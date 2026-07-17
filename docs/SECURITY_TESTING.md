@@ -17,6 +17,9 @@
 The prompt-injection/red-team suite is **manual-only**:
 
 - no `pull_request` trigger;
+- GitHub-hosted live runs are restricted to `main` and the protected `f2-live`
+  environment; provider keys belong to that environment, not repository-level
+  secrets;
 - no nightly or scheduled trigger;
 - no automatic execution against a personal vault or production database;
 - use public/synthetic fixtures and a disposable database;

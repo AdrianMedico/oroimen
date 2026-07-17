@@ -5,15 +5,11 @@ pytest-asyncio==1.4.0
 pytest-cov==7.1.0
 pytest-mock==3.15.1
 pytest-timeout==2.4.0
-# pytest-split: divide test suite en N shards balanceados por tiempo.
-# Sprint 12.2: usado en CI con estrategia de 2 shards para reducir wall time
-# de tests de ~39s a ~22s. Ver .github/workflows/ci.yml.
+# Optional sharding support. Public CI must not enable this without fresh,
+# committed timing data; see docs/CI_TEST_PARALLELISM.md.
 pytest-split==0.11.0
-# pytest-xdist: ejecucion paralela dentro de un shard (multiple workers
-# en un solo proceso). Bench 2026-07-11: -n 4 da 2.01x speedup vs
-# single-process (33.5s vs 67.4s en 1410 tests). Combinable con
-# pytest-split en CI: cada shard corre con -n 3 para usar 6 cores
-# del WSL runner (2 shards x 3 workers = 6 workers).
+# Local parallel test execution. The public CI baseline is intentionally
+# serial until hosted-runner measurements justify a worker-count change.
 pytest-xdist==3.8.0
 respx==0.23.1
 ruff==0.15.20

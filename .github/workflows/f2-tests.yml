@@ -8,10 +8,10 @@ name: f2-tests
 # Raw prompts and model responses are not printed or retained as artifacts.
 # Missing credentials, skipped cases, and incomplete collections fail the run.
 #
-# Required repository secrets:
+# Required `f2-live` environment secrets:
 #   - E2E_LLM_KEY_MINIMAX
 #   - E2E_LLM_KEY_OPENCODE
-# Optional repository variables/secrets override provider model/base URLs.
+# Optional environment variables/secrets override provider model/base URLs.
 #
 # Deterministic escaping, budget, and message-contract tests remain in normal CI.
 on:
@@ -19,7 +19,7 @@ on:
 
 # Don't cancel in-progress F2 runs. We want to see the full result.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: f2-live
   cancel-in-progress: false
 
 permissions:
@@ -28,6 +28,8 @@ permissions:
 jobs:
   f2-prod-llm:
     name: F2 real-LLM validation
+    if: github.ref == 'refs/heads/main'
+    environment: f2-live
     runs-on: ubuntu-latest
     # F2 baseline on M3: 7 tests × 3 runs = 21 calls = ~60-90s.
     # If opencode-go also runs (and doesn't hang), +30-60s.
@@ -37,7 +39,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Setup Python + uv
         uses: ./.github/actions/setup-python-uv

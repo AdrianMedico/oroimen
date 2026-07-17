@@ -5,8 +5,9 @@
 > frontier mode sends the selected conversation to the configured cloud
 > provider only after explicit opt-in. No GPU required.
 
-[![License: AGPLv3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-1765%20pass-success)](./tests)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](./LICENSE)
+[![CI](https://github.com/AdrianMedico/oroimen/actions/workflows/ci.yml/badge.svg)](https://github.com/AdrianMedico/oroimen/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-1766%20pass-success)](./tests)
 [![Python 3.13](https://img.shields.io/badge/python-3.13-blue)](https://www.python.org/)
 [![Built with Mavis + ChatGPT 5.6](https://img.shields.io/badge/built%20with-Mavis%20%2B%20ChatGPT%205.6-purple)](./BUILD_PROCESS.md)
 
@@ -313,9 +314,10 @@ agent. The public Compose path uses local Ollama embeddings by default.
 ### 4. Docker setup (the one-command story)
 
 One `docker compose up`. All services in one compose file.
-The WebUI is in its own container for the AGPLv3 license boundary
-(per AGPLv3 §5, "mere aggregation" lets the WebUI stay
-independent).
+The WebUI and Oroimen backend run in separate containers and
+communicate through the documented HTTP API. Each bundled component
+retains its own license notices; container separation is an
+architectural boundary, not by itself a licensing determination.
 
 ## Security
 
@@ -362,18 +364,19 @@ and we want to show what good collaboration looks like.
 
 ## License
 
-**AGPLv3**. This means:
-- You can use, modify, and distribute Oroimen freely.
-- If you **modify it and serve it as a network service**, you
-  must publish your modifications.
-- If you **wrap it and monetize**, the same applies.
+Oroimen is licensed under the GNU Affero General Public License,
+version 3 or later (`SPDX: AGPL-3.0-or-later`). See
+[`LICENSE`](./LICENSE) for the full terms.
 
-This protects the project from closed-source forks. It does
-**not** force the WebUI to be AGPLv3 — the WebUI is an
-independent work that talks to the backend via HTTP API
-("mere aggregation" per AGPLv3 §5).
+In broad terms, the license permits use, modification, and
+redistribution subject to its conditions. Section 13 includes
+source-offer obligations when users interact over a network with a
+modified covered version. How those terms apply to integrations can
+depend on how components are modified, combined, and distributed; an
+HTTP API or separate container does not by itself resolve that
+question. Third-party components retain their own licenses.
 
-See [`LICENSE`](./LICENSE) for the full text.
+This summary is informational and is not legal advice.
 
 ## Outside the supported evaluator path
 
@@ -448,17 +451,16 @@ This is a personal project released for the OpenAI Build
 Week. Contributions are welcome but the scope is small
 (polished subset). Open an issue first to discuss.
 
-If you fork Oroimen and serve a modified version as a
-network service, AGPLv3 §13 requires you to publish your
-modifications. That's the deal.
+If you offer a modified network deployment, review AGPLv3 Section 13 and
+provide remote users the source access required by the license.
 
 ## Status
 
-- **Tests**: the audited unit gate passes 1765 tests / 2 skipped / 1 expected failure after the R5 remediation fixes. The 7/7 self-crafted F2 cases passed against MiniMax-M3; the 50-case public chat path and second-provider baseline remain pending.
+- **Tests**: the audited serial unit gate passes 1766 tests / 2 skipped / 1 expected failure after the R5 remediation fixes. The 7/7 self-crafted F2 cases passed against MiniMax-M3; the 50-case public chat path and second-provider baseline remain pending.
 - **Coverage**: no current coverage artifact is claimed in this subset.
-- **CI**: local verification commands are documented here; hosted workflow evidence is outside this public candidate subset
+- **CI**: pull requests and `main` run lint, type checks, Compose validation, deterministic tests, and a committed-secret scan on GitHub-hosted runners
 - **Build**: Dockerfile currently targets linux/amd64; clean-host container smoke and arm64 support remain pending
-- **License**: AGPLv3
+- **License**: AGPL-3.0-or-later
 
 ---
 

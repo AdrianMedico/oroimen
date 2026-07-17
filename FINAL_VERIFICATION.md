@@ -194,8 +194,27 @@ Final evidence for this closure: 1765 unit tests passed, 2 skipped, 1 expected
 failure; mypy passed 91 modules; both fresh adversarial re-reviews returned PASS
 with no remaining BLOCKING, MAJOR, or MINOR findings in scope. Live provider calls
 were deliberately not executed.
+## Public CI follow-up (2026-07-17)
 
-## Exact public tree expansion (242 files)
+The public follow-up adds deterministic CI for pull requests and main without
+changing the manual-only provider policy. Static checks, unit tests, local
+integration tests, Compose validation, and Gitleaks run without repository
+secrets beyond GitHub's read-only workflow token. External provider tests remain
+workflow_dispatch only.
+
+Local baseline before publication:
+
+- Serial unit gate: 1766 passed, 2 skipped, 1 expected failure, 73 deselected (206.91 s).
+- Serial dry/integration/e2e gate: 221 passed, 7 skipped, 1 expected failure, 18 deselected (31.03 s).
+- Ruff and mypy: PASS.
+- Compose configuration: PASS.
+- CI lock dry-run: 96 Python 3.13/Linux packages resolved with required hashes.
+- F2 workflow: restricted to `main` and the `f2-live` environment; environment
+  protection and secrets remain a GitHub-side setup gate before any live run.
+- Adversarial CI review: PASS after R3, with 0 BLOCKING and 0 MAJOR findings.
+- Gitleaks and hard-privacy scans: PASS — 0 findings; generic CI security identifiers were manually adjudicated.
+
+## Exact public tree expansion (246 files)
 
 The following paths are the complete allowlist-expanded public tree used for the
 clean candidate export:
@@ -205,12 +224,14 @@ clean candidate export:
 .env.example
 .gitattributes
 .github/actions/setup-python-uv/action.yml
+.github/workflows/ci.yml
 .github/workflows/f2-tests.yml
 .gitignore
 BUILD_PROCESS.md
 docker-compose.yml
 Dockerfile
 docs/ARCHITECTURE.md
+docs/CI_TEST_PARALLELISM.md
 docs/DEMO_SCRIPT.md
 docs/EVAL_STRATEGY.md
 docs/SECURITY_TESTING.md
@@ -313,6 +334,7 @@ pytest.ini
 README.md
 requirements.txt
 requirements-dev.txt
+requirements-ci.lock
 ruff.toml
 scripts/__init__.py
 scripts/pr_review.py
@@ -358,6 +380,7 @@ tests/unit/test_backup.py
 tests/unit/test_breaker.py
 tests/unit/test_builtin.py
 tests/unit/test_chatgpt5_6_provider.py
+tests/unit/test_ci_exit_status.py
 tests/unit/test_chunker.py
 tests/unit/test_classifier_meta.py
 tests/unit/test_collections.py

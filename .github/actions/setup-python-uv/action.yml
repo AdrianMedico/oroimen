@@ -1,86 +1,41 @@
-# Composite action: checkout + Python 3.13 + uv + mypy cache.
-# Reusado por ci.yml, security.yml, nightly-tests.yml.
-# Antes cada workflow duplicaba este setup (~15 lineas cada uno).
-#
-# Uso:
-#   - uses: actions/checkout@v5
-#   - uses: ./.github/actions/setup-python-uv
-#     with:
-#       python-version: "3.13"   # opcional, default 3.13
-#       cache-mypy: "true"        # opcional, default true
-
 name: setup-python-uv
+
+description: Set up Python, uv, a fresh virtual environment, and project dependencies.
 
 inputs:
   python-version:
-    description: 'Python version a instalar'
+    description: Python version to install
     required: false
-    default: '3.13'
-  cache-mypy:
-    description: 'Si cachear .mypy_cache (compartido entre jobs)'
-    required: false
-    default: 'true'
+    default: "3.13"
 
 outputs:
   python-version:
-    description: 'Python version instalada'
+    description: Installed Python version
     value: ${{ steps.setup-python.outputs.python-version }}
 
 runs:
   using: composite
   steps:
-    - name: Setup Python
+    - name: Set up Python
       id: setup-python
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
       with:
         python-version: ${{ inputs.python-version }}
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@v7
+    - name: Set up uv
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       with:
-        version: 'latest'
+        version: "0.11.7"
+        enable-cache: true
+        cache-dependency-glob: |
+          requirements.txt
+          requirements-dev.txt
+          requirements-ci.lock
 
-    - name: Cache uv (deps Python)
-      uses: actions/cache@v5
-      with:
-        path: |
-          .venv
-          ~/.cache/uv
-        key: uv-${{ runner.os }}-${{ inputs.python-version }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt', 'pyproject.toml', 'uv.lock') }}
-        restore-keys: |
-          uv-${{ runner.os }}-${{ inputs.python-version }}-
-
-    - name: Create venv (if not cached)
-      # Skip if .venv already exists (restored from cache). Single-purpose
-      # step, no pip install here -- that's in the next step.
+    - name: Create virtual environment
       shell: bash
-      run: |
-        if [ ! -d .venv ]; then
-          uv venv --python ${{ inputs.python-version }}
-        fi
+      run: uv venv --python ${{ inputs.python-version }}
 
-    - name: Install dependencies (idempotent, ALWAYS runs)
-      # This step ALWAYS runs `uv pip install`, even if the previous
-      # "Create venv" step restored .venv from cache. That's INTENTIONAL:
-      # when requirements-dev.txt adds a new dep (e.g. pytest-xdist in
-      # the perf commit), the cache key hash changes, but a pre-existing
-      # .venv from a partial cache hit may still lack the new dep.
-      # uv pip install is idempotent when deps are already up to date
-      # (~5s overhead, negligible vs 40s test wall time). This is the
-      # "stale .venv protection" pattern.
+    - name: Install dependencies
       shell: bash
-      run: |
-        if [ ! -f requirements-dev.txt ]; then
-          echo "::error::requirements-dev.txt not found in repo root."
-          exit 1
-        fi
-        uv pip install -r requirements-dev.txt
-
-    - name: Cache mypy
-      if: inputs.cache-mypy == 'true'
-      uses: actions/cache@v5
-      with:
-        path: .mypy_cache
-        key: mypy-${{ runner.os }}-${{ hashFiles('requirements-dev.txt', 'hermes/**/*.py') }}
-        restore-keys: |
-          mypy-${{ runner.os }}-
+      run: uv pip install --require-hashes -r requirements-ci.lock
