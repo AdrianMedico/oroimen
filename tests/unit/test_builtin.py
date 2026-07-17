@@ -47,10 +47,9 @@ class TestGetCurrentTime:
 
     @pytest.mark.asyncio
     async def test_uses_settings_timezone(self, settings: object) -> None:
-        """Si settings.tz = 'Europe/Madrid', el offset debe ser +02:00 (CEST)
-        o +01:00 (CET) dependiendo de la fecha."""
+        """Europe/Madrid uses CET or CEST regardless of the host timezone."""
+        settings.tz = "Europe/Madrid"  # type: ignore[attr-defined]
         result = await get_current_time(settings)
-        # Madrid está en UTC+1 (invierno) o UTC+2 (verano)
         assert result.endswith("+01:00") or result.endswith("+02:00")
 
     @pytest.mark.asyncio
