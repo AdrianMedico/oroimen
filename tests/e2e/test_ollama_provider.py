@@ -11,11 +11,11 @@ default URL works for a local docker compose stack.
 
 Usage:
     # All tests skip if Ollama is not reachable
-    pytest tests/e2e/test_ollama_provider.py
+    pytest tests/e2e/test_ollama_provider.py --runnetwork
     # Force-run even if Ollama is not reachable (will skip with reason)
-    pytest tests/e2e/test_ollama_provider.py --runollama=force
+    pytest tests/e2e/test_ollama_provider.py --runnetwork --runollama=force
     # Or point to a custom Ollama URL
-    E2E_OLLAMA_URL=http://edge-host:11434 pytest tests/e2e/test_ollama_provider.py
+    E2E_OLLAMA_URL=http://edge-host:11434 pytest tests/e2e/test_ollama_provider.py --runnetwork
 
 Reference: docs/OLLAMA_DOCKER_COMPOSE_PLAN.md §3.6.
 """
@@ -29,6 +29,8 @@ import pytest
 
 from hermes.config import Settings
 from hermes.llm.ollama import OllamaClient
+
+pytestmark = pytest.mark.network
 
 # ---------------------------------------------------------------------------
 # Constants

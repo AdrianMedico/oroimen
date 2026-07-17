@@ -1,22 +1,7 @@
-"""Pytest configuration and shared fixtures.
-
-Contiene:
-- Hook `pytest_sessionfinish` para evitar hang de `threading._shutdown()`
-  en GitHub Actions (ver `docs/POSTMORTEM_CI_HANG.md`).
-- Fixtures compartidas para tests de handlers de Telegram: `bot`,
-  `settings`, `db`, `telemetry`.
-- Helpers para construir mocks de `aiogram.Message` (la clase real es
-  pydantic frozen, lo que impide reasignar `answer`).
-- Helper para extraer el callable de un Router de aiogram.
-- Markers: `@pytest.mark.slow` para tests >1s (deselect en CI con
-  `-m "not slow"` para mantener la suite <60s; correlos con
-  `pytest -m slow` o `pytest --runslow` cuando necesites validar
-  esos flujos end-to-end con tiempos reales).
-"""
+"""Shared pytest fixtures and helpers for the Oroimen test suite."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -28,31 +13,6 @@ from aiogram.types import Chat, User
 from hermes.config import Settings
 from hermes.memory.db import Database
 from hermes.telemetry import Telemetry
-
-# ---------------------------------------------------------------------------
-# CI hang workaround
-# ---------------------------------------------------------------------------
-
-# Detect if running in GitHub Actions
-IN_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
-
-
-def pytest_sessionfinish(session, exitstatus):
-    """Force immediate process exit to avoid threading._shutdown() hang.
-
-    GitHub Actions runners hang in threading._shutdown() when asyncio libraries
-    (aiogram, aiohttp, httpx) create daemon threads that don't close cleanly.
-    Pytest finishes successfully (2-3s, all tests pass) but the Python process
-    can't exit because _shutdown() waits for daemon threads.
-
-    os._exit(0) bypasses cleanup and threading._shutdown, allowing the job
-    to terminate cleanly.
-
-    Reference: https://github.com/actions/runner/issues/3535
-    """
-    if IN_GITHUB_ACTIONS:
-        os._exit(0)
-
 
 # ---------------------------------------------------------------------------
 # Constantes de test compartidas
