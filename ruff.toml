@@ -1,0 +1,20 @@
+target-version = "py311"
+line-length = 100
+extend-exclude = ["tests"]
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501", "B008"]
+
+# Per-file ignores: archivos que intencionalmente tienen emojis Unicode
+# (Telegram severity icons: info/warning/critical). RUF001 los marca como
+# "ambiguous unicode characters" (falso positivo: los emojis son
+# intencionales). Silenciamos RUF001 solo en estos archivos especificos
+# (no global, para mantener el lint util en el resto del codigo).
+[lint.per-file-ignores]
+"hermes/handlers/notifications.py" = ["RUF001", "RUF003"]
+"tests/unit/test_health_notifier.py" = ["RUF001", "RUF003"]
+
+[format]
+quote-style = "double"
+indent-style = "space"

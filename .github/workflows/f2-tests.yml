@@ -1,0 +1,87 @@
+name: f2-tests
+
+# Sprint 19.6+ Phase 2.5+ : F2 hardening real-LLM tests.
+#
+# Project security policy: provider-backed prompt-injection tests run only
+# through workflow_dispatch. Each run performs 7 cases x 3 repetitions on
+# two providers (42 external calls), so it must never be a PR or nightly job.
+# Raw prompts and model responses are not printed or retained as artifacts.
+# Missing credentials, skipped cases, and incomplete collections fail the run.
+#
+# Required repository secrets:
+#   - E2E_LLM_KEY_MINIMAX
+#   - E2E_LLM_KEY_OPENCODE
+# Optional repository variables/secrets override provider model/base URLs.
+#
+# Deterministic escaping, budget, and message-contract tests remain in normal CI.
+on:
+  workflow_dispatch:  # manual trigger from Actions tab
+
+# Don't cancel in-progress F2 runs. We want to see the full result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  f2-prod-llm:
+    name: F2 real-LLM validation
+    runs-on: ubuntu-latest
+    # F2 baseline on M3: 7 tests × 3 runs = 21 calls = ~60-90s.
+    # If opencode-go also runs (and doesn't hang), +30-60s.
+    # Buffer: 15 min for hangs (opencode-go rate-limit issue per
+    # PHASE_STATE.yaml opencode_go_rate_limit_investigation).
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python + uv
+        uses: ./.github/actions/setup-python-uv
+
+      - name: Lint (ruff)
+        # Use the exact Ruff version pinned in requirements-dev.txt.
+        run: uv run ruff check hermes/ tests/
+
+      - name: Pytest F2 tests (real-LLM)
+        env:
+          E2E_LLM_KEY_MINIMAX: ${{ secrets.E2E_LLM_KEY_MINIMAX }}
+          E2E_LLM_BASE_URL_MINIMAX: ${{ secrets.E2E_LLM_BASE_URL_MINIMAX || 'https://api.minimax.io/v1' }}
+          E2E_LLM_MODEL_MINIMAX: ${{ vars.E2E_LLM_MODEL_MINIMAX || 'MiniMax-M3' }}
+          E2E_LLM_KEY_OPENCODE: ${{ secrets.E2E_LLM_KEY_OPENCODE }}
+          E2E_LLM_BASE_URL_OPENCODE: ${{ secrets.E2E_LLM_BASE_URL_OPENCODE || 'https://opencode.ai/zen/go/v1' }}
+          E2E_LLM_MODEL_OPENCODE: ${{ vars.E2E_LLM_MODEL_OPENCODE || 'deepseek-v4-flash' }}
+        # -m e2e: only the @pytest.mark.e2e tests (F2 hardening).
+        # -v: verbose (per-test PASS/FAIL with which model).
+        # --timeout=180: 3 min per test. Most take 5-15s, but
+        #   opencode-go may hang on 2nd+ call (known issue).
+        # -p no:cacheprovider: avoid cache (suspicious of hangs per
+        #   docs/HALLAZGO_ASYNC_HANG.md).
+        # No --splits: the test file is small (14 tests) and parallel
+        # LLM calls would hit rate limits.
+        run: |
+          if [ -z "$E2E_LLM_KEY_MINIMAX" ] || [ -z "$E2E_LLM_KEY_OPENCODE" ]; then
+            echo "ERROR: both F2 provider secrets must be configured"
+            exit 1
+          fi
+          uv run pytest tests/e2e/test_real_llm_validation.py \
+            -v --no-header \
+            --timeout=180 \
+            -m e2e \
+            --runnetwork --runslow \
+            -p no:cacheprovider \
+            --junitxml=f2-results.xml
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("f2-results.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(s.attrib.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.attrib.get("skipped", 0)) for s in suites)
+          if tests != 14 or skipped:
+              raise SystemExit(f"F2 run inconclusive: tests={tests}, skipped={skipped}")
+          print(f"F2 execution complete: {tests} cases, 0 skipped")
+          PY

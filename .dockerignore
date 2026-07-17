@@ -1,0 +1,35 @@
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets and config
+.env
+.env.*
+*.pem
+*.key
+
+# Docs and IDE
+.vscode/
+.idea/
+*.md
+!hermes/**/*.md
+!docs/**/*.md
+!README.md
+LICENSE
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,239 @@
+services:
+  # Sprint 19.6+ Phase 5 (OpenAI Build Week): local Ollama server.
+  # Provides an OpenAI-compat API at /v1 on port 11434. The
+  # backend connects to it via the docker internal hostname
+  # `ollama` (LLM_TEXT_PRIMARY__BASE_URL=http://ollama:11434/v1
+  # is set in the `backend` service environment below).
+  #
+  # Health check probes the /api/tags endpoint — Ollama's standard
+  # discovery endpoint that returns the list of locally-available
+  # models. 30s start_period because the cold start includes
+  # `ollama serve` + health check round-trips; the first model
+  # pulls (qwen2.5:7b plus qwen3-embedding:0.6b) are handled by `init-ollama`
+  # sidecar below, NOT by this service.
+  #
+  # CPU-only operation is supported. Exact clean-host memory and disk
+  # requirements remain part of the final container smoke.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: oroimen-ollama
+    restart: unless-stopped
+    # Host port 11435 avoids common collisions with a host Ollama.
+    # Containers use the internal `ollama:11434` address.
+    ports:
+      - "127.0.0.1:11435:11434"   # exposed to host, not public
+    # Bind to all interfaces inside the container so any future
+    # cross-container service can reach us by container name
+    # (currently hermes uses `http://ollama:11434/v1`, but if
+    # someone adds a service that uses loopback, this prevents
+    # a silent footgun).
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # One-shot model bootstrap for the local chat and embedding models.
+  # It starts only after the Ollama service is healthy.
+  # The downloaded model is stored in the `ollama-data` volume,
+  # so subsequent restarts use the cached model and the init
+  # container exits in seconds (no-op).
+  #
+  # `restart: "no"` — this is a one-shot, not a daemon. After
+  # the pull completes successfully, the container exits 0 and
+  # the backend's `depends_on: init-ollama: service_completed_successfully`
+  # gate opens.
+  init-ollama:
+    image: ollama/ollama:latest
+    container_name: oroimen-init-ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama pull qwen2.5:7b && ollama pull qwen3-embedding:0.6b"]
+    restart: "no"
+    volumes:
+      - ollama-data:/root/.ollama
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  hermes:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/adrianmedico/oroimen:dev
+    container_name: hermes
+    restart: unless-stopped
+    env_file:
+      # Build Week polish: env_file is OPTIONAL. The default
+      # local-first chain (Ollama only) works without .env. If the
+      # judge wants to add MiniMax/ChatGPT 5.6, they `cp
+      # .env.example .env` and fill in the keys. The Settings
+      # validation accepts the no-.env case for the local chain.
+      - path: ./.env
+        required: false
+    environment:
+      # Sprint 19.6+ Phase 5: the default chain primary is
+      # `qwen2.5:7b` served by the `ollama` service. Inside the
+      # docker network the hostname `ollama` resolves to the
+      # Ollama container. Outside (host browser, curl from
+      # workstation), the user uses `localhost:11435` (port-mapped
+      # in the `ollama` service above; 11435 chosen to avoid the
+      # common host-service collision on 11434 and another local
+      # process already bound to that port).
+      - LLM_TEXT_PRIMARY__BASE_URL=http://ollama:11434/v1
+      - LLM_TEXT_PRIMARY__MODEL=qwen2.5:7b
+      - LLM_TEXT_PRIMARY__API_KEY=ollama
+      - LLM_TEXT_PRIMARY_PROVIDER=ollama
+      - EMBEDDING_TIER_EDGE__ENABLED=true
+      - EMBEDDING_TIER_EDGE__BASE_URL=http://ollama:11434/v1
+      - EMBEDDING_TIER_EDGE__MODEL=qwen3-embedding:0.6b
+      - EMBEDDING_TIER_EDGE__API_KEY=ollama
+      - EMBEDDING_POLICY_CHAT_RAG=edge
+      - EMBEDDING_POLICY_VAULT_INGEST=edge
+      - VAULT_EMBEDDING_MODEL=qwen3-embedding:0.6b
+      - VAULT_EMBEDDING_DIM=1024
+      - VAULT_INBOX_ROOT=/app/data/inbox
+      - VAULT_WATCHER_POLL_INTERVAL_S=5
+      - TOOLS_ENABLED=true
+      - OUTBOUND_TOOLS_ENABLED=false
+      - SEARCH_ENABLED=false
+      - ENABLE_HTTP_API=true
+      - HERMES_API_CORS_ORIGINS=http://localhost:8080,http://127.0.0.1:8080
+      - VAULT_DROP_ROOT=/app/drop
+      - VAULT_DROP_DEFAULT_COLLECTION=inbox
+    volumes:
+      - hermes-data:/app/data
+      - ./drop:/app/drop
+    ports:
+      - "127.0.0.1:8000:8000"
+    # Wait for Ollama to be healthy (model loaded in init-ollama)
+    # before starting the backend. Without this, the backend may
+    # start before the model is downloaded and the first chat
+    # request fails (Ollama returns 404 for a missing model).
+    depends_on:
+      ollama:
+        condition: service_healthy
+      init-ollama:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Open WebUI — portable user-facing chat interface.
+  # Uses the default bridge, a named volume, and host-only ports.
+  # Inline settings keep the local quickstart independent of a private deploy.
+  #
+  # Wire to hermes:8000/v1 (internal Docker DNS). The chat goes
+  # through Oroimen's OpenAI-compat HTTP API, so RAG via /v1/files,
+  # the multi-tier chain, AND the Sprint 19.6 F2 3-layer
+  # RAG-injection defense (XML escape + `<file_content>` tag wrap +
+  # system rule) all apply. The F2 fix is wired into both
+  # `AgentLoop.run()` (`hermes/agent/loop.py:211`) and
+  # `AgentLoop.run_stream()` (`hermes/agent/loop.py:388`); the
+  # helper functions (`wrap_file_content`, `_xml_escape`,
+  # `FILE_CONTENT_SYSTEM_RULE`) live around `hermes/agent/loop.py:1205+`.
+  # These are the entry points `/v1/chat/completions` uses. See
+  # `tests/e2e/test_real_llm_validation.py` for the seven measured
+  # MiniMax-M3 cases. The second-provider baseline remains pending. Open WebUI
+  # is OpenAI-compat; it just needs a base URL.
+  #
+  # Judge UX: `git clone && docker compose up` → wait for both local
+  # models to download and all health checks to pass → open
+  # http://localhost:8080 → create admin account on first visit →
+  # chat works. No API keys needed (everything runs locally).
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: oroimen-open-webui
+    restart: unless-stopped
+    environment:
+      # PLURAL: OPENAI_API_BASE_URLS (with S) is the actual env var
+      # name. The singular form is silently ignored. Documented in
+      # Open WebUI docs: https://docs.openwebui.com/getting-started/env-configuration
+      - OPENAI_API_BASE_URLS=http://hermes:8000/v1
+      - OPENAI_API_KEYS=${HERMES_API_API_KEY:-}
+      # Single-user auth. Open WebUI's default: signup OPEN until
+      # the first user registers (the visitor becomes admin
+      # automatically), then signup auto-flips to false. This is the
+      # judge-friendly path: clone, compose up, open localhost:8080,
+      # create admin account, chat. DO NOT set ENABLE_SIGNUP=false
+      # here — that would hide the signup form on first boot and
+      # block the only path to admin creation (see R1 S-1).
+      #
+      - WEBUI_AUTH=true
+      - DATA_DIR=/app/backend/data
+    volumes:
+      - open-webui-data:/app/backend/data
+    # No explicit `networks:` block — uses the default bridge. hermes
+    # and ollama also use the default bridge. They reach each other
+    # by container name (e.g., `hermes:8000` from open-webui's view).
+    ports:
+      - "127.0.0.1:8080:8080"   # host-only, not public
+    depends_on:
+      hermes:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ollama-data:
+  hermes-data:
+  open-webui-data:

@@ -1,0 +1,129 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+# lib/ removed for whisper.cpp submodule (Sprint 11)
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment and secrets (tier 1: defaults)
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+
+# Environment and secrets (tier 2: project-specific)
+# Hermes/Oroimen deployment artifacts
+**/oroimen.env
+.harness/**/*.env
+.harness/**/*.env.local
+.harness/**/*.env.production
+**/secrets/**
+**/secrets.*
+**/cookies.txt
+**/id_*
+**/*.pub
+
+# Whitelist: keep .env.example templates tracked
+!.env.example
+!.env.*.example
+!.harness/**/*.env.example
+!.harness/**/.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Docker
+docker-compose.override.yml
+
+# Logs
+*.log
+logs/
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# OS
+Thumbs.db
+
+# PowerShell artifacts (artefactos cuando '=' se interpreta como filename)
+=
+# Tmp dirs
+.tmp/
+.scratch/
+.git-credential-gh.sh
+docs/research/
+
+# Ad-hoc local scripts (en el home del operador o cualquier workspace local)
+# Los scripts canónicos viven fuera del repo, en un directorio configurable.
+**/scrub-*.ps1
+**/scrub-*.py
+**/scrub*.ps1
+**/scrub*.py
+**/oro-*.ps1
+
+# Mavis runtime state (planes, probes efímeros, debug scripts, worktrees).
+# La ubicación del runtime es local y configurable; NUNCA commitearla al repo.
+# Si necesitas trackear algo de Mavis ligado al proyecto, va en .harness/
+# (ver bloque siguiente) o como artefacto versionado bajo otro nombre.
+.mavis/
+
+# .harness/ contiene planes locales y notas del operador. El repo puede
+# contener archivos .harness/*.md si son documentacion publica del proyecto
+# (renombrados a *.md.example). Por ahora: ignorar todo *.harness/ hasta
+# decidir qué entra en el repo.
+.harness/
+.harness/**/*.yaml
+.harness/**/*.yml
+.harness/**/*.sh
+.harness/**/*.py
+!.harness/**/*.md
+
+# rikkahub-fork/ es un repo independiente (el fork de RikkaHub del operador en GitHub)
+# que vive anidado aqui por convenience de IDE (single-window dev). No es
+# parte de hermes-deploy; sus cambios se trackean en su propio repo. Si en
+# el futuro hermes-deploy necesita declarar la dependencia explicitamente
+# (CI conjunto, on-boarding de otro dev), convertir a submodule.
+rikkahub-fork/

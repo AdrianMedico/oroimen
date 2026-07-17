@@ -1,0 +1,113 @@
+httpx==0.28.1
+aiogram==3.29.1
+aiosqlite==0.22.1
+aiohttp==3.14.1
+pydantic==2.13.4
+pydantic-settings==2.14.2
+python-json-logger==4.1.0
+influxdb-client==1.50.0
+# Sprint 4 MVP-2: Agent-Reach (yt-dlp, feedparser, gh search, Jina Reader, etc.)
+# No esta en PyPI todavia (solo GitHub). Pin al tag v1.5.0 para reproducibilidad.
+# Mismo approach que recomienda el README oficial:
+# https://github.com/Panniantong/Agent-Reach#installation
+https://github.com/Panniantong/Agent-Reach/archive/refs/tags/v1.5.0.zip#egg=agent-reach
+# yt-dlp-ejs: External JavaScript (recomendado por yt-dlp para YouTube)
+# Resuelve el JS challenge de YouTube de forma robusta. Sin esto,
+# yt-dlp puede fallar con HTTP 429 o "Sign in to confirm you're not a bot".
+yt-dlp-ejs>=0.8.0
+
+# Sprint 6 T53 fase 1: HTTP API server (compatible con OpenAI).
+# FastAPI: framework para el endpoint. Uvicorn[standard] incluye
+# httptools, uvloop, y watchfiles para mejor performance y hot-reload
+# (este ultimo solo en dev).
+fastapi>=0.139.0
+uvicorn[standard]>=0.49.0
+# Sprint 7 T53.2: file uploads server-side (multipart) + PDF text extraction.
+# python-multipart: requerido por FastAPI para UploadFile/File.
+# pypdf: extraccion de texto de PDFs subidos directamente a Hermes
+# (cuando el cliente NO usa Open WebUI como intermediario).
+python-multipart>=0.0.32
+pypdf>=4.0.0
+
+# Sprint 8 S8.4: SQLite WAL backup online (scheduled job at 03:30 AM).
+# APScheduler 3.10.4: pin para reproducibilidad (LTS, compatible con Python 3.11).
+# Se usa solo para el cron del backup; no afecta el event loop de FastAPI
+# (el wrapper asyncio.to_thread() lo mantiene aislado).
+apscheduler==3.11.3
+# Sprint 8.4 follow-up: apscheduler.jobstores.sqlalchemy (used by
+# hermes/jobs/scheduler.py) requires SQLAlchemy. Sin este dep,
+# `hermes.jobs.scheduler` falla con ImportError al import time
+# (cazado por tests/dry/test_hermes_imports.py el 2026-07-11).
+# SQLAlchemy 2.x es la línea soportada por apscheduler 3.11.
+sqlalchemy>=2.0
+
+# Sprint 9.1: RAG + embeddings via OpenAI text-embedding-3-small.
+# openai: SDK oficial. Usado por hermes/services/embeddings.py para
+# generar embeddings de files subidos. Compatible con OpenAI-compat
+# endpoints (opencode-go, OpenRouter, etc.) via base_url override.
+# Si openai no esta instalado, RAG se desactiva graciosamente
+# (EmbeddingsService cae en fallback NoOp).
+openai>=2.44.0
+
+# numpy: usado por EmbeddingsCache para cosine similarity en Python puro
+# (TDD S9 §2.3 MVP, antes de migrar a FAISS a 10K docs).
+# Python 3.13 permite numpy 2.2+ (PEP 695 type statements requieren 3.12+).
+# Pin floor a 1.26.0 (lo que ya teniamos); 2.2+ es opt-in via lock file.
+numpy>=1.26.0
+
+# Sprint 12.1 (ADR-007): cifrado de content en tombstoned conversations.
+# Fernet (symmetric authenticated encryption) para proteger transcripts
+# de chats borrados contra robo fisico del NAS. El cifrado es de aplicacion
+# (no SQLCipher); solo la columna `content` de `messages` se cifra, no
+# la DB entera. Ver TDD_S12_DELETE_AND_SYNC.md §8 para detalles.
+cryptography>=42.0.0,<50.0.0
+
+# Trivy CVE bump (2026-07-04) — superseded por el bump a Python 3.13
+# (ver Dockerfile ARG PYTHON_VERSION=3.13). En 3.11 teniamos floors explicitos
+# para setuptools/wheel/jaraco.context porque el base image 3.11-slim
+# vendoreaba versiones vulnerables en setuptools/_vendor. Con 3.13-slim
+# el base image ya viene con versiones parcheadas y setuptools 81+, asi
+# que estos floors son innecesarios. requirements.txt queda limpio.
+
+# Sprint 14 (TDD_S14_DEEP_RESEARCH.md §6.3): HTML parser para phase 2 (scrape).
+# selectolax: C-extension memory-safe parser (vs html2text regex vulnerable a
+# ReDoS en HTML patologico). Size Guard 2MB ANTES de to_thread reduce superficie.
+selectolax>=0.3.21
+
+# Sprint 19 Slice 4 (TDD_VAULT_COLLECTIONS.md §4): drop folder watcher.
+# watchfiles: cross-platform filesystem event library (inotify/FSEvents/
+# ReadDirectoryChangesW). Used by drop_watcher.py para detectar archivos
+# nuevos en <vault_root>/pending/drop/<subdir>/.
+# Sin watchfiles el watcher tendría que hacer polling, lo cual desperdicia
+# CPU y batería en el NAS 24/7.
+watchfiles>=0.21.0
+
+# Sprint 19 Slice 4a: text extractors for non-OCR file types (PDF/DOCX/XLSX).
+# - pymupdf: PDF text extraction (Tier 0, baseline ~5ms/page).
+#   Renombrado del package original `fitz`; import es `import pymupdf`.
+# - python-docx: DOCX text extraction (zipfile + XML parse, no LibreOffice).
+# - openpyxl: XLSX text extraction (zipfile + XML parse).
+# OCR (Tesseract) viene en Slice 4b; pytesseract se añadirá entonces.
+pymupdf>=1.24.0
+python-docx>=1.1.0
+openpyxl>=3.1.2
+
+# Sprint 19 Slice 4b: Tesseract OCR for JPG/PNG (opt-in for low-confidence
+# images that need a second pass). Pillow es dep de pytesseract para
+# abrir imágenes, pero la importamos explícitamente para los extractors
+# que pre-procesan (resize, grayscale) antes de OCR.
+# - pytesseract: wrapper Python sobre el binario `tesseract`. El binario
+#   se instala vía apt-get en el Dockerfile (no pip).
+# - Pillow: image I/O, preprocessing.
+pytesseract>=0.3.10
+Pillow>=10
+
+# Sprint 19 follow-up: hermes/tools/scripts/rss_read.py importa
+# feedparser para parsear feeds RSS. Sin este dep, el módulo falla
+# con ModuleNotFoundError al import time (cazado por
+# tests/dry/test_hermes_imports.py el 2026-07-11). feedparser 6.x
+# es la línea actual (uso feedparser 6.0.12 instalado).
+# Dependencia histórica: el comentario en la línea 9 menciona
+# "feedparser" como parte de Agent-Reach, pero nunca se pineó
+# formalmente. Se agrega acá con su uso real (rss_read).
+feedparser>=6.0
