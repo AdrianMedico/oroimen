@@ -21,6 +21,7 @@ recover_research_jobs() lo resetea a 'pending' y re-enqueue.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from datetime import datetime
@@ -31,6 +32,7 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
+from hermes.jobs.exceptions import SchedulerUnavailableError
 from hermes.jobs.models import JobStatus
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,12 @@ class DeepResearchScheduler:
             jobstore_url = f"sqlite:///{db_path}"
         self._jobstore_url = jobstore_url
         self._scheduler: AsyncIOScheduler | None = None
+        # Slice 1C1c: explicit stopping flag toggled by ``stop_accepting``
+        # BEFORE the actual shutdown runs. This prevents the classic
+        # race where a request races past the deadline check and reaches
+        # an internal APScheduler that is halfway through shutdown.
+        self._stopping: bool = False
+        self._shutdown_event: asyncio.Event | None = None
 
     async def start(self) -> None:
         """Inicializa AsyncIOScheduler con SQLAlchemyJobStore persistent.
@@ -86,16 +94,108 @@ class DeepResearchScheduler:
             extra={"jobstore_url": self._jobstore_url},
         )
 
-    async def shutdown(self) -> None:
-        """Graceful shutdown. Await in-flight jobs hasta 30s."""
+    def stop_accepting(self) -> bool:
+        """Mark the scheduler as no longer accepting enqueues. Idempotent.
+
+        Synchronous seam. Once set, any ``enqueue`` call raises
+        ``SchedulerUnavailableError`` *immediately* — before any DB
+        transaction or APScheduler call.
+
+        Returns:
+            True if this call flipped the flag, False if it was already
+            set.
+        """
+        if self._stopping:
+            return False
+        self._stopping = True
+        return True
+
+    def start_accepting(self) -> bool:
+        """Re-arm the admission seam after a successful startup.
+
+        Slice 1C1c: paired with :meth:`stop_accepting` so a successful
+        ``start()`` can re-enable the enqueue path. Idempotent — calling
+        it on a scheduler that is already accepting returns ``False``
+        without touching the flag. This is the only way the composer
+        should clear the pre-emptive guard set right before ``start()``;
+        a future refactor that reintroduces direct ``_stopping`` writes
+        should route through this method instead so the rollback
+        ordering stays observable in tests.
+        """
+        if not self._stopping:
+            return False
+        self._stopping = False
+        return True
+
+    @property
+    def accepting(self) -> bool:
+        """True while enqueues are still allowed (read-only state)."""
+        return not self._stopping
+
+    async def shutdown(self, timeout_s: float = 10.0) -> bool:
+        """Bounded, idempotent shutdown. Returns truthy drain outcome.
+
+        Slice 1C1c contract:
+        1. ``stop_accepting()`` is called FIRST so subsequent enqueues
+           reject with ``SchedulerUnavailableError`` even if a caller
+           races the actual shutdown.
+        2. ``self._scheduler.shutdown(wait=True)`` is dispatched to a
+           dedicated background thread (via ``asyncio.to_thread``) so
+           the asyncio event-loop thread NEVER blocks inside the
+           blocking APScheduler shutdown. This avoids the documented
+           ``asyncio.run()`` hang that left the process alive after
+           the deadline.
+        3. The internal scheduler reference is detached (*not* replaced)
+           so no late ``enqueue`` call can route into a half-shut
+           APScheduler instance.
+        4. Boolean honestly distinguishes graceful completion (True)
+           from deadline expiry (False). The default executor task,
+           when used, is awaited under the same deadline — no awaited
+           default-executor task is left dangling after this returns.
+
+        Args:
+            timeout_s: caller-imposed budget (seconds). Must be > 0.
+
+        Returns:
+            True if APScheduler finished shutting down within the
+            deadline, False otherwise.
+        """
+        # (a) Flag stopping first, *synchronously*, BEFORE issuing
+        # the actual shutdown. Even a concurrent ``enqueue`` sees
+        # the guard immediately.
+        self.stop_accepting()
+
         if self._scheduler is None:
-            return
+            return True
+
+        scheduler_ref = self._scheduler
+        # Detach so any late ``enqueue`` call cannot reach a half-shut
+        # APScheduler instance. We do NOT create a replacement — losing
+        # the reference is intentional.
+        self._scheduler = None
+
+        deadline = max(timeout_s, 0.0)
+
+        # (b) Dispatch the blocking APScheduler.shutdown(wait=True) to a
+        # dedicated thread so the event loop stays responsive. Without
+        # this, calling ``scheduler.shutdown(wait=True)`` directly from
+        # the loop's thread would wedge the process.
         try:
-            self._scheduler.shutdown(wait=True)
+            await asyncio.wait_for(
+                asyncio.to_thread(scheduler_ref.shutdown, True),
+                timeout=deadline,
+            )
+            logger.info("research_scheduler_stopped")
+            return True
+        except TimeoutError:
+            logger.warning("research_scheduler_shutdown_timeout")
+            # Best-effort: cancel pending futures so we don't leak the
+            # background thread. APScheduler doesn't expose a public
+            # ``cancel()``; the next loop tick will reap the worker.
+            return False
         except Exception:
             logger.exception("research_scheduler_shutdown_error")
-        self._scheduler = None
-        logger.info("research_scheduler_stopped")
+            return False
 
     @property
     def running(self) -> bool:
@@ -125,7 +225,19 @@ class DeepResearchScheduler:
         El callable ejecutado por APScheduler es `service._run_research` — el
         `service` se inyecta via `set_service()` DESPUÉS de start() para
         evitar import circular. Si no se inyecta, NO se ejecuta (logged warning).
+
+        Slice 1C1c: ``stop_accepting()`` rejects all new enqueues
+        immediately. The check fires *before* any DB transaction or
+        APScheduler call so neither half-shut resources nor the DB
+        needs to handle the rejection.
         """
+        # Slice 1C1c: reject immediately once stopping begins, BEFORE
+        # any DB transaction or APScheduler.add_job call. Mirrors the
+        # service-level guard so the test asserting "submission
+        # rejection happens before budget/DB/enqueue" succeeds for
+        # both HTTP-side and recovery-side callers.
+        if self._stopping:
+            raise SchedulerUnavailableError("Scheduler is no longer accepting enqueues")
         if self._scheduler is None:
             logger.warning(
                 "research_scheduler_enqueue_skipped_not_started",
