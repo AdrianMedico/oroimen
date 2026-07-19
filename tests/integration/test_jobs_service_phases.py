@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -57,9 +58,35 @@ class _FakeSettings:
     deep_research_output_max_tokens = 10000
 
 
+class _FakeFetcher:
+    """Controlled fake safe fetcher for Phase 2 tests.
+
+    Records every ``fetch(url)`` invocation and returns scripted bytes.
+    The service must use ONLY the returned bounded bytes for local
+    decode; there is no other transport.
+    """
+
+    def __init__(self, bodies: dict[str, bytes] | None = None) -> None:
+        self.calls: list[str] = []
+        self._bodies = bodies or {}
+
+    async def fetch(self, url: str) -> _FakeFetchResult:
+        self.calls.append(url)
+        body = self._bodies.get(url, b"<html>default</html>")
+        return _FakeFetchResult(body=body, media_type="text/html", status=200)
+
+
+@dataclass
+class _FakeFetchResult:
+    body: bytes
+    media_type: str = "text/html"
+    status: int = 200
+    redirect_count: int = 0
+
+
 @pytest.fixture
 def service_with_mocks(db, tmp_path: Path):
-    """Service with real DB + mocked LLM/search/notifier/scheduler."""
+    """Service with real DB + mocked LLM/search/notifier/scheduler/fetcher."""
     settings = _FakeSettings()
     settings.deep_research_data_root = str(tmp_path / "jobs")
 
@@ -71,12 +98,16 @@ def service_with_mocks(db, tmp_path: Path):
     search = MagicMock()
     scheduler = MagicMock()
     scheduler.enqueue = AsyncMock()
+    # Slice 1C1b: controlled fake fetcher; tests can override
+    # service._fetcher for specific Phase 2 scenarios.
+    fetcher = _FakeFetcher()
 
     service = DeepResearchService(
         db=db,
         notifier=notifier,
         llm_router=llm,
         web_search=search,
+        fetcher=fetcher,
         settings=settings,
         scheduler=scheduler,
     )
@@ -160,6 +191,11 @@ async def test_phase_search_timeout_raises_phase_error(db, service_with_mocks) -
 async def test_phase_scrape_size_guard_truncates_before_thread(db, service_with_mocks) -> None:
     """Phase 2: HTML > 2MB → truncated to 2MB BEFORE to_thread.
 
+    Slice 1C1b: replaces the former httpx.AsyncClient seam with a
+    controlled safe fetcher. The service must call
+    ``await self._fetcher.fetch(url)`` and use only the bounded bytes
+    for local decode.
+
     Verifies by patching html_to_text_selectolax to capture what it
     receives and asserting the input was ≤ _HTML_SIZE_GUARD_BYTES.
     """
@@ -172,29 +208,12 @@ async def test_phase_scrape_size_guard_truncates_before_thread(db, service_with_
         user_id=0,
     )
 
-    # Mock httpx with a response whose .text is 3MB of HTML
-    oversized = "x" * (3 * 1024 * 1024)
-
-    class _FakeResp:
-        status_code = 200
-        text = oversized
-
-        def raise_for_status(self):
-            pass
-
-    class _FakeClient:
-        def __init__(self, *args, **kwargs):
-            # Accept whatever httpx.AsyncClient() passes (timeout=, etc.)
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def get(self, url, **kwargs):
-            return _FakeResp()
+    # Body must be local bytes returned by the fetcher (3MB).
+    oversized = b"x" * (3 * 1024 * 1024)
+    fetcher = _FakeFetcher(
+        bodies={"https://example.com/big": oversized},
+    )
+    service._fetcher = fetcher
 
     received_html_sizes: list[int] = []
     real_html_to_text = html_to_text_selectolax
@@ -203,26 +222,107 @@ async def test_phase_scrape_size_guard_truncates_before_thread(db, service_with_
         received_html_sizes.append(len(html))
         return real_html_to_text(html)
 
-    # Patch at module level because _phase_scrape calls
-    # `html_to_text_selectolax` (module-level reference) directly.
-    # Also patch sys.modules['httpx'].AsyncClient (which is what `import httpx`
-    # inside _phase_scrape resolves to).
-    import httpx as _httpx_mod
-
     from hermes.jobs import service as service_module
 
-    with (
-        patch.object(_httpx_mod, "AsyncClient", _FakeClient),
-        patch.object(service_module, "html_to_text_selectolax", _capture),
-    ):
+    with patch.object(service_module, "html_to_text_selectolax", _capture):
         results = await service._phase_scrape(job_id, ["https://example.com/big"])
 
-    # Size guard truncated to ≤ 2MB
+    # Safe fetcher was called for the URL.
+    assert fetcher.calls == ["https://example.com/big"]
+    # Size guard truncated to ≤ 2MB.
     assert len(received_html_sizes) == 1
     assert received_html_sizes[0] <= _HTML_SIZE_GUARD_BYTES
-    # Output structure
+    # Output structure.
     assert len(results) == 1
     assert results[0]["url"] == "https://example.com/big"
+    assert results[0]["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_phase_scrape_uses_fake_fetcher(db, service_with_mocks) -> None:
+    """Phase 2 calls ``self._fetcher.fetch(url)`` and consumes bounded bytes only.
+
+    Slice 1C1b: proves the safe-fetcher boundary is the only HTTP
+    seam. The service must NOT import httpx or instantiate AsyncClient.
+    """
+    service, _llm, _search, _notifier = service_with_mocks
+    job_id = "usesfetch1"
+    await db.create_research_job(
+        job_id=job_id,
+        query="x",
+        notify_via_tg=0,
+        user_id=0,
+    )
+
+    url = "https://example.invalid/page"
+    body_html = (
+        b"<html><body>" + (b"hello world this is sufficient content. " * 100) + b"</body></html>"
+    )
+    fetcher = _FakeFetcher(
+        bodies={url: body_html},
+    )
+    service._fetcher = fetcher
+
+    results = await service._phase_scrape(job_id, [url])
+
+    # Fetcher was called exactly once for the URL.
+    assert fetcher.calls == [url]
+    assert len(results) == 1
+    assert results[0]["success"] is True
+    assert "hello world" in results[0]["clean_text"]
+
+
+@pytest.mark.asyncio
+async def test_phase_scrape_fetcher_exception_maps_to_redacted_error(
+    db, service_with_mocks
+) -> None:
+    """Phase 2 maps a fetcher exception to a stable redacted error.
+
+    Slice 1C1b: the redacted error must NOT contain the URL,
+    hostname, exception text, exception type, or any input
+    identifier. The marker is a stable ``safe_fetch_failed`` string.
+    """
+
+    class _ExplodingFetcher:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def fetch(self, url: str) -> Any:
+            self.calls.append(url)
+            # Raise with a value the test can search for. The service
+            # MUST NOT include this text in the returned marker.
+            raise RuntimeError(
+                "SECRET_TOKEN_abc123 example.invalid TypeError: secret internal detail"
+            )
+
+    service, _llm, _search, _notifier = service_with_mocks
+    job_id = "explode1"
+    await db.create_research_job(
+        job_id=job_id,
+        query="x",
+        notify_via_tg=0,
+        user_id=0,
+    )
+
+    exploding = _ExplodingFetcher()
+    service._fetcher = exploding
+
+    results = await service._phase_scrape(job_id, ["https://example.invalid/x"])
+
+    # Fetcher was called.
+    assert exploding.calls == ["https://example.invalid/x"]
+    assert len(results) == 1
+    # The marker must be a stable redacted error.
+    assert results[0]["success"] is False
+    assert results[0]["error"] == "safe_fetch_failed"
+    # The marker must NOT contain the URL, hostname, exception text,
+    # exception type, or input identifiers.
+    marker = results[0]["error"]
+    assert "SECRET_TOKEN_abc123" not in marker
+    assert "example.invalid" not in marker
+    assert "RuntimeError" not in marker
+    assert "TypeError" not in marker
+    assert "secret" not in marker
 
 
 @pytest.mark.asyncio

@@ -168,6 +168,7 @@ class DeepResearchService:
         notifier: Any,
         llm_router: Any,
         web_search: Any,
+        fetcher: Any,
         settings: Any,
         scheduler: Any,
     ) -> None:
@@ -175,6 +176,12 @@ class DeepResearchService:
         self._notifier = notifier
         self._llm = llm_router
         self._search = web_search
+        # Slice 1B+1C1b: external HTTP is funneled through the
+        # reviewed safe fetcher boundary. The service no longer owns
+        # any direct HTTP transport, AsyncClient, or fallback path.
+        # The fetcher must be supplied — there is no default and no
+        # optional fallback because that would defeat the boundary.
+        self._fetcher = fetcher
         self._settings = settings
         self._scheduler = scheduler
 
@@ -763,21 +770,30 @@ class DeepResearchService:
         return urls[:max_sources]
 
     async def _phase_scrape(self, job_id: str, urls: list[str]) -> list[dict]:
-        """Phase 2: HTTP fetch + selectolax html_to_text. Size Guard 2MB.
+        """Phase 2: safe-fetch external URL + selectolax html_to_text.
+
+        Slice 1B+1C1b: HTTP fetching is funneled exclusively through the
+        reviewed SafeExternalFetcher boundary. There is no direct httpx,
+        no AsyncClient, and no fallback transport — the fetcher must be
+        supplied at construction time.
 
         Para cada URL:
-          1. fetch raw con httpx (timeout 30s)
-          2. Size Guard: si raw > 2MB → truncate ANTES de to_thread
+          1. fetch bounded bytes via ``await self._fetcher.fetch(url)``
+          2. Size Guard: si body > 2MB → truncate ANTES de to_thread
           3. html_to_text via custom ThreadPoolExecutor (4 workers)
           4. si clean_text < 100 chars → mark success=False, error='too_short'
 
         Output: list of dicts con keys: url, success, clean_text?, error?
+
+        Failure handling: any safe-fetch failure (including
+        ``SafeFetchError`` and unexpected exceptions) is collapsed into a
+        stable redacted source failure. The URL, hostname, body bytes,
+        exception text, and FetchErrorCode value are NEVER returned to
+        the caller nor logged here — only a generic ``safe_fetch_failed``
+        marker. This preserves the privacy guarantee from the fetcher
+        boundary.
         """
-        import httpx
-
-        timeout = int(getattr(self._settings, "deep_research_phase2_timeout_s", 30))
-
-        # Observability: threadpool saturation al inicio de phase 2
+        # Observability: threadpool saturation al inicio de phase 2.
         # NB1 verifier finding: usa el counter explícito ``self._scrape_active``
         # en vez de inspeccionar ``self._scrape_pool._idle_semaphore._value``
         # (estado interno de CPython, frágil entre versiones). Al inicio de
@@ -798,30 +814,33 @@ class DeepResearchService:
 
         async def fetch_one(url: str) -> dict:
             try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    resp = await client.get(url, follow_redirects=True)
-                resp.raise_for_status()
-                raw = resp.text
-                # Size Guard 2MB ANTES de to_thread (P0-1 v1.3 Gemini)
+                # SafeExternalFetcher.fetch returns a FetchResult with bounded bytes.
+                # The fetcher boundary is the ONLY place where the URL is resolved.
+                result = await self._fetcher.fetch(url)
+                raw = result.body
+                # Size Guard 2MB ANTES de to_thread (P0-1 v1.3 Gemini).
+                # Operates on local bytes only — no additional fetch.
                 if len(raw) > _HTML_SIZE_GUARD_BYTES:
                     raw = raw[:_HTML_SIZE_GUARD_BYTES]
+                # Deterministic, bounded UTF-8 decode (errors='replace') BEFORE
+                # dispatching to the thread pool. This is the ONLY network → text
+                # decode seam: no second fetch, no fallback transport, no httpx
+                # access here. selectolax and the regex fallback both expect str,
+                # so we MUST convert bytes → str before to_thread.
+                html_text = raw.decode("utf-8", errors="replace")
                 # HTML parse en thread pool dedicado (no default executor).
                 # NB1: usamos _run_in_scrape_pool para mantener
                 # self._scrape_active sincronizado (saturación métrica).
-                clean = await self._run_in_scrape_pool(html_to_text_selectolax, raw)
+                clean = await self._run_in_scrape_pool(html_to_text_selectolax, html_text)
                 if len(clean) < 100:
                     return {"url": url, "success": False, "error": "too_short"}
                 return {"url": url, "success": True, "clean_text": clean}
-            except TimeoutError:
-                return {"url": url, "success": False, "error": "timeout"}
-            except httpx.HTTPStatusError as exc:
-                return {
-                    "url": url,
-                    "success": False,
-                    "error": f"http_{exc.response.status_code}",
-                }
-            except Exception as exc:
-                return {"url": url, "success": False, "error": f"parse_error:{exc!s}"}
+            except Exception:
+                # Stable redacted source failure. Do NOT include URL,
+                # hostname, exception text, exception type, or any
+                # underlying fetcher code in the returned marker. The
+                # fetcher boundary already enforces the same redaction.
+                return {"success": False, "error": "safe_fetch_failed"}
 
         results = await asyncio.gather(*[fetch_one(u) for u in urls], return_exceptions=False)
         return results

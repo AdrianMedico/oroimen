@@ -23,11 +23,31 @@ from __future__ import annotations
 import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from unittest.mock import MagicMock
 
 import pytest
 
 from hermes.jobs.service import DeepResearchService
+
+
+@dataclass
+class _FakeFetchResult:
+    body: bytes
+    media_type: str = "text/html"
+    status: int = 200
+    redirect_count: int = 0
+
+
+class _FakeFetcher:
+    """Controlled fake safe fetcher (Slice 1C1b)."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def fetch(self, url: str) -> _FakeFetchResult:
+        self.calls.append(url)
+        return _FakeFetchResult(body=b"<html></html>")
 
 
 def _make_service(pool_workers: int = 1) -> DeepResearchService:
@@ -37,11 +57,13 @@ def _make_service(pool_workers: int = 1) -> DeepResearchService:
         pool_workers: how many workers in the scrape pool. Default 1 so we
             can deterministically observe the "during" state without races.
     """
+    fetcher = _FakeFetcher()
     service = DeepResearchService(
         db=None,
         notifier=None,
         llm_router=None,
         web_search=None,
+        fetcher=fetcher,
         settings=MagicMock(),
         scheduler=None,
     )
@@ -71,18 +93,18 @@ async def test_threadpool_saturation_counter_increments() -> None:
     # Let the wrapper reach ``await submit(...)`` and fn start.
     await asyncio.sleep(0.02)
     # Counter must be +1 while fn is running.
-    assert (
-        service._scrape_active == 1
-    ), f"Counter should be +1 while fn runs, got {service._scrape_active}"
+    assert service._scrape_active == 1, (
+        f"Counter should be +1 while fn runs, got {service._scrape_active}"
+    )
 
     result = await task
     assert result == "done"
-    assert (
-        observed["during"] == 1
-    ), f"Counter during fn execution should be 1, got {observed.get('during')}"
-    assert (
-        service._scrape_active == 0
-    ), f"Counter should return to 0 after completion, got {service._scrape_active}"
+    assert observed["during"] == 1, (
+        f"Counter during fn execution should be 1, got {observed.get('during')}"
+    )
+    assert service._scrape_active == 0, (
+        f"Counter should return to 0 after completion, got {service._scrape_active}"
+    )
 
 
 @pytest.mark.asyncio
@@ -101,9 +123,9 @@ async def test_threadpool_saturation_counter_decrements_on_exception() -> None:
         await service._run_in_scrape_pool(fake_fn)
 
     # Even though fn raised, counter must be back to 0.
-    assert (
-        service._scrape_active == 0
-    ), f"Counter should be 0 after exception, got {service._scrape_active}"
+    assert service._scrape_active == 0, (
+        f"Counter should be 0 after exception, got {service._scrape_active}"
+    )
 
 
 @pytest.mark.asyncio
@@ -134,18 +156,18 @@ async def test_threadpool_saturation_counter_concurrent() -> None:
     ]
     # Yield so all wrappers reach ``await submit(...)`` and fns start.
     await asyncio.sleep(0.02)
-    assert (
-        service._scrape_active == 3
-    ), f"Counter should be 3 with 3 in-flight tasks, got {service._scrape_active}"
+    assert service._scrape_active == 3, (
+        f"Counter should be 3 with 3 in-flight tasks, got {service._scrape_active}"
+    )
 
     results = await asyncio.gather(*tasks)
     assert results == ["result-0", "result-1", "result-2"]
-    assert (
-        observed_peak["peak"] == 3
-    ), f"Peak counter during execution should be 3, got {observed_peak['peak']}"
-    assert (
-        service._scrape_active == 0
-    ), f"Counter should be 0 after all tasks complete, got {service._scrape_active}"
+    assert observed_peak["peak"] == 3, (
+        f"Peak counter during execution should be 3, got {observed_peak['peak']}"
+    )
+    assert service._scrape_active == 0, (
+        f"Counter should be 0 after all tasks complete, got {service._scrape_active}"
+    )
 
 
 @pytest.mark.asyncio
@@ -158,9 +180,9 @@ async def test_threadpool_saturation_counter_no_negative() -> None:
     service = _make_service(pool_workers=2)
     for _i in range(5):
         await service._run_in_scrape_pool(lambda: "x")
-    assert (
-        service._scrape_active == 0
-    ), f"After 5 sequential calls, counter must be 0, got {service._scrape_active}"
+    assert service._scrape_active == 0, (
+        f"After 5 sequential calls, counter must be 0, got {service._scrape_active}"
+    )
 
 
 @pytest.mark.asyncio
@@ -191,9 +213,9 @@ async def test_threadpool_saturation_no_idle_semaphore_access() -> None:
                 f"line {node.lineno}: {ast.unparse(node) if hasattr(ast, 'unparse') else 'attr access'}"
             )
 
-    assert (
-        not bad_refs
-    ), f"NB1 regression: _idle_semaphore attribute access found in service.py: {bad_refs}"
+    assert not bad_refs, (
+        f"NB1 regression: _idle_semaphore attribute access found in service.py: {bad_refs}"
+    )
 
 
 @pytest.mark.asyncio

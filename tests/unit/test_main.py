@@ -21,7 +21,11 @@ Estrategia de mocking (justificación):
 from __future__ import annotations
 
 import asyncio
+import sys
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -852,3 +856,370 @@ async def test_close_core_resources_closes_all_after_earlier_failure() -> None:
     telemetry.aclose.assert_awaited_once()
     llm.aclose.assert_awaited_once()
     db.close.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Slice 1C1b: Deep Research runtime startup ordering + capability booleans
+# ---------------------------------------------------------------------------
+# These tests assert the reviewed startup sequence WITHOUT spinning up the
+# full HTTP server, real Telegram polling, or any network. We replace the
+# real DeepResearchService / DeepResearchScheduler / SafeExternalFetcher /
+# recover_research_jobs / set_deep_research_service call sites with fakes
+# that record their invocation order, then assert the published capabilities.
+# Disabled / missing-prerequisite paths register NO research-specific runtime
+# and report false runtime capabilities.
+
+
+class _RecordingDRScheduler:
+    """Stand-in for DeepResearchScheduler that records the startup sequence.
+
+    Every event (``set_service`` / ``start``) is recorded both into
+    ``self.calls`` (used for in-order scheduler assertions) and via the
+    ``record_callback`` (if set), which lets the global ordering list
+    see scheduler events interleaved with closure-local ordering from
+    other fakes.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self._service: object | None = None
+        self.received_service: object | None = None
+        self.record_callback: Callable[[str], None] | None = None
+
+    def set_service(self, service: object) -> None:
+        self.calls.append("set_service")
+        self._service = service
+        self.received_service = service
+        if self.record_callback is not None:
+            self.record_callback("attach_to_scheduler")
+
+    async def start(self) -> None:
+        self.calls.append("start")
+        if self.record_callback is not None:
+            self.record_callback("scheduler_start")
+
+
+def _patch_dr_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    scheduler: _RecordingDRScheduler,
+    service_should_fail: bool = False,
+) -> dict:
+    """Wire all Deep Research runtime call sites to the recording stubs.
+
+    Returns a dict with call logs. Uses ``setattr`` on the imported
+    module symbols so the fake instances replace the real classes.
+
+    Slice 1C1b closure: also patches ``hermes.receivers.http_api.create_app``
+    so the test can assert that the SAME service instance reaches the
+    app's deep_research_capabilities-singleton registration AND that
+    recovery completes BEFORE both ``create_app`` and the HTTP task
+    are constructed.
+    """
+    service_constructor_calls: list[dict] = []
+    fetcher_constructor_calls: list[dict] = []
+    set_singleton_calls: list[object | None] = []
+    recover_calls: list[dict] = []
+    # Holds the constructed service instance so assertions can verify
+    # that the SAME object was passed to set_service, set_deep_research_service,
+    # and scheduler.set_service(...).
+    constructed_services: list[object] = []
+    # Records the full successful ordering across all reviewed steps plus
+    # ``create_app`` invocation and HTTP task creation. The list contains
+    # short string labels in invocation order, e.g.
+    #   ["construct_service", "attach_to_scheduler", "singleton_register",
+    #    "scheduler_start", "recover", "create_app", "http_task"]
+    ordering: list[str] = []
+    # The capabilities object that was passed into the app via create_app,
+    # captured for assertion on the seven approved runtime booleans.
+    app_caps: list[Any] = []
+    # The ``create_app`` keyword arguments across invocations, used to
+    # verify it received the SAME service singleton via its deps and the
+    # SAME capability object.
+    create_app_kwargs: list[dict] = []
+
+    class _FakeDRService:
+        def __init__(self, **kwargs: Any) -> None:
+            service_constructor_calls.append(kwargs)
+            constructed_services.append(self)
+            ordering.append("construct_service")
+            self._service_id = id(self)
+            if service_should_fail:
+                raise RuntimeError("service construct exploded")
+            self.kwargs = kwargs
+
+    class _FakeSafeFetcherCls:
+        def __init__(self, **kwargs: Any) -> None:
+            fetcher_constructor_calls.append(kwargs)
+            ordering.append("construct_fetcher")
+            self.kwargs = kwargs
+
+    async def _fake_recover_research_jobs(**kwargs: Any) -> int:
+        recover_calls.append(kwargs)
+        ordering.append("recover")
+        return 0
+
+    def _fake_set_singleton(service: object | None) -> None:
+        set_singleton_calls.append(service)
+        ordering.append("singleton_register")
+
+    def _fake_create_app(**kwargs: Any) -> MagicMock:
+        """Recording stand-in for ``hermes.receivers.http_api.create_app``.
+
+        Captures the kwargs so we can verify that the same
+        ``deep_research_capabilities`` instance reaches the app and the
+        same service deps are visible (the test does not pull the deps
+        through the app — they're already asserted via the scheduler +
+        singleton assertions — so a MagicMock is safe).
+        """
+        ordering.append("create_app")
+        create_app_kwargs.append(kwargs)
+        # Capture the capability object the runtime handed to create_app;
+        # assertions read it back to compare with the singleton.
+        caps_arg = kwargs.get("deep_research_capabilities")
+        if caps_arg is not None:
+            app_caps.append(caps_arg)
+        return MagicMock()
+
+    class _FakeUvicornServer:
+        """Stand-in for ``uvicorn.Server`` — only ``serve`` is awaited."""
+
+        def __init__(self, config: Any) -> None:
+            self.config = config
+
+        async def serve(self) -> None:
+            ordering.append("http_task_serve")
+            # Block until the test activates the stop_event; mirrors the
+            # real uvicorn.Server.serve() in main.py.
+            stop_event = (
+                FakePollingReceiver.last_stop_event
+                if FakePollingReceiver.last_stop_event is not None
+                else asyncio.Event()
+            )
+            try:
+                await stop_event.wait()
+            except asyncio.CancelledError:
+                return
+
+    class _FakeUvicornConfig:
+        def __init__(self, app: Any, **kwargs: Any) -> None:
+            self.app = app
+            self.kwargs = kwargs
+
+    import hermes.jobs.recovery as recovery_module
+    import hermes.jobs.safe_fetcher as safe_fetcher_module
+    import hermes.jobs.scheduler as scheduler_module
+    import hermes.jobs.service as service_module
+    import hermes.receivers.http_api as http_api_module
+    import hermes.receivers.jobs_api as jobs_api_module
+
+    # Let the scheduler append its events into the same closure ordering
+    # list so the assertion can interleave scheduler events with the
+    # other fake's events without touching the scheduler's own ``calls``.
+    def _record(event: str) -> None:
+        ordering.append(event)
+
+    scheduler.record_callback = _record
+
+    monkeypatch.setattr(scheduler_module, "DeepResearchScheduler", lambda **kw: scheduler)
+    monkeypatch.setattr(service_module, "DeepResearchService", _FakeDRService)
+    monkeypatch.setattr(
+        safe_fetcher_module,
+        "SafeExternalFetcher",
+        _FakeSafeFetcherCls,
+    )
+    monkeypatch.setattr(recovery_module, "recover_research_jobs", _fake_recover_research_jobs)
+    monkeypatch.setattr(jobs_api_module, "set_deep_research_service", _fake_set_singleton)
+    monkeypatch.setattr(http_api_module, "create_app", _fake_create_app)
+    # Patch uvicorn via sys.modules because hermes.__main__.run() imports
+    # uvicorn locally (``import uvicorn`` inside the enable_http_api
+    # block), so main_module.uvicorn does not exist as a module attribute.
+    # Replacing sys.modules["uvicorn"] ensures the local ``import uvicorn``
+    # statement resolves to the fake without spinning up a real listener.
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        MagicMock(
+            Server=_FakeUvicornServer,
+            Config=_FakeUvicornConfig,
+        ),
+    )
+    # DeepResearchCapabilities stays real (no I/O, just a frozen model).
+
+    return {
+        "service_constructor_calls": service_constructor_calls,
+        "fetcher_constructor_calls": fetcher_constructor_calls,
+        "set_singleton_calls": set_singleton_calls,
+        "recover_calls": recover_calls,
+        "constructed_services": constructed_services,
+        "ordering": ordering,
+        "app_caps": app_caps,
+        "create_app_kwargs": create_app_kwargs,
+    }
+
+
+def _enable_dr_prereqs(monkeypatch: pytest.MonkeyPatch, *, enabled: bool) -> None:
+    """Configure the env so the runtime sees enabled + a Tavily key + a cloud LLM.
+
+    Slice 1C1b: also enable the Search Router so the Tavily backend is
+    actually constructed at startup. Without SEARCH_ENABLED=true,
+    ``settings.search_enabled`` is False → ``search_backends`` is empty
+    → ``tavily_configured`` is False → ``all_prereqs_ready`` is False,
+    so the successful-order test would silently exercise the
+    missing-prerequisite branch instead of the reviewed construction path.
+    """
+    monkeypatch.setenv("HERMES_DEEP_RESEARCH_ENABLED", "true" if enabled else "false")
+    if enabled:
+        # SEARCH_ENABLED activates the search block in hermes.__main__.run()
+        # which constructs the TavilyBackend when TAVILY_API_KEY is set.
+        monkeypatch.setenv("SEARCH_ENABLED", "true")
+        # Tavily backend construction key. Fake value — must not be a real
+        # secret; the test does NOT issue any network requests, it only
+        # verifies that the constructor was invoked.
+        monkeypatch.setenv("TAVILY_API_KEY", "fake-tavily-key")
+        # Cloud LLM client (OPENCODE_GO_API_KEY) is set in the hermes_env
+        # fixture, so cloud_client_configured is True in run().
+    else:
+        # Disabled path: explicitly turn the Search Router off so the
+        # disabled test exercises the `deep_research_enabled=False` branch.
+        monkeypatch.setenv("SEARCH_ENABLED", "false")
+        monkeypatch.setenv("TAVILY_API_KEY", "")
+
+
+@pytest.fixture
+def dr_patched_hermes_main(
+    hermes_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict:
+    """Apply the standard hermes_main patches AND enable Deep Research prereqs."""
+    FakePollingReceiver.reset()
+    fake_health = make_fake_health()
+    captured_signals: list[asyncio.Event] = []
+    monkeypatch.setattr(main_module, "PollingReceiver", FakePollingReceiver)
+    monkeypatch.setattr(main_module, "HealthServer", MagicMock(return_value=fake_health))
+    monkeypatch.setattr(main_module, "ToolRegistry", MagicMock())
+    monkeypatch.setattr(main_module, "register_builtin_tools", MagicMock())
+    monkeypatch.setattr(
+        main_module,
+        "install_signal_handlers",
+        lambda evt: captured_signals.append(evt),
+    )
+    # Keep the composition tests focused on the Deep Research seam.  The
+    # normal application lifecycle starts several unrelated schedulers and a
+    # health-check task; their shutdown timing is intentionally covered by
+    # the existing lifecycle tests and makes these ordering assertions slow
+    # and flaky on Windows.
+    # The fake receiver provides the deterministic stop-event seam used by
+    # these tests; it does not make any Telegram network calls.
+    monkeypatch.setenv("ENABLE_TELEGRAM", "true")
+    monkeypatch.setenv("BACKUP_ENABLED", "false")
+    monkeypatch.setenv("CLEANUP_ENABLED", "false")
+    monkeypatch.setenv("VAULT_DROP_ENABLED", "false")
+    monkeypatch.setenv("PUSH_NOTIFICATIONS_ENABLED", "false")
+    monkeypatch.setenv("TOOLS_ENABLED", "false")
+    scheduler = _RecordingDRScheduler()
+    return {
+        "fake_health": fake_health,
+        "captured_signals": captured_signals,
+        "scheduler": scheduler,
+    }
+
+
+def _dr_settings(*, enabled: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        deep_research_enabled=enabled,
+        search_enabled=True,
+        search_size_guard_chars=1000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_compose_deep_research_runtime_orders_success_without_full_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _RecordingDRScheduler()
+    logs = _patch_dr_runtime(monkeypatch, scheduler=scheduler)
+    caps, returned_scheduler, service = await main_module._compose_deep_research_runtime(
+        settings=_dr_settings(enabled=True),
+        db=MagicMock(),
+        notifier=MagicMock(),
+        llm=SimpleNamespace(cloud_client_configured=True),
+        search_backends={"tavily": MagicMock()},
+        search_budget=MagicMock(),
+        search_circuit_breaker=MagicMock(),
+        search_concurrency=MagicMock(),
+    )
+    assert returned_scheduler is scheduler
+    assert service is logs["constructed_services"][0]
+    assert logs["ordering"] == [
+        "construct_fetcher",
+        "construct_service",
+        "attach_to_scheduler",
+        "singleton_register",
+        "scheduler_start",
+        "recover",
+    ]
+    assert scheduler.calls == ["set_service", "start"]
+    assert all(
+        getattr(caps, name)
+        for name in (
+            "service_wiring",
+            "recovery_wiring",
+            "fetch_policy",
+            "external_fetch",
+            "search_backend_configured",
+            "llm_provider_configured",
+            "model_output_enforced",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_compose_deep_research_runtime_disabled_constructs_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _RecordingDRScheduler()
+    logs = _patch_dr_runtime(monkeypatch, scheduler=scheduler)
+    caps, returned_scheduler, service = await main_module._compose_deep_research_runtime(
+        settings=_dr_settings(enabled=False),
+        db=MagicMock(),
+        notifier=MagicMock(),
+        llm=SimpleNamespace(cloud_client_configured=True),
+        search_backends={"tavily": MagicMock()},
+        search_budget=MagicMock(),
+        search_circuit_breaker=MagicMock(),
+        search_concurrency=MagicMock(),
+    )
+    assert not caps.service_wiring
+    assert returned_scheduler is None and service is None
+    assert logs["ordering"] == [] and logs["set_singleton_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_compose_deep_research_runtime_failure_stops_and_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingScheduler(_RecordingDRScheduler):
+        async def start(self) -> None:
+            await super().start()
+            raise RuntimeError("test failure")
+
+        async def shutdown(self) -> None:
+            self.calls.append("shutdown")
+
+    scheduler = FailingScheduler()
+    logs = _patch_dr_runtime(monkeypatch, scheduler=scheduler)
+    caps, returned_scheduler, service = await main_module._compose_deep_research_runtime(
+        settings=_dr_settings(enabled=True),
+        db=MagicMock(),
+        notifier=MagicMock(),
+        llm=SimpleNamespace(cloud_client_configured=True),
+        search_backends={"tavily": MagicMock()},
+        search_budget=MagicMock(),
+        search_circuit_breaker=MagicMock(),
+        search_concurrency=MagicMock(),
+    )
+    assert not caps.service_wiring
+    assert returned_scheduler is None and service is None
+    assert scheduler.calls == ["set_service", "start", "shutdown"]
+    assert logs["set_singleton_calls"][-1] is None

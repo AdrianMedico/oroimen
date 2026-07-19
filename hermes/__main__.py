@@ -85,6 +85,111 @@ async def _close_core_resources(
         raise first_error
 
 
+async def _compose_deep_research_runtime(
+    *,
+    settings: Any,
+    db: Any,
+    notifier: Any,
+    llm: Any,
+    search_backends: dict[str, Any],
+    search_budget: Any,
+    search_circuit_breaker: Any,
+    search_concurrency: Any,
+) -> tuple[Any, Any | None, Any | None]:
+    """Compose opt-in research before HTTP; roll back partial startup only."""
+    from hermes.jobs.preflight import DeepResearchCapabilities
+    from hermes.jobs.recovery import recover_research_jobs
+    from hermes.jobs.safe_fetcher import DualAddressResolver, FetchPolicy, SafeExternalFetcher
+    from hermes.jobs.scheduler import DeepResearchScheduler
+    from hermes.jobs.service import DeepResearchService
+    from hermes.receivers.jobs_api import set_deep_research_service
+
+    unavailable = DeepResearchCapabilities()
+    if not settings.deep_research_enabled:
+        logger.info("deep_research_runtime_skipped_disabled")
+        return unavailable, None, None
+    tavily = "tavily" in search_backends
+    cloud = bool(getattr(llm, "cloud_client_configured", False))
+    if not (
+        tavily
+        and cloud
+        and settings.search_enabled
+        and search_budget is not None
+        and search_circuit_breaker is not None
+        and search_concurrency is not None
+    ):
+        logger.info("deep_research_runtime_skipped_missing_prereqs")
+        return unavailable, None, None
+
+    scheduler: Any | None = None
+
+    async def rollback() -> None:
+        if scheduler is not None:
+            try:
+                await scheduler.shutdown()
+            except Exception:
+                logger.error("deep_research_runtime_rollback_failed")
+        try:
+            set_deep_research_service(None)
+        except Exception:
+            logger.error("deep_research_runtime_rollback_failed")
+
+    try:
+        fetcher = SafeExternalFetcher(policy=FetchPolicy(), resolver=DualAddressResolver())
+        scheduler = DeepResearchScheduler(db=db, settings=settings)
+        from hermes.services.search.router import hermes_search
+
+        async def native_search(query: str, intent: str, content: str, num_results: int) -> Any:
+            return await hermes_search(
+                query=query,
+                intent=intent,
+                content=content,
+                num_results=num_results,
+                backends=search_backends,
+                budget=search_budget,
+                circuit_breaker=search_circuit_breaker,
+                semaphore=search_concurrency,
+                size_guard_chars=settings.search_size_guard_chars,
+            )
+
+        service = DeepResearchService(
+            db=db,
+            notifier=notifier,
+            llm_router=llm,
+            web_search=native_search,
+            fetcher=fetcher,
+            settings=settings,
+            scheduler=scheduler,
+        )
+        scheduler.set_service(service)
+        set_deep_research_service(service)
+        await scheduler.start()
+        await recover_research_jobs(
+            db=db, notifier=notifier, settings=settings, scheduler=scheduler
+        )
+    except asyncio.CancelledError:
+        await rollback()
+        raise
+    except Exception:
+        logger.error("deep_research_runtime_start_failed")
+        await rollback()
+        return unavailable, None, None
+
+    return (
+        DeepResearchCapabilities(
+            service_wiring=True,
+            recovery_wiring=True,
+            fetch_policy=True,
+            external_fetch=True,
+            search_backend_configured=True,
+            llm_provider_configured=True,
+            model_output_enforced=True,
+        ),
+        scheduler,
+        service,
+    )
+
+
 async def run() -> int:
     settings = Settings()
     configure_logging(settings.log_level)
@@ -630,6 +735,21 @@ async def run() -> int:
             extra={"tools": tool_registry.list_tools(), "count": len(tool_registry.list_tools())},
         )
 
+    (
+        deep_research_runtime_caps,
+        _deep_research_scheduler_obj,
+        _deep_research_service_obj,
+    ) = await _compose_deep_research_runtime(
+        settings=settings,
+        db=db,
+        notifier=notifier,
+        llm=llm,
+        search_backends=search_backends,
+        search_budget=search_budget,
+        search_circuit_breaker=search_circuit_breaker,
+        search_concurrency=search_concurrency,
+    )
+
     # Sprint 6 T53 v3.1: HTTP API server (opt-in).
     # Si enable_http_api=True, arrancamos uvicorn.Server en una task
     # paralela que comparte los singletons (db, llm, tool_registry).
@@ -639,7 +759,6 @@ async def run() -> int:
     http_server = None
     http_task: asyncio.Task | None = None
     if settings.enable_http_api:
-        from hermes.jobs.preflight import DeepResearchCapabilities
         from hermes.receivers.http_api import create_app
 
         http_app = create_app(
@@ -651,10 +770,7 @@ async def run() -> int:
             telemetry=telemetry,  # Sprint 9.3.3: para que AgentLoop registre metricas
             ocr_repo=ocr_repo,  # Sprint 19 Slice 4d: OCR decision API
             edge_coordinator=edge_coordinator,
-            deep_research_capabilities=DeepResearchCapabilities(
-                search_backend_configured="tavily" in search_backends,
-                llm_provider_configured=llm.cloud_client_configured,
-            ),
+            deep_research_capabilities=deep_research_runtime_caps,
         )
         import uvicorn
 

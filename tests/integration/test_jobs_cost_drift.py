@@ -9,6 +9,7 @@ Anti-regression checks:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,6 +19,25 @@ import pytest
 from hermes.jobs.cost import calculate_cost
 from hermes.jobs.models import PhaseName
 from hermes.jobs.service import DeepResearchService
+
+
+@dataclass
+class _FakeFetchResult:
+    body: bytes
+    media_type: str = "text/html"
+    status: int = 200
+    redirect_count: int = 0
+
+
+class _FakeFetcher:
+    """Controlled fake safe fetcher (Slice 1C1b)."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def fetch(self, url: str) -> _FakeFetchResult:
+        self.calls.append(url)
+        return _FakeFetchResult(body=b"<html></html>")
 
 
 class _FakeSettings:
@@ -36,7 +56,7 @@ class _FakeSettings:
 
 @pytest.fixture
 def service_with_db(db, tmp_path: Path):
-    """Build a DeepResearchService pointing at the real DB, with mock notifier/llm/search."""
+    """Build a DeepResearchService pointing at the real DB, with mock notifier/llm/search/fetcher."""
     settings = _FakeSettings()
     settings.deep_research_data_root = str(tmp_path / "jobs")
     notifier = MagicMock()
@@ -45,11 +65,13 @@ def service_with_db(db, tmp_path: Path):
     llm = MagicMock()
     search = MagicMock()
     scheduler = MagicMock()
+    fetcher = _FakeFetcher()
     service = DeepResearchService(
         db=db,
         notifier=notifier,
         llm_router=llm,
         web_search=search,
+        fetcher=fetcher,
         settings=settings,
         scheduler=scheduler,
     )
