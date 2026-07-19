@@ -241,6 +241,11 @@ async def test_phase_per_source_synthesis_with_one_failed(db, service_with_mocks
         user_id=0,
     )
 
+    # Oroimen Slice 1C1a: set distinct non-default configured value so
+    # the assertion below proves the override is forwarded (not just
+    # that the global llm_max_tokens default leaks through).
+    service._settings.deep_research_per_source_max_tokens = 4321
+
     sources = [
         {"url": "https://a.com", "success": True, "clean_text": "alpha content"},
         {"url": "https://b.com", "success": True, "clean_text": "beta content"},
@@ -265,6 +270,11 @@ async def test_phase_per_source_synthesis_with_one_failed(db, service_with_mocks
     assert "Summary of B" in summaries[1]
     # Only 2 LLM calls (c didn't trigger)
     assert llm_mock.chat.call_count == 2
+    # Oroimen Slice 1C1a: phase 3 forwards the configured per-source
+    # output token limit, distinct from the global llm_max_tokens default.
+    assert llm_mock.chat.await_count == 2
+    for call in llm_mock.chat.await_args_list:
+        assert call.kwargs.get("max_tokens") == 4321
 
 
 @pytest.mark.asyncio
@@ -306,6 +316,11 @@ async def test_phase_final_synthesis_with_citations(db, service_with_mocks) -> N
         user_id=0,
     )
 
+    # Oroimen Slice 1C1a: set distinct non-default configured value so
+    # the assertion below proves phase 4 forwards its own setting
+    # (not the per-source value or any global default).
+    service._settings.deep_research_output_max_tokens = 8765
+
     # Mock LLM to return a citation-style report
     citation_report = """## Summary
 Based on the sources [1] and [2], the answer is X.
@@ -335,6 +350,10 @@ Based on the sources [1] and [2], the answer is X.
     assert "[2]" in report
     # Sanitized (no thinking blocks leaked)
     assert "<think>" not in report
+    # Oroimen Slice 1C1a: phase 4 forwards the configured final-output
+    # token limit, distinct from the per-source setting.
+    llm.chat.assert_awaited_once()
+    assert llm.chat.await_args.kwargs.get("max_tokens") == 8765
 
 
 @pytest.mark.asyncio

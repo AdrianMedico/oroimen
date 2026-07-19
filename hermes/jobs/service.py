@@ -854,6 +854,13 @@ class DeepResearchService:
                         self._llm.chat(
                             messages=[{"role": "user", "content": prompt}],
                             chain_override=[_DEFAULT_LLM_MODEL],
+                            max_tokens=int(
+                                getattr(
+                                    self._settings,
+                                    "deep_research_per_source_max_tokens",
+                                    3000,
+                                )
+                            ),
                         ),
                         timeout=int(
                             getattr(
@@ -937,6 +944,13 @@ class DeepResearchService:
                     self._llm.chat(
                         messages=[{"role": "user", "content": prompt}],
                         chain_override=[_DEFAULT_LLM_MODEL],
+                        max_tokens=int(
+                            getattr(
+                                self._settings,
+                                "deep_research_output_max_tokens",
+                                10000,
+                            )
+                        ),
                     ),
                     timeout=int(
                         getattr(
@@ -1267,7 +1281,7 @@ class DeepResearchService:
 
         # Source 2: SUM of token_usage table
         db_sum = await self._db.query_scalar(
-            "SELECT COALESCE(SUM(cost_usd), 0) FROM research_job_token_usage " "WHERE job_id = ?",
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM research_job_token_usage WHERE job_id = ?",
             job_id,
         )
         db_sum_dec = Decimal(str(db_sum or 0.0))
