@@ -84,6 +84,28 @@ def set_deep_research_service(service: Any) -> None:
     logger.info("jobs_api_service_registered")
 
 
+def clear_deep_research_service() -> bool:
+    """Clear the singleton. Idempotent lifecycle seam (Slice 1C1c).
+
+    Called from the centralized shutdown helper BEFORE shared DB /
+    provider resources are closed so that no stale dependency can
+    route a late request into a service that is being torn down.
+
+    Returns:
+        True if a singleton was cleared, False if no singleton was set.
+
+    Backward compatible: the existing ``set_deep_research_service``
+    setter-based tests continue to work. ``get_deep_research_service_dep``
+    keeps its 503 behavior after clearing.
+    """
+    global _service_singleton
+    had_value = _service_singleton is not None
+    if had_value:
+        _service_singleton = None
+        logger.info("jobs_api_service_cleared")
+    return had_value
+
+
 def get_deep_research_service_dep() -> Any:
     """FastAPI dependency que devuelve el service singleton.
 

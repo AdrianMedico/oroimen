@@ -85,6 +85,347 @@ async def _close_core_resources(
         raise first_error
 
 
+# Slice 1C1c: default deadlines for bounded research lifecycle teardown.
+# Both are intentionally sub-second-eligible for tests via injection.
+_DEFAULT_RESEARCH_SCHEDULER_SHUTDOWN_S = 10.0
+_DEFAULT_RESEARCH_SERVICE_ACLOSE_S = 10.0
+
+
+async def _run_cleanup_steps(
+    *,
+    scheduler: Any | None,
+    service: Any | None,
+    timeout_s_scheduler: float,
+    timeout_s_service: float,
+    clear_singleton: bool,
+) -> None:
+    """Inner cleanup steps; the finally block always clears the singleton.
+
+    Slice 1C1c remediation (P1-A1): this is the inner task body that
+    actually performs steps (b)..(e). Its ``finally`` block guarantees
+    the singleton is cleared even if the caller (the outer task
+    awaiting ``asyncio.shield(...)``) is cancelled mid-shutdown.
+    """
+    try:
+        # (b) Synchronous, idempotent stop_accepting on both halves.
+        # Both halves tolerate being called twice; subsequent accept
+        # calls return False. This is the cheapest possible "reject new
+        # work" guarantee and runs even if scheduler/service are missing.
+        if service is not None:
+            try:
+                flipped = service.stop_accepting()
+                logger.info(
+                    "deep_research_cleanup_service_stop_accepting",
+                    extra={"flipped": flipped},
+                )
+            except Exception:
+                logger.exception("deep_research_cleanup_service_stop_accepting_failed")
+        if scheduler is not None:
+            try:
+                flipped = scheduler.stop_accepting()
+                logger.info(
+                    "deep_research_cleanup_scheduler_stop_accepting",
+                    extra={"flipped": flipped},
+                )
+            except Exception:
+                logger.exception("deep_research_cleanup_scheduler_stop_accepting_failed")
+
+        # (c) Bounded scheduler shutdown. The scheduler's own
+        # implementation honors the deadline via asyncio.to_thread so
+        # it NEVER blocks the loop. Treat outcome as informational; do
+        # NOT skip (d)/(e) on timeout — the service can still be torn
+        # down safely.
+        if scheduler is not None:
+            try:
+                ok = await scheduler.shutdown(timeout_s=timeout_s_scheduler)
+                logger.info(
+                    "deep_research_cleanup_scheduler_shutdown",
+                    extra={"drained": bool(ok)},
+                )
+            except Exception:
+                logger.exception("deep_research_cleanup_scheduler_shutdown_failed")
+
+        # (d) Bounded service aclose. Best-effort: a False/timeout
+        # return MUST NOT prevent the singleton clear. The service
+        # implementation is idempotent and deadline-bounded.
+        if service is not None:
+            try:
+                ok = await service.aclose(timeout_s=timeout_s_service)
+                logger.info(
+                    "deep_research_cleanup_service_aclose",
+                    extra={"drained": bool(ok)},
+                )
+            except Exception:
+                logger.exception("deep_research_cleanup_service_aclose_failed")
+    finally:
+        # (e) ALWAYS clear the singleton — this is the critical
+        # guarantee that survives caller cancellation. The finally
+        # block runs regardless of which step above raised or whether
+        # the outer task is being cancelled; the inner task itself
+        # is shielded from cancellation by the asyncio.shield() wrap
+        # in the outer function, so this finally runs to completion
+        # even when the caller is cancelled mid-shutdown.
+        if clear_singleton:
+            try:
+                from hermes.receivers.jobs_api import clear_deep_research_service
+
+                cleared = clear_deep_research_service()
+                logger.info(
+                    "deep_research_cleanup_singleton_cleared",
+                    extra={"cleared": bool(cleared)},
+                )
+            except Exception:
+                logger.exception("deep_research_cleanup_singleton_clear_failed")
+
+
+async def _deep_research_cleanup(
+    *,
+    scheduler: Any | None,
+    service: Any | None,
+    timeout_s_scheduler: float = _DEFAULT_RESEARCH_SCHEDULER_SHUTDOWN_S,
+    timeout_s_service: float = _DEFAULT_RESEARCH_SERVICE_ACLOSE_S,
+    clear_singleton: bool = True,
+) -> None:
+    """Centralized, idempotent, best-effort Deep Research cleanup seam.
+
+    Slice 1C1c remediation (P1-A1): cancellation-safe contract.
+
+      (b) ``stop_accepting()`` on service AND scheduler — synchronous,
+          immediate. Any new HTTP ``submit_job`` / recovery enqueue
+          rejects right after this.
+      (c) Bounded scheduler shutdown — runs in a worker thread so the
+          asyncio event-loop is never blocked; returns True/False by
+          deadline. Failures are logged (best-effort).
+      (d) Bounded service ``aclose`` — drains / cancels the scrape
+          executor and marks ``closed=True``. Failures are logged.
+      (e) Clear the process-global API singleton — restores the 503
+          behavior in ``get_deep_research_service_dep``.
+
+    Cancellation safety:
+      - The actual cleanup steps run in a separate ``asyncio.Task``
+        (``_run_cleanup_steps``) so the caller can be cancelled without
+        abandoning the seam midway.
+      - The caller awaits ``asyncio.shield(cleanup_task)`` (NOT a bare
+        ``await cleanup_task``). The shield decouples the outer
+        coroutine's ``_fut_waiter`` from the inner task, so that
+        ``outer.cancel()`` does NOT cascade into the inner via
+        CPython's ``Task.cancel() → _fut_waiter.cancel()`` mechanism.
+        The inner task continues to run through its ``finally`` block
+        (which clears the singleton) even when the outer is cancelled.
+      - If the shielded await raises ``CancelledError``, the outer
+        does a SECOND ``await cleanup_task`` (no shield) to wait for
+        the inner to finish, then re-raises the ORIGINAL
+        ``CancelledError`` so the caller's cancel propagates only
+        after cleanup completes.
+      - The inner task's ``finally`` block ALWAYS clears the singleton
+        (when ``clear_singleton`` is True) regardless of which step
+        raised.
+      - A ``done_callback`` on the cleanup task logs completion so
+        there are no unobserved background tasks. The callback is
+        logging-only — it is NOT a wait mechanism (the second
+        ``await cleanup_task`` is the wait).
+      - Every step is best-effort: a failure in (c), (d), or (e) cannot
+        prevent the remaining steps from running.
+
+    The disabled / unavailable case (``scheduler is None and service
+    is None``) is a safe no-op that still optionally clears the
+    singleton.
+
+    Stable event/category-only logging: no exception text, no
+    traceback lines containing configuration. The function is safe
+    to call multiple times across rollback + ordinary shutdown paths.
+    """
+    cleanup_task = asyncio.create_task(
+        _run_cleanup_steps(
+            scheduler=scheduler,
+            service=service,
+            timeout_s_scheduler=timeout_s_scheduler,
+            timeout_s_service=timeout_s_service,
+            clear_singleton=clear_singleton,
+        )
+    )
+
+    def _log_cleanup_done(t: "asyncio.Task[None]") -> None:
+        """Done-callback so the cleanup task is never unobserved.
+
+        Either logs a clean completion, surfaces a swallowed exception,
+        or notes that the inner task was itself cancelled. The
+        ``Exception`` branch is intentionally narrow (not BaseException)
+        so an internal cancellation during teardown is handled
+        separately by the ``CancelledError`` branch.
+        """
+        try:
+            t.result()
+            logger.info("deep_research_cleanup_task_done")
+        except asyncio.CancelledError:
+            logger.warning("deep_research_cleanup_task_cancelled")
+        except Exception:
+            logger.exception("deep_research_cleanup_task_failed")
+
+    cleanup_task.add_done_callback(_log_cleanup_done)
+    try:
+        # The shield is the cancellation-safety mechanism: it makes
+        # ``outer._fut_waiter`` an internal future, NOT ``cleanup_task``,
+        # so ``outer.cancel()`` does not cascade into the inner task.
+        # The inner continues to run through its ``finally`` block
+        # (which clears the singleton). See CPython's
+        # ``asyncio/tasks.py:Task.cancel`` for the fut_waiter chain.
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        # Caller cancelled the outer. The inner task is still running
+        # because the shield absorbed the cancel. Wait for the inner
+        # to finish (its ``finally`` clears the singleton), then
+        # re-raise the ORIGINAL CancelledError so the caller's cancel
+        # propagates only after cleanup completes.
+        await cleanup_task
+        raise
+    except Exception:
+        # Inner task failed (not via cancel). Propagate to caller.
+        raise
+
+
+async def _compose_deep_research_runtime(
+    *,
+    settings: Any,
+    db: Any,
+    notifier: Any,
+    llm: Any,
+    search_backends: dict[str, Any],
+    search_budget: Any,
+    search_circuit_breaker: Any,
+    search_concurrency: Any,
+) -> tuple[Any, Any | None, Any | None]:
+    """Compose opt-in research before HTTP; roll back partial startup only."""
+    from hermes.jobs.preflight import DeepResearchCapabilities
+    from hermes.jobs.recovery import recover_research_jobs
+    from hermes.jobs.safe_fetcher import DualAddressResolver, FetchPolicy, SafeExternalFetcher
+    from hermes.jobs.scheduler import DeepResearchScheduler
+    from hermes.jobs.service import DeepResearchService
+    from hermes.receivers.jobs_api import set_deep_research_service
+
+    unavailable = DeepResearchCapabilities()
+    if not settings.deep_research_enabled:
+        logger.info("deep_research_runtime_skipped_disabled")
+        return unavailable, None, None
+    tavily = "tavily" in search_backends
+    cloud = bool(getattr(llm, "cloud_client_configured", False))
+    if not (
+        tavily
+        and cloud
+        and settings.search_enabled
+        and search_budget is not None
+        and search_circuit_breaker is not None
+        and search_concurrency is not None
+    ):
+        logger.info("deep_research_runtime_skipped_missing_prereqs")
+        return unavailable, None, None
+
+    scheduler: Any | None = None
+    service: Any | None = None
+
+    async def rollback() -> None:
+        """Tear down using the same seam as ordinary host shutdown.
+
+        Slice 1C1c: the rollback path uses ``_deep_research_cleanup``
+        so it shares the lifecycle contract with the main shutdown path.
+        Importantly, the rollback retains the ``service`` reference when
+        it is available (so the seam can drive ``stop_accepting`` and
+        ``aclose`` on it) while the scheduler is still passed through
+        only when it was constructed. The public singleton clear
+        happens as the LAST step so any in-flight recovery write that
+        raced the rollback is rejected first, then the dependency is
+        cleared without losing context in logs.
+        """
+        await _deep_research_cleanup(
+            scheduler=scheduler,
+            service=service,
+            timeout_s_scheduler=_DEFAULT_RESEARCH_SCHEDULER_SHUTDOWN_S,
+            timeout_s_service=_DEFAULT_RESEARCH_SERVICE_ACLOSE_S,
+            clear_singleton=True,
+        )
+
+    try:
+        fetcher = SafeExternalFetcher(policy=FetchPolicy(), resolver=DualAddressResolver())
+        scheduler = DeepResearchScheduler(db=db, settings=settings)
+        from hermes.services.search.router import hermes_search
+
+        async def native_search(query: str, intent: str, content: str, num_results: int) -> Any:
+            return await hermes_search(
+                query=query,
+                intent=intent,
+                content=content,
+                num_results=num_results,
+                backends=search_backends,
+                budget=search_budget,
+                circuit_breaker=search_circuit_breaker,
+                semaphore=search_concurrency,
+                size_guard_chars=settings.search_size_guard_chars,
+            )
+
+        service = DeepResearchService(
+            db=db,
+            notifier=notifier,
+            llm_router=llm,
+            web_search=native_search,
+            fetcher=fetcher,
+            settings=settings,
+            scheduler=scheduler,
+        )
+        scheduler.set_service(service)
+        # Slice 1C1c: pre-emptive admission guard. Setting
+        # ``_stopping`` BEFORE the actual ``start()`` ensures that any
+        # late enqueue (e.g. a recovery call that races startup) is
+        # rejected immediately rather than reaching a half-built
+        # scheduler. The guard is re-armed below once ``start()``
+        # returns successfully, so the normal path is unaffected.
+        # If ``start()`` raises, the rollback re-asserts the guard
+        # (idempotent) and tears the runtime down through the shared
+        # cleanup seam.
+        scheduler.stop_accepting()
+        await scheduler.start()
+        # Re-arm the pre-emptive guard BEFORE recovery runs so the
+        # recovery enqueue is actually admitted (recovery is the
+        # legitimate first client of the new runtime).
+        scheduler.start_accepting()
+        await recover_research_jobs(
+            db=db, notifier=notifier, settings=settings, scheduler=scheduler
+        )
+        # Slice 1C1c remediation (P1-B1): publish the singleton ONLY
+        # after the full recovery contract has succeeded. The
+        # previous ordering published the global dependency while
+        # the scheduler was still half-built, leaving a race window
+        # where a concurrent ``submit_job`` HTTP request could reach
+        # a scheduler that wasn't yet ready. By moving the publish
+        # to the very last step, a successful composition guarantees
+        # the runtime is fully ready and recovery has completed
+        # before any external client can route through it. On the
+        # failure / cancellation paths below, the publish is never
+        # reached — the singleton stays cleared and the 503
+        # dependency behavior is preserved.
+        set_deep_research_service(service)
+    except asyncio.CancelledError:
+        await rollback()
+        raise
+    except Exception:
+        logger.error("deep_research_runtime_start_failed")
+        await rollback()
+        return unavailable, None, None
+
+    return (
+        DeepResearchCapabilities(
+            service_wiring=True,
+            recovery_wiring=True,
+            fetch_policy=True,
+            external_fetch=True,
+            search_backend_configured=True,
+            llm_provider_configured=True,
+            model_output_enforced=True,
+        ),
+        scheduler,
+        service,
+    )
+
+
 async def run() -> int:
     settings = Settings()
     configure_logging(settings.log_level)
@@ -630,6 +971,21 @@ async def run() -> int:
             extra={"tools": tool_registry.list_tools(), "count": len(tool_registry.list_tools())},
         )
 
+    (
+        deep_research_runtime_caps,
+        _deep_research_scheduler_obj,
+        _deep_research_service_obj,
+    ) = await _compose_deep_research_runtime(
+        settings=settings,
+        db=db,
+        notifier=notifier,
+        llm=llm,
+        search_backends=search_backends,
+        search_budget=search_budget,
+        search_circuit_breaker=search_circuit_breaker,
+        search_concurrency=search_concurrency,
+    )
+
     # Sprint 6 T53 v3.1: HTTP API server (opt-in).
     # Si enable_http_api=True, arrancamos uvicorn.Server en una task
     # paralela que comparte los singletons (db, llm, tool_registry).
@@ -639,7 +995,6 @@ async def run() -> int:
     http_server = None
     http_task: asyncio.Task | None = None
     if settings.enable_http_api:
-        from hermes.jobs.preflight import DeepResearchCapabilities
         from hermes.receivers.http_api import create_app
 
         http_app = create_app(
@@ -651,10 +1006,7 @@ async def run() -> int:
             telemetry=telemetry,  # Sprint 9.3.3: para que AgentLoop registre metricas
             ocr_repo=ocr_repo,  # Sprint 19 Slice 4d: OCR decision API
             edge_coordinator=edge_coordinator,
-            deep_research_capabilities=DeepResearchCapabilities(
-                search_backend_configured="tavily" in search_backends,
-                llm_provider_configured=llm.cloud_client_configured,
-            ),
+            deep_research_capabilities=deep_research_runtime_caps,
         )
         import uvicorn
 
@@ -768,6 +1120,12 @@ async def run() -> int:
         # Sprint 6 T53 v3.1: parar uvicorn ANTES de cerrar DB/llm
         # para que requests en vuelo puedan terminar limpiamente.
         # uvicorn.Server.serve() respeta should_exit = True y para.
+        # Slice 1C1c: HTTP stop is step (a) of the deep research
+        # shutdown sequence. Only AFTER http_task has finished do we
+        # call ``stop_accepting`` on the research runtime. The
+        # ``finally`` block below the scheduled tasks executes the
+        # remaining research shutdown steps (b)..(e) BEFORE the
+        # other schedulers and shared DB/provider closure.
         if http_server is not None:
             http_server.should_exit = True
         if http_task is not None:
@@ -779,6 +1137,15 @@ async def run() -> int:
                 await receiver_task
         if health is not None:
             await health.stop()
+        # Slice 1C1c steps (b)..(e): bounded deep research shutdown.
+        # This runs inside the ``finally`` so it executes even on
+        # CancelledError / uncaught exceptions in the shutdown path.
+        # Disabled / unavailable Deep Research is a no-op because the
+        # helper tolerates ``scheduler is None and service is None``.
+        await _deep_research_cleanup(
+            scheduler=_deep_research_scheduler_obj,
+            service=_deep_research_service_obj,
+        )
     # Sprint 8 S8.4: parar backup scheduler (espera al job en curso).
     # Sprint 9.2: parar sleep cycle scheduler si esta activo.
     # Sprint 9.4: parar conversation cleanup scheduler.

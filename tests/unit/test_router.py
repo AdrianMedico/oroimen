@@ -431,6 +431,85 @@ class TestOpenAIPath:
         assert payload["repetition_penalty"] == 1.06
 
     @pytest.mark.asyncio
+    async def test_openai_max_tokens_override_reaches_payload(
+        self, settings: Settings, respx_mock
+    ) -> None:
+        """Oroimen Slice 1C1a: explicit `max_tokens` override reaches the
+        /chat/completions payload when the caller provides one.
+        """
+        import json as _json
+
+        url = f"{settings.opencode_go_base_url}/chat/completions"
+        captured: list[dict] = []
+
+        def cb(req: httpx.Request) -> httpx.Response:
+            captured.append(_json.loads(req.content))
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                },
+            )
+
+        respx_mock.post(url).mock(side_effect=cb)
+
+        router = LLMRouter(settings)
+        try:
+            await router.chat(
+                [{"role": "user", "content": "u"}],
+                temperature=0.5,
+                chain_override=["deepseek-v4-flash"],
+                max_tokens=2468,
+            )
+        finally:
+            await router.aclose()
+
+        assert len(captured) == 1
+        payload = captured[0]
+        assert payload["max_tokens"] == 2468
+
+    @pytest.mark.asyncio
+    async def test_openai_payload_omits_max_tokens_when_no_override(
+        self, settings: Settings, respx_mock
+    ) -> None:
+        """Oroimen Slice 1C1a: without an override, the /chat/completions
+        payload must NOT carry a `max_tokens` field. This preserves
+        backward compatibility for ordinary chat() callers (no override)
+        and OpenAI providers that reject unknown keys.
+        """
+        import json as _json
+
+        url = f"{settings.opencode_go_base_url}/chat/completions"
+        captured: list[dict] = []
+
+        def cb(req: httpx.Request) -> httpx.Response:
+            captured.append(_json.loads(req.content))
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                },
+            )
+
+        respx_mock.post(url).mock(side_effect=cb)
+
+        router = LLMRouter(settings)
+        try:
+            await router.chat(
+                [{"role": "user", "content": "u"}],
+                temperature=0.5,
+                chain_override=["deepseek-v4-flash"],
+            )
+        finally:
+            await router.aclose()
+
+        assert len(captured) == 1
+        payload = captured[0]
+        assert "max_tokens" not in payload
+
+    @pytest.mark.asyncio
     async def test_uses_default_temperature_when_not_provided(
         self, settings: Settings, respx_mock
     ) -> None:
@@ -740,6 +819,49 @@ class TestAnthropicPath:
         assert payload["messages"] == [{"role": "user", "content": "hola"}]
         # No hay system prompt → no se incluye el campo
         assert "system" not in payload
+
+    @pytest.mark.asyncio
+    async def test_anthropic_max_tokens_override_replaces_default(
+        self, settings: Settings, respx_mock
+    ) -> None:
+        """Oroimen Slice 1C1a: explicit max_tokens override reaches the
+        /messages payload. When the caller passes `max_tokens`, that
+        value wins over settings.llm_max_tokens.
+        """
+        import json as _json
+
+        url = f"{settings.opencode_go_base_url}/messages"
+        captured: list[dict] = []
+
+        def cb(req: httpx.Request) -> httpx.Response:
+            captured.append(_json.loads(req.content))
+            return httpx.Response(
+                200,
+                json={
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+
+        respx_mock.post(url).mock(side_effect=cb)
+
+        router = LLMRouter(settings)
+        try:
+            await router.chat(
+                [{"role": "user", "content": "hola"}],
+                temperature=0.5,
+                chain_override=["minimax-m3"],
+                max_tokens=1234,
+            )
+        finally:
+            await router.aclose()
+
+        assert len(captured) == 1
+        payload = captured[0]
+        # Override is forwarded verbatim; settings.llm_max_tokens
+        # default is NOT used in its place.
+        assert payload["max_tokens"] == 1234
+        assert payload["max_tokens"] != settings.llm_max_tokens
 
     @pytest.mark.asyncio
     async def test_payload_includes_top_p_but_not_repetition_penalty(

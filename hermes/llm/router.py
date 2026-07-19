@@ -1442,6 +1442,7 @@ class LLMRouter:
         is_voice: bool = False,
         tools: list[dict] | None = None,
         chain_override: list[str] | None = None,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         """Invoca el LLM con smart routing unificado (v1.2).
 
@@ -1506,7 +1507,9 @@ class LLMRouter:
                 logger.warning("circuit_open_skip", extra={"breaker": model})
                 continue
             try:
-                return await self._call_with_breaker(breaker, model, messages, temperature, tools)
+                return await self._call_with_breaker(
+                    breaker, model, messages, temperature, tools, max_tokens
+                )
             except (CircuitOpenError, LLMError) as exc:
                 last_err = exc
                 logger.warning(
@@ -1523,6 +1526,7 @@ class LLMRouter:
         messages: list[dict],
         temperature: float,
         tools: list[dict] | None = None,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         max_attempts = self.settings.llm_max_retries + 1
         last_err: Exception | None = None
@@ -1555,7 +1559,7 @@ class LLMRouter:
                     temperature=temperature,
                     tools=tools,
                 )
-            coro = self._invoke(model, messages, temperature, tools)
+            coro = self._invoke(model, messages, temperature, tools, max_tokens)
             try:
                 return await breaker.call(_await(coro))
             except (CircuitOpenError, LLMError) as exc:
@@ -1583,6 +1587,7 @@ class LLMRouter:
         messages: list[dict],
         temperature: float,
         tools: list[dict] | None = None,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         # Sprint 19.6+ Phase 4 (OpenAI Build Week): el frontier usa su
         # propio cliente (httpx + breaker dedicados). Esta rama solo
@@ -1618,10 +1623,10 @@ class LLMRouter:
         # workaround y mantiene compatibilidad con todos los tests
         # existentes que no usan tools.
         if force_openai_for_tools(model) and tools:
-            return await self._invoke_openai(model, messages, temperature, tools)
+            return await self._invoke_openai(model, messages, temperature, tools, max_tokens)
         if is_anthropic_model(model):
-            return await self._invoke_anthropic(model, messages, temperature, tools)
-        return await self._invoke_openai(model, messages, temperature, tools)
+            return await self._invoke_anthropic(model, messages, temperature, tools, max_tokens)
+        return await self._invoke_openai(model, messages, temperature, tools, max_tokens)
 
     async def _invoke_openai(
         self,
@@ -1629,6 +1634,7 @@ class LLMRouter:
         messages: list[dict],
         temperature: float,
         tools: list[dict] | None = None,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         # Sprint 19.6+ Phase 5: ver guard en _stream_anthropic.
         if self._client is None:
@@ -1656,6 +1662,13 @@ class LLMRouter:
             # campos no estándar con 400).
             "repetition_penalty": self.settings.llm_repetition_penalty,
         }
+        # Oroimen Slice 1C1a: explicit Deep Research per-phase output
+        # token limit. Only include when the caller overrides; the
+        # ordinary chat() call (no override) keeps the unchanged
+        # /chat/completions payload shape so legacy OpenAI providers
+        # that reject unknown keys don't break.
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         if tools:
             payload["tools"] = tools
         try:
@@ -1717,6 +1730,7 @@ class LLMRouter:
         messages: list[dict],
         temperature: float,
         tools: list[dict] | None = None,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         # Sprint 19.6+ Phase 5: ver guard en _stream_anthropic.
         if self._client is None:
@@ -1732,7 +1746,11 @@ class LLMRouter:
         anthropic_messages = _transform_to_anthropic_messages(user_assistant)
         payload: dict = {
             "model": model,
-            "max_tokens": self.settings.llm_max_tokens,
+            # Oroimen Slice 1C1a: explicit Deep Research per-phase output
+            # token limit. Override beats the global default; without an
+            # override we keep the existing llm_max_tokens default so the
+            # ordinary chat() call still works.
+            "max_tokens": max_tokens if max_tokens is not None else self.settings.llm_max_tokens,
             "temperature": temperature,
             "top_p": self.settings.llm_top_p,
         }

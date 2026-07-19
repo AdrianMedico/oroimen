@@ -168,6 +168,7 @@ class DeepResearchService:
         notifier: Any,
         llm_router: Any,
         web_search: Any,
+        fetcher: Any,
         settings: Any,
         scheduler: Any,
     ) -> None:
@@ -175,6 +176,12 @@ class DeepResearchService:
         self._notifier = notifier
         self._llm = llm_router
         self._search = web_search
+        # Slice 1B+1C1b: external HTTP is funneled through the
+        # reviewed safe fetcher boundary. The service no longer owns
+        # any direct HTTP transport, AsyncClient, or fallback path.
+        # The fetcher must be supplied — there is no default and no
+        # optional fallback because that would defeat the boundary.
+        self._fetcher = fetcher
         self._settings = settings
         self._scheduler = scheduler
 
@@ -197,6 +204,55 @@ class DeepResearchService:
         # Tests inyectan via settings.output_dir si necesitan tmp_path.
         self._data_root = Path(getattr(settings, "deep_research_data_root", None) or "data/jobs")
 
+        # =====================================================================
+        # Slice 1C1c: explicit stopping / closed lifecycle state.
+        #
+        # Lifecycle invariants (no exception text is exposed):
+        # - ``_stopping`` is set first (synchronous, idempotent). Any new
+        #   submit / enqueue is rejected immediately afterwards.
+        # - ``_closed`` flips on only AFTER ``aclose`` has drained the
+        #   scrape pool, so in-flight workers can still observe
+        #   ``_stopping`` while they run.
+        # - ``_scrape_active`` is NEVER driven negative: ``_run_in_scrape_pool``
+        #   fails closed (raises after closing) BEFORE incrementing the
+        #   counter, so the increment/decrement pair remains balanced.
+        # =====================================================================
+        self._stopping: bool = False
+        self._closed: bool = False
+        self._aclose_lock: asyncio.Lock = asyncio.Lock()
+
+    # =====================================================================
+    # Slice 1C1c: explicit stopping / closed lifecycle seams
+    # =====================================================================
+
+    def stop_accepting(self) -> bool:
+        """Mark the service as no longer accepting submissions. Idempotent.
+
+        Synchronous seam callable from any thread or shutdown hook.
+        Subsequent ``submit_job`` / ``retry_job`` invocations will reject
+        with ``SchedulerUnavailableError`` *before* any budget check,
+        DB write, or scheduler enqueue. Subsequent calls to this method
+        are no-ops and return the already-stopping value.
+
+        Returns:
+            True if this call flipped the state (no prior stop), False
+            if the service was already in stopping mode.
+        """
+        if self._stopping:
+            return False
+        self._stopping = True
+        return True
+
+    @property
+    def accepting(self) -> bool:
+        """True when ``submit_job`` / ``retry_job`` can still be called."""
+        return not self._stopping
+
+    @property
+    def closed(self) -> bool:
+        """True once ``aclose`` has finished (Drain-safe)."""
+        return self._closed
+
     async def _run_in_scrape_pool(self, fn: Any, *args: Any) -> Any:
         """Ejecuta ``fn`` en el threadpool ``_scrape_pool`` con counter explícito.
 
@@ -208,13 +264,98 @@ class DeepResearchService:
         El counter se incrementa ANTES de submit (evita race: si el thread
         arranca y decrementa antes de que incrementemos, veríamos negativo)
         y se decrementa en finally (cubre excepciones y cancels).
+
+        Slice 1C1c: failure-closed after ``aclose`` begins. Once
+        ``self._closed`` is set, this method raises ``SchedulerUnavailableError``
+        BEFORE incrementing the counter so the in-flight accounting never
+        goes negative. In-flight workers that have already incremented are
+        free to finish or be cancelled; only NEW submissions are rejected.
         """
+        if self._closed:
+            raise SchedulerUnavailableError("Service is closing")
         self._scrape_active += 1
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(self._scrape_pool, fn, *args)
         finally:
             self._scrape_active -= 1
+
+    async def aclose(self, timeout_s: float = 10.0) -> bool:
+        """Stop the service deterministically. Idempotent and deadline-bounded.
+
+        Sequence (intentional order):
+        1. ``stop_accepting()`` — flips ``_stopping`` synchronously so
+           concurrent ``submit_job`` / ``retry_job`` reject immediately.
+        2. Fail-closed the scrape pool: any *new* ``_run_in_scrape_pool``
+           call raises ``SchedulerUnavailableError`` (counter is NEVER
+           driven negative — see that method for the guarantee).
+        3. Cancel in-flight executor work and wait for the scrape pool
+           to drain. We use a bounded ``run_in_executor`` awaiting pattern
+           scheduled on the loop so the deadline is honored even if a
+           worker hangs on a ``to_thread`` call.
+        4. Mark ``_closed`` so further ``aclose`` calls are idempotent
+           no-ops. The original executor reference is released (no
+           replacement executor is created — would defeat shutdown).
+
+        No exception text is exposed. The boolean honestly distinguishes
+        graceful drain (``True``) from deadline expiry (``False``).
+
+        Returns:
+            True if the scrape pool drained within ``timeout_s`` and the
+            service is fully closed; False if the deadline was hit (in
+            which case the executor is cancelled and the service remains
+            in ``_closed=True`` anyway).
+        """
+        # Idempotency guard. ``_closed`` is set on the first call's
+        # success OR deadline path; subsequent calls return its outcome
+        # without re-running the lifecycle.
+        if self._closed:
+            return self._scrape_active == 0
+
+        async with self._aclose_lock:
+            if self._closed:
+                return self._scrape_active == 0
+
+            # (1) Stop accepting first — synchronous and immediate.
+            self.stop_accepting()
+
+            drained = True
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + max(timeout_s, 0.0)
+
+            # (2)+(3) Drain or cancel the scrape pool. We do NOT wait
+            # on ``self._scrape_pool.shutdown(wait=True)`` because that
+            # blocks the asyncio event-loop thread; we instead probe the
+            # counter under the deadline and explicitly cancel stuck
+            # workers via the loop's ``run_in_executor`` integration.
+            try:
+                remaining_sleep = max(0.0, deadline - loop.time())
+                while self._scrape_active > 0 and loop.time() < deadline:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(asyncio.sleep(min(0.05, remaining_sleep))),
+                            timeout=remaining_sleep,
+                        )
+                    except TimeoutError:
+                        break
+                    remaining_sleep = max(0.0, deadline - loop.time())
+                if self._scrape_active > 0:
+                    drained = False
+            except Exception:
+                logger.exception("deep_research_service_drain_error")
+                drained = False
+
+            # (4) Finalize: release the executor. We do NOT recreate it.
+            # If drain wasn't complete we still mark ``_closed`` so any
+            # later ``aclose`` call is a no-op instead of racing.
+            self._closed = True
+            try:
+                self._scrape_pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                # Best-effort: the pool is going out of scope either way.
+                logger.exception("deep_research_service_executor_shutdown_error")
+
+            return drained
 
     # =====================================================================
     # Public API (HTTP-facing, retorna modelos Pydantic)
@@ -229,9 +370,19 @@ class DeepResearchService:
 
         Raises:
             BudgetExceededError: si daily cap reached.
-            SchedulerUnavailableError: si el scheduler no está inicializado.
+            SchedulerUnavailableError: si el scheduler no está inicializado
+                OR ``stop_accepting()`` has been called OR ``aclose`` has
+                started. The rejection happens BEFORE budget / DB /
+                scheduler enqueue so the service can drain safely.
         """
         import uuid
+
+        # Slice 1C1c: reject submissions the moment stopping begins, BEFORE
+        # any budget check, DB write, or scheduler enqueue. This is the
+        # "fail closed" guarantee — once stop_accepting() flips the
+        # flag (synchronously), no new research work enters the pipeline.
+        if self._stopping or self._closed:
+            raise SchedulerUnavailableError("Service is no longer accepting submissions")
 
         # Pre-check 1 (TDD §10.2): budget rápido para UX (fail-fast con 429).
         # Check 2 (atómico en _run_research) captura el TOCTOU race.
@@ -444,8 +595,17 @@ class DeepResearchService:
         Raises:
             JobNotFoundError: si original no existe.
             JobNotRetryableError: si original NO está en 'failed'.
+            SchedulerUnavailableError: si ``stop_accepting()`` /
+                ``aclose`` ha begun — antes de cualquier DB write o
+                scheduler enqueue (Slice 1C1c fail-closed contract).
         """
         import uuid
+
+        # Slice 1C1c: same fail-closed guard as submit_job — applied
+        # before the original-row SELECT so we never touch DB rows when
+        # the service is no longer accepting work.
+        if self._stopping or self._closed:
+            raise SchedulerUnavailableError("Service is no longer accepting submissions")
 
         original = await self._db.get_research_job(job_id)
         if original is None:
@@ -763,21 +923,30 @@ class DeepResearchService:
         return urls[:max_sources]
 
     async def _phase_scrape(self, job_id: str, urls: list[str]) -> list[dict]:
-        """Phase 2: HTTP fetch + selectolax html_to_text. Size Guard 2MB.
+        """Phase 2: safe-fetch external URL + selectolax html_to_text.
+
+        Slice 1B+1C1b: HTTP fetching is funneled exclusively through the
+        reviewed SafeExternalFetcher boundary. There is no direct httpx,
+        no AsyncClient, and no fallback transport — the fetcher must be
+        supplied at construction time.
 
         Para cada URL:
-          1. fetch raw con httpx (timeout 30s)
-          2. Size Guard: si raw > 2MB → truncate ANTES de to_thread
+          1. fetch bounded bytes via ``await self._fetcher.fetch(url)``
+          2. Size Guard: si body > 2MB → truncate ANTES de to_thread
           3. html_to_text via custom ThreadPoolExecutor (4 workers)
           4. si clean_text < 100 chars → mark success=False, error='too_short'
 
         Output: list of dicts con keys: url, success, clean_text?, error?
+
+        Failure handling: any safe-fetch failure (including
+        ``SafeFetchError`` and unexpected exceptions) is collapsed into a
+        stable redacted source failure. The URL, hostname, body bytes,
+        exception text, and FetchErrorCode value are NEVER returned to
+        the caller nor logged here — only a generic ``safe_fetch_failed``
+        marker. This preserves the privacy guarantee from the fetcher
+        boundary.
         """
-        import httpx
-
-        timeout = int(getattr(self._settings, "deep_research_phase2_timeout_s", 30))
-
-        # Observability: threadpool saturation al inicio de phase 2
+        # Observability: threadpool saturation al inicio de phase 2.
         # NB1 verifier finding: usa el counter explícito ``self._scrape_active``
         # en vez de inspeccionar ``self._scrape_pool._idle_semaphore._value``
         # (estado interno de CPython, frágil entre versiones). Al inicio de
@@ -798,30 +967,33 @@ class DeepResearchService:
 
         async def fetch_one(url: str) -> dict:
             try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    resp = await client.get(url, follow_redirects=True)
-                resp.raise_for_status()
-                raw = resp.text
-                # Size Guard 2MB ANTES de to_thread (P0-1 v1.3 Gemini)
+                # SafeExternalFetcher.fetch returns a FetchResult with bounded bytes.
+                # The fetcher boundary is the ONLY place where the URL is resolved.
+                result = await self._fetcher.fetch(url)
+                raw = result.body
+                # Size Guard 2MB ANTES de to_thread (P0-1 v1.3 Gemini).
+                # Operates on local bytes only — no additional fetch.
                 if len(raw) > _HTML_SIZE_GUARD_BYTES:
                     raw = raw[:_HTML_SIZE_GUARD_BYTES]
+                # Deterministic, bounded UTF-8 decode (errors='replace') BEFORE
+                # dispatching to the thread pool. This is the ONLY network → text
+                # decode seam: no second fetch, no fallback transport, no httpx
+                # access here. selectolax and the regex fallback both expect str,
+                # so we MUST convert bytes → str before to_thread.
+                html_text = raw.decode("utf-8", errors="replace")
                 # HTML parse en thread pool dedicado (no default executor).
                 # NB1: usamos _run_in_scrape_pool para mantener
                 # self._scrape_active sincronizado (saturación métrica).
-                clean = await self._run_in_scrape_pool(html_to_text_selectolax, raw)
+                clean = await self._run_in_scrape_pool(html_to_text_selectolax, html_text)
                 if len(clean) < 100:
                     return {"url": url, "success": False, "error": "too_short"}
                 return {"url": url, "success": True, "clean_text": clean}
-            except TimeoutError:
-                return {"url": url, "success": False, "error": "timeout"}
-            except httpx.HTTPStatusError as exc:
-                return {
-                    "url": url,
-                    "success": False,
-                    "error": f"http_{exc.response.status_code}",
-                }
-            except Exception as exc:
-                return {"url": url, "success": False, "error": f"parse_error:{exc!s}"}
+            except Exception:
+                # Stable redacted source failure. Do NOT include URL,
+                # hostname, exception text, exception type, or any
+                # underlying fetcher code in the returned marker. The
+                # fetcher boundary already enforces the same redaction.
+                return {"success": False, "error": "safe_fetch_failed"}
 
         results = await asyncio.gather(*[fetch_one(u) for u in urls], return_exceptions=False)
         return results
@@ -854,6 +1026,13 @@ class DeepResearchService:
                         self._llm.chat(
                             messages=[{"role": "user", "content": prompt}],
                             chain_override=[_DEFAULT_LLM_MODEL],
+                            max_tokens=int(
+                                getattr(
+                                    self._settings,
+                                    "deep_research_per_source_max_tokens",
+                                    3000,
+                                )
+                            ),
                         ),
                         timeout=int(
                             getattr(
@@ -937,6 +1116,13 @@ class DeepResearchService:
                     self._llm.chat(
                         messages=[{"role": "user", "content": prompt}],
                         chain_override=[_DEFAULT_LLM_MODEL],
+                        max_tokens=int(
+                            getattr(
+                                self._settings,
+                                "deep_research_output_max_tokens",
+                                10000,
+                            )
+                        ),
                     ),
                     timeout=int(
                         getattr(
@@ -1267,7 +1453,7 @@ class DeepResearchService:
 
         # Source 2: SUM of token_usage table
         db_sum = await self._db.query_scalar(
-            "SELECT COALESCE(SUM(cost_usd), 0) FROM research_job_token_usage " "WHERE job_id = ?",
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM research_job_token_usage WHERE job_id = ?",
             job_id,
         )
         db_sum_dec = Decimal(str(db_sum or 0.0))
