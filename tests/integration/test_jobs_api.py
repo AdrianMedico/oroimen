@@ -52,6 +52,7 @@ from hermes.jobs.models import (
     JobSummary,
     PhaseName,
 )
+from hermes.jobs.preflight import DeepResearchCapabilities
 from hermes.receivers import jobs_api
 from hermes.receivers.http_api import create_app
 from hermes.tools.registry import ToolRegistry
@@ -656,7 +657,7 @@ def test_auth_required_all_endpoints(client_with_auth: Any) -> None:
         else:
             response = client_with_auth.get(path)
         assert response.status_code == 401, (
-            f"{method} {path} should be 401, got {response.status_code}: " f"{response.text}"
+            f"{method} {path} should be 401, got {response.status_code}: {response.text}"
         )
 
 
@@ -695,3 +696,85 @@ def test_service_unavailable_503_when_singleton_missing(authed_settings: Any, db
     assert response.status_code == 503
     detail = response.json()["detail"]
     assert "not initialized" in detail["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Offline Deep Research preflight
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_default_disabled(
+    client_with_auth: Any,
+    bearer: dict[str, str],
+) -> None:
+    response = client_with_auth.get("/v1/jobs/preflight", headers=bearer)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["schema_version"] == 1
+    assert body["mode"] == "offline"
+    assert body["status"] == "disabled"
+
+
+def test_preflight_requires_jobs_auth(client_with_auth: Any) -> None:
+    response = client_with_auth.get("/v1/jobs/preflight")
+
+    assert response.status_code == 401
+
+
+def test_preflight_enabled_is_blocked(authed_settings: Any, db: Any) -> None:
+    enabled_settings = authed_settings.model_copy(update={"deep_research_enabled": True})
+    jobs_api.set_deep_research_service(None)  # type: ignore[arg-type]
+    app = create_app(enabled_settings, db, _fake_router(), ToolRegistry())
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/jobs/preflight",
+            headers={"Authorization": "Bearer test-bearer-key-xyz"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "blocked"
+    assert {check["state"] for check in body["checks"]} >= {"fail", "skip"}
+
+
+def test_preflight_uses_supplied_runtime_capabilities(
+    authed_settings: Any,
+    db: Any,
+) -> None:
+    enabled_settings = authed_settings.model_copy(update={"deep_research_enabled": True})
+    capabilities = DeepResearchCapabilities(
+        service_wiring=True,
+        recovery_wiring=True,
+        search_backend_configured=True,
+        llm_provider_configured=True,
+        fetch_policy=True,
+        external_fetch=True,
+        report_retrieval=True,
+        model_output_enforced=True,
+        egress_firewall=True,
+        query_decomposition=True,
+    )
+    app = create_app(
+        enabled_settings,
+        db,
+        _fake_router(),
+        ToolRegistry(),
+        deep_research_capabilities=capabilities,
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/jobs/preflight",
+            headers={"Authorization": "Bearer test-bearer-key-xyz"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+
+
+def test_preflight_static_route_precedes_job_id() -> None:
+    paths = [getattr(route, "path", None) for route in jobs_api.router.routes]
+
+    assert paths.index("/v1/jobs/preflight") < paths.index("/v1/jobs/{job_id}")

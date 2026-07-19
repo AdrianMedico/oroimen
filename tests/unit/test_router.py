@@ -56,6 +56,26 @@ async def with_router(settings: Settings, respx_mock, mock_setup) -> tuple[LLMRo
     return router, respx_mock
 
 
+@pytest.mark.asyncio
+async def test_cloud_client_configured_for_standard_test_settings(
+    settings: Settings,
+) -> None:
+    router = LLMRouter(settings)
+    try:
+        assert router.cloud_client_configured is True
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cloud_client_not_configured_for_local_defaults() -> None:
+    router = LLMRouter(Settings(_env_file=None))
+    try:
+        assert router.cloud_client_configured is False
+    finally:
+        await router.aclose()
+
+
 # ---------------------------------------------------------------------------
 # Tests de `is_anthropic_model` (función pura)
 # ---------------------------------------------------------------------------
@@ -1759,9 +1779,9 @@ class TestVoiceChainUnifiedV12:
         from hermes.llm import router as router_module
 
         # NoVoiceFallbackError ya no debe existir en el módulo
-        assert not hasattr(
-            router_module, "NoVoiceFallbackError"
-        ), "NoVoiceFallbackError no debería existir en v1.2 (chain unificado)"
+        assert not hasattr(router_module, "NoVoiceFallbackError"), (
+            "NoVoiceFallbackError no debería existir en v1.2 (chain unificado)"
+        )
 
 
 # ---------------------------------------------------------------------------

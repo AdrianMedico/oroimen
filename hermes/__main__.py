@@ -639,6 +639,7 @@ async def run() -> int:
     http_server = None
     http_task: asyncio.Task | None = None
     if settings.enable_http_api:
+        from hermes.jobs.preflight import DeepResearchCapabilities
         from hermes.receivers.http_api import create_app
 
         http_app = create_app(
@@ -650,6 +651,10 @@ async def run() -> int:
             telemetry=telemetry,  # Sprint 9.3.3: para que AgentLoop registre metricas
             ocr_repo=ocr_repo,  # Sprint 19 Slice 4d: OCR decision API
             edge_coordinator=edge_coordinator,
+            deep_research_capabilities=DeepResearchCapabilities(
+                search_backend_configured="tavily" in search_backends,
+                llm_provider_configured=llm.cloud_client_configured,
+            ),
         )
         import uvicorn
 
