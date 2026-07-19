@@ -74,6 +74,7 @@ from pydantic import BaseModel, Field
 
 from hermes.agent.loop import LLM_ERROR_FALLBACK_MESSAGE, AgentLoop
 from hermes.config import Settings
+from hermes.jobs.preflight import DeepResearchCapabilities
 from hermes.llm.router import LLMError
 from hermes.memory.db import Database
 from hermes.tools.registry import ToolRegistry
@@ -433,6 +434,7 @@ def create_app(
     telemetry: Any | None = None,  # Telemetry, optional (Sprint 9.3.3)
     ocr_repo: Any | None = None,  # OcrPendingRepo, optional (Sprint 19 Slice 4d)
     edge_coordinator: Any | None = None,  # EdgeCoordinator, optional
+    deep_research_capabilities: DeepResearchCapabilities | None = None,
 ) -> FastAPI:
     """Factory del FastAPI app. Recibe los singletons ya inicializados.
 
@@ -470,6 +472,7 @@ def create_app(
     from hermes.memory.collections import VaultCollectionsRepo
 
     app.state.collections_repo = VaultCollectionsRepo(db)
+    app.state.deep_research_capabilities = deep_research_capabilities or DeepResearchCapabilities()
 
     # Sprint 14 (US-2.1): mount deep research jobs router. Lazy import evita
     # circular dep (jobs_api importa authenticate_bearer de hermes.receivers.auth,

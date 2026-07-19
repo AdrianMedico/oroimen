@@ -26,7 +26,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
 
 from hermes.jobs.exceptions import (
     BudgetExceededError,
@@ -43,6 +43,10 @@ from hermes.jobs.models import (
     JobResponse,
     JobStatus,
     JobSummary,
+)
+from hermes.jobs.preflight import (
+    DeepResearchPreflight,
+    evaluate_deep_research_preflight,
 )
 from hermes.receivers.auth import authenticate_bearer
 
@@ -205,6 +209,18 @@ async def get_budget(
         jobs_today=jobs_today,
         resets_at=next_reset,
     )
+
+
+@router.get("/jobs/preflight", status_code=status.HTTP_200_OK)
+async def get_deep_research_preflight(
+    request: Request,
+    _user_id: Annotated[int, Depends(authenticate_bearer)],
+) -> DeepResearchPreflight:
+    """Return deterministic offline readiness without requiring the service."""
+
+    settings = request.app.state.settings
+    capabilities = request.app.state.deep_research_capabilities
+    return evaluate_deep_research_preflight(settings, capabilities)
 
 
 @router.get("/jobs/{job_id}", status_code=status.HTTP_200_OK)
@@ -489,6 +505,6 @@ def _build_count_jobs_sql(user_id: int, today_start_str: str) -> tuple[str, list
     Inlining: SQLite acepta `?` params; nada de string-format con user_id.
     """
     return (
-        "SELECT COUNT(*) FROM research_jobs " "WHERE user_id = ? AND created_at >= ?",
+        "SELECT COUNT(*) FROM research_jobs WHERE user_id = ? AND created_at >= ?",
         [user_id, today_start_str],
     )

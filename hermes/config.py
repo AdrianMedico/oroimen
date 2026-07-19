@@ -1099,6 +1099,12 @@ class Settings(BaseSettings):
     )
 
     # === Sprint 14 (TDD_S14_DEEP_RESEARCH.md §5): Deep Research settings ===
+    deep_research_enabled: bool = Field(
+        default=False,
+        validation_alias="HERMES_DEEP_RESEARCH_ENABLED",
+        description="Explicit opt-in for the supported Deep Research runtime.",
+    )
+
     # 13 settings nuevas. Defaults críticos razonados:
     # - daily_budget=3.0: cubre ~75 jobs/dia a $0.04/job (post-user decision 2026-07-02,
     #   subido de 1.0 → 3.0 para evitar cap en mal momento). Single-tenant personal use.

@@ -872,6 +872,12 @@ class LLMRouter:
             await self._ollama_client.aclose()
             self._ollama_client = None
 
+    @property
+    def cloud_client_configured(self) -> bool:
+        """Whether the shared cloud transport was constructed successfully."""
+
+        return self._client is not None
+
     def _is_ollama_model(self, model: str) -> bool:
         """True si `model` se sirve por Ollama (provider hint == 'ollama').
 
