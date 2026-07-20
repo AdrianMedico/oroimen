@@ -1230,6 +1230,32 @@ class Settings(BaseSettings):
         description="Running sin output > N horas → reset pending + re-enqueue (caso 2).",
     )
 
+    # Slice 1C2: report content retrieval settings. The read path is
+    # ``<data_root>/<job_id>.md`` derived from the validated 12-char
+    # hex job_id. ``max_report_bytes`` bounds the read so an oversize
+    # file is rejected BEFORE the route reads it into memory.
+    deep_research_data_root: Path = Field(
+        default=Path("data/jobs"),
+        validation_alias="HERMES_DEEP_RESEARCH_DATA_ROOT",
+        description=(
+            "Root directory for the report-content read path. "
+            "Resolved at startup; created with mkdir -p if missing. "
+            "Production deployments SHOULD set this to an absolute path."
+        ),
+    )
+    deep_research_max_report_bytes: int = Field(
+        default=5_242_880,
+        ge=10_240,
+        le=52_428_800,
+        validation_alias="HERMES_DEEP_RESEARCH_MAX_REPORT_BYTES",
+        description=(
+            "Max bytes for the read path of "
+            "``GET /v1/jobs/{id}/report``. Default 5 MiB. "
+            "Oversize files are rejected (500 report_unavailable) "
+            "BEFORE the body is read into memory."
+        ),
+    )
+
     # === Sprint 19.6+ Phase 4 (OpenAI Build Week): ChatGPT 5.6 frontier tier ===
     # The OpenAI Build Week hackathon (deadline 2026-07-21, $15k first
     # prize) requires use of ChatGPT 5.6 (OpenAI's new frontier model).

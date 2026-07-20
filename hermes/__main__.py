@@ -6,6 +6,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 from hermes.config import Settings
@@ -295,9 +296,30 @@ async def _compose_deep_research_runtime(
     search_circuit_breaker: Any,
     search_concurrency: Any,
 ) -> tuple[Any, Any | None, Any | None]:
-    """Compose opt-in research before HTTP; roll back partial startup only."""
+    """Compose opt-in research before HTTP; roll back partial startup only.
+
+    Slice 1C2 (fail-closed contract):
+
+    - When Deep Research is disabled, the report store is NOT constructed
+      and the returned capabilities keep ``report_retrieval=False``.
+    - When runtime prerequisites are missing, the report store is NOT
+      constructed and ``report_retrieval=False``.
+    - When Deep Research is enabled AND prerequisites exist, a real
+      ``LocalReportStore`` is constructed from settings and injected
+      into ``DeepResearchService``. The flag ``_report_reader_wired``
+      flips to True ONLY when construction succeeded.
+    - If the report-store construction itself fails (OSError / ValueError),
+      the runtime follows the existing composition failure/rollback path:
+      the singleton is NOT published, the returned capabilities keep
+      ``report_retrieval=False`` (the default), and the disabled/
+      unconfigured behavior is preserved.
+
+    The set_deep_research_service(service) call is the LAST step (after
+    recovery). It only runs if the runtime was successfully composed.
+    """
     from hermes.jobs.preflight import DeepResearchCapabilities
     from hermes.jobs.recovery import recover_research_jobs
+    from hermes.jobs.report_store import LocalReportStore
     from hermes.jobs.safe_fetcher import DualAddressResolver, FetchPolicy, SafeExternalFetcher
     from hermes.jobs.scheduler import DeepResearchScheduler
     from hermes.jobs.service import DeepResearchService
@@ -323,6 +345,13 @@ async def _compose_deep_research_runtime(
     scheduler: Any | None = None
     service: Any | None = None
 
+    # Slice 1C2: track whether LocalReportStore was successfully
+    # constructed in the current process. ``False`` is the default for
+    # every path that does NOT reach the successful construction block
+    # below (disabled, missing-prereq, rollback, or construction-failure).
+    _report_reader_wired: bool = False
+    report_store: LocalReportStore | None = None
+
     async def rollback() -> None:
         """Tear down using the same seam as ordinary host shutdown.
 
@@ -335,6 +364,12 @@ async def _compose_deep_research_runtime(
         happens as the LAST step so any in-flight recovery write that
         raced the rollback is rejected first, then the dependency is
         cleared without losing context in logs.
+
+        Slice 1C2: the rollback path leaves ``_report_reader_wired``
+        at False (its default). A failed composition never publishes
+        ``report_retrieval=True`` — the route will return 500
+        ``report_unavailable`` for complete jobs because the store
+        never made it into the singleton.
         """
         await _deep_research_cleanup(
             scheduler=scheduler,
@@ -362,6 +397,33 @@ async def _compose_deep_research_runtime(
                 size_guard_chars=settings.search_size_guard_chars,
             )
 
+        # Slice 1C2: construct the real LocalReportStore from validated
+        # settings. Resolve at startup (strict=False because the file
+        # may not exist yet — the route uses .exists() to distinguish
+        # "not yet written" from "written and readable"). ``mkdir -p``
+        # so the first write from _phase_write can land there.
+        #
+        # FAIL-CLOSED: any construction failure (OSError, ValueError,
+        # AttributeError, or any other Exception) propagates to the
+        # outer ``except Exception:`` at the bottom of this function,
+        # which runs ``rollback()`` (clears the singleton) and returns
+        # ``unavailable, None, None``. The singleton is NEVER published
+        # with a missing or broken report store. There is no inner
+        # try/except that would let composition continue with
+        # ``report_store=None``.
+        data_root_path = Path(settings.deep_research_data_root)
+        data_root_resolved = data_root_path.resolve(strict=False)
+        data_root_resolved.mkdir(parents=True, exist_ok=True)
+        report_store = LocalReportStore(
+            root=data_root_resolved,
+            max_bytes=int(settings.deep_research_max_report_bytes),
+        )
+        _report_reader_wired = True
+        logger.info(
+            "deep_research_report_store_constructed",
+            extra={"max_bytes": int(settings.deep_research_max_report_bytes)},
+        )
+
         service = DeepResearchService(
             db=db,
             notifier=notifier,
@@ -370,6 +432,7 @@ async def _compose_deep_research_runtime(
             fetcher=fetcher,
             settings=settings,
             scheduler=scheduler,
+            report_store=report_store,
         )
         scheduler.set_service(service)
         # Slice 1C1c: pre-emptive admission guard. Setting
@@ -420,6 +483,7 @@ async def _compose_deep_research_runtime(
             search_backend_configured=True,
             llm_provider_configured=True,
             model_output_enforced=True,
+            report_retrieval=_report_reader_wired,
         ),
         scheduler,
         service,

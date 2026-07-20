@@ -6,9 +6,11 @@ Endpoints:
   POST   /v1/jobs                  bearer auth → 201 JobResponse
   GET    /v1/jobs                  bearer auth → 200 [JobSummary]
   GET    /v1/jobs/budget           bearer auth → 200 DailyBudgetStatus
+  GET    /v1/jobs/preflight        bearer auth → 200 DeepResearchPreflight
   GET    /v1/jobs/{job_id}         bearer auth → 200 JobDetail | 404
   POST   /v1/jobs/{job_id}/cancel  bearer auth → 200 CancelResponse | 404 | 409
   POST   /v1/jobs/{job_id}/retry   bearer auth → 201 JobResponse | 404 | 409
+  GET    /v1/jobs/{job_id}/report  bearer auth → 200 markdown | 404 | 409 | 500
 
 Todos los endpoints requieren bearer auth via `Depends(authenticate_bearer)`.
 El service singleton se obtiene via `Depends(get_deep_research_service_dep)`
@@ -18,15 +20,23 @@ Wiring: `create_app()` en hermes/receivers/http_api.py monta este router
 y registra el singleton via `set_deep_research_service(service)` ANTES
 de aceptar requests. Patron deliberadamente minimal: este modulo NO
 inicializa el service (responsabilidad del startup lifecycle).
+
+Slice 1C2: added ``GET /v1/jobs/{job_id}/report``. The read path is
+derived from ``settings.deep_research_data_root + job_id`` (NEVER from
+the DB ``output_path`` column). The route translates internal
+``LocalReportStore`` exceptions into a single 500 ``report_unavailable``
+envelope — the public response never exposes filesystem paths, byte
+limits, decoder text, raw exceptions, symlink targets, or OS details.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
 
 from hermes.jobs.exceptions import (
     BudgetExceededError,
@@ -265,7 +275,7 @@ async def get_job_detail(
             detail={
                 "error": {
                     "type": "job_not_found",
-                    "message": f"Job {job_id} not found.",
+                    "message": "Job not found.",
                 }
             },
         ) from exc
@@ -302,7 +312,7 @@ async def cancel_job(
             detail={
                 "error": {
                     "type": "job_not_found",
-                    "message": f"Job {job_id} not found.",
+                    "message": "Job not found.",
                 }
             },
         ) from exc
@@ -341,7 +351,7 @@ async def retry_job(
             detail={
                 "error": {
                     "type": "job_not_found",
-                    "message": f"Job {job_id} not found.",
+                    "message": "Job not found.",
                 }
             },
         ) from exc
@@ -438,6 +448,183 @@ async def list_jobs(
     ]
 
 
+@router.get("/jobs/{job_id}/report", status_code=status.HTTP_200_OK)
+async def get_job_report(
+    job_id: Annotated[str, Path(min_length=12, max_length=12, pattern=r"^[0-9a-f]{12}$")],
+    user_id: Annotated[int, Depends(authenticate_bearer)],
+    service: Annotated[Any, Depends(get_deep_research_service_dep)],
+) -> Response:
+    """GET /v1/jobs/{job_id}/report — return the final markdown report.
+
+    Slice 1C2 contract (owner-adjudicated):
+
+    - 200 OK with markdown body, headers:
+        Content-Type: text/markdown; charset=utf-8
+        Content-Disposition: inline; filename="research-{job_id}.md"
+        Cache-Control: private, no-store
+        X-Content-Type-Options: nosniff
+    - 401 — missing or invalid bearer token (existing).
+    - 404 ``job_not_found`` — owner check fails (missing OR foreign-owned,
+      byte-identical body).
+    - 409 ``report_not_ready`` — owner job in {pending, running, cancelling}.
+    - 409 ``report_unavailable`` — owner job in {failed, cancelled} (no
+      final report).
+    - 500 ``report_unavailable`` — owner job in {complete} but the file is
+      missing, escaped, symlink-denied, oversize, invalid UTF-8, or
+      otherwise unreadable.
+    - 503 — service singleton not initialized (existing).
+
+    The read path is derived from ``settings.deep_research_data_root +
+    job_id`` (NEVER from the DB ``output_path`` column). The internal
+    column stays as a completion/recovery marker only.
+    """
+    # (1) Ownership check first — same 404 shape as missing/foreign.
+    try:
+        await _assert_owner_id(job_id, user_id, service)
+    except HTTPException:
+        # Re-raise as-is (the 404 shape is already correct).
+        raise
+
+    # (2) Look up the job row to learn the status. Same path as
+    # get_job_detail; we re-fetch instead of calling get_job() to avoid
+    # loading the token_usage drill-down we do not need.
+    db = service._db
+    row = await db.get_research_job(job_id)
+    if row is None:
+        # Should not happen — _assert_owner_id already confirmed the
+        # row exists and is owned. But defense in depth: if a race
+        # deletes the row between the owner check and the status read,
+        # the route should still return 404 (same shape).
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": {
+                    "type": "job_not_found",
+                    "message": "Job not found.",
+                }
+            },
+        )
+    job_status = JobStatus(row["status"])
+
+    # (3) Status-driven dispatch. Status is the source of truth — the
+    # FILE EXISTING ON DISK does NOT authorize a 200 if the DB says
+    # the job is still pending/running/cancelling.
+    if job_status in (JobStatus.PENDING, JobStatus.RUNNING, JobStatus.CANCELLING):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": {
+                    "type": "report_not_ready",
+                    "message": "Report is not ready yet.",
+                }
+            },
+        )
+    if job_status in (JobStatus.FAILED, JobStatus.CANCELLED):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": {
+                    "type": "report_unavailable",
+                    "message": "Report is not available for this job.",
+                }
+            },
+        )
+    # job_status == COMPLETE → attempt the read. Any internal error
+    # (missing, escaped, symlink, oversize, invalid UTF-8) is mapped
+    # to 500 ``report_unavailable`` by the translation block below.
+
+    # (4) Resolve the data root from settings and derive the path. The
+    # store is OPTIONAL: if it was not constructed at startup, the route
+    # returns 500 ``report_unavailable`` (the fail-closed contract).
+    report_store = getattr(service, "_report_store", None)
+    if report_store is None:
+        logger.warning(
+            "report_unavailable_no_store",
+            extra={"job_id": job_id},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": {
+                    "type": "report_unavailable",
+                    "message": "Report is not available for this job.",
+                }
+            },
+        )
+
+    # (5) Run the read in a thread so the event loop is not blocked.
+    # The store is sync and bounded by max_bytes (default 5 MiB).
+    try:
+        markdown_text = await asyncio.to_thread(report_store.read, job_id)
+    except FileNotFoundError:
+        logger.warning(
+            "report_missing",
+            extra={"job_id": job_id},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": {
+                    "type": "report_unavailable",
+                    "message": "Report is not available for this job.",
+                }
+            },
+        ) from None
+    except Exception as exc:
+        # Map ALL report-store errors to 500 ``report_unavailable``.
+        # We log the internal category for ops/observability but never
+        # include the type text in the response body.
+        from hermes.jobs.exceptions import (
+            InvalidJobIdError,
+            InvalidUTF8Error,
+            PathEscapeError,
+            ReportTooLargeError,
+            SymlinkEscapeError,
+        )
+
+        if isinstance(exc, InvalidJobIdError):
+            category = "report_invalid_job_id"
+        elif isinstance(exc, PathEscapeError):
+            category = "report_path_escape"
+        elif isinstance(exc, SymlinkEscapeError):
+            category = "report_symlink_denied"
+        elif isinstance(exc, ReportTooLargeError):
+            category = "report_size_limit_exceeded"
+        elif isinstance(exc, InvalidUTF8Error):
+            category = "report_invalid_utf8"
+        else:
+            category = "report_read_failed"
+        logger.warning(
+            category,
+            extra={"job_id": job_id, "error": exc.__class__.__name__},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": {
+                    "type": "report_unavailable",
+                    "message": "Report is not available for this job.",
+                }
+            },
+        ) from exc
+
+    # (6) Successful read. Encode the markdown as UTF-8 bytes and
+    # return with the documented headers. The filename is
+    # ``research-{job_id}.md`` — exactly reproducible from the URL
+    # parameter, no path or extension disclosure.
+    markdown_bytes = markdown_text.encode("utf-8")
+    return Response(
+        content=markdown_bytes,
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Type": "text/markdown; charset=utf-8",
+            "Content-Disposition": f'inline; filename="research-{job_id}.md"',
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 # ============================================================================
 # Internal helpers
 # ============================================================================
@@ -464,7 +651,7 @@ async def _assert_owner(
             detail={
                 "error": {
                     "type": "job_not_found",
-                    "message": f"Job {job_detail.id} not found.",
+                    "message": "Job not found.",
                 }
             },
         )
@@ -475,7 +662,7 @@ async def _assert_owner(
             detail={
                 "error": {
                     "type": "job_not_found",
-                    "message": f"Job {job_detail.id} not found.",
+                    "message": "Job not found.",
                 }
             },
         )
@@ -499,7 +686,7 @@ async def _assert_owner_id(
             detail={
                 "error": {
                     "type": "job_not_found",
-                    "message": f"Job {job_id} not found.",
+                    "message": "Job not found.",
                 }
             },
         )

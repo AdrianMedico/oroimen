@@ -107,10 +107,9 @@ async def test_recovery_complete_no_notif(db, fake_settings, fake_notifier) -> N
     )
     assert recovered >= 1
 
-    # Notifier was called with the right args
+    # Notifier was called with the right args (Slice 1C2: no output_path)
     fake_notifier.send_research_complete.assert_called_with(
         job_id=job_id,
-        output_path=output_path,
         cost_usd=0.05,
     )
 

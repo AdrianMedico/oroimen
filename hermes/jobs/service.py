@@ -171,6 +171,7 @@ class DeepResearchService:
         fetcher: Any,
         settings: Any,
         scheduler: Any,
+        report_store: Any | None = None,
     ) -> None:
         self._db = db
         self._notifier = notifier
@@ -184,6 +185,15 @@ class DeepResearchService:
         self._fetcher = fetcher
         self._settings = settings
         self._scheduler = scheduler
+        # Slice 1C2: the read path for ``GET /v1/jobs/{id}/report`` is
+        # delegated to ``LocalReportStore``. The service does NOT use
+        # this for the WRITE path (``_phase_write`` still writes via
+        # ``tmp + fsync + os.replace``) and does NOT use it for any
+        # internal read — the route is the sole reader. ``None`` is
+        # the legitimate value when the composition root could not
+        # construct a report store; the route then returns 500
+        # ``report_unavailable`` for complete jobs.
+        self._report_store = report_store
 
         # ThreadPoolExecutor custom para HTML parsing (TDD §6.3.1).
         # 4 workers (NAS host 2 vCPU: 4 threads = uso racional).
@@ -486,9 +496,12 @@ class DeepResearchService:
             for r in token_rows
         ]
 
-        # checkpoint_path si existe
-        ckpt_path = self._data_root / job_id / "checkpoint.json"
-        checkpoint_path = str(ckpt_path) if ckpt_path.exists() else None
+        # Slice 1C2: JobDetail no longer exposes filesystem paths. The
+        # internal DB ``output_path`` / ``partial_output_path`` /
+        # ``checkpoint_path`` columns stay in the schema (no migration
+        # in 1C2) but are NOT part of the public DTO. Status is the
+        # source of truth; the client calls
+        # ``GET /v1/jobs/{id}/report`` to retrieve the markdown.
 
         return JobDetail(
             id=job_row["id"],
@@ -504,8 +517,6 @@ class DeepResearchService:
             completed_at=job_row.get("completed_at"),
             job_type=JobType(job_row.get("job_type", "deep_research")),
             notify_via_tg=bool(job_row.get("notify_via_tg", 1)),
-            output_path=job_row.get("output_path"),
-            partial_output_path=job_row.get("partial_output_path"),
             error_taxonomy=(
                 ErrorTaxonomy(job_row["error_taxonomy"]) if job_row.get("error_taxonomy") else None
             ),
@@ -515,7 +526,6 @@ class DeepResearchService:
             notified=bool(job_row.get("notified", 0)),
             updated_at=job_row["updated_at"],
             token_usage=token_usage,
-            checkpoint_path=checkpoint_path,
         )
 
     async def list_jobs(
@@ -576,7 +586,6 @@ class DeepResearchService:
                 id=job_id,
                 status=JobStatus.CANCELLED,
                 graceful=False,
-                partial_output_path=None,
             )
 
         # Graceful: la próxima vez que _run_research poll el status, verá
@@ -586,7 +595,6 @@ class DeepResearchService:
             id=job_id,
             status=JobStatus.CANCELLING,
             graceful=True,
-            partial_output_path=None,
         )
 
     async def retry_job(self, job_id: str, user_id: int = 0) -> JobResponse:
@@ -1210,9 +1218,12 @@ class DeepResearchService:
             notify_via_tg = bool(job_row.get("notify_via_tg", 1)) if job_row else True
             if notify_via_tg:
                 try:
+                    # Slice 1C2: signature is now (job_id, cost_usd) — no
+                    # output_path. The Telegram template uses the static
+                    # phrase "Report ready in Oroimen" and "Open Oroimen
+                    # to view it". The filesystem path is NEVER sent.
                     sent_ok = await self._notifier.send_research_complete(
                         job_id=job_id,
-                        output_path=str(final_path),
                         cost_usd=cost,
                     )
                     if sent_ok:

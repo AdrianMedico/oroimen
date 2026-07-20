@@ -112,6 +112,7 @@ def _build_service() -> DeepResearchService:
         fetcher=MagicMock(),
         settings=_FakeSettings(),
         scheduler=_FakeScheduler(),
+        report_store=None,  # Slice 1C2: optional; not used by lifecycle tests
     )
 
 
