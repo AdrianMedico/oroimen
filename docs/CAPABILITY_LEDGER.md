@@ -10,25 +10,54 @@ feature merely because its implementation and component tests exist.
 
 ## Status vocabulary
 
-- **Supported**: wired into the documented startup path, covered by its
-  deterministic integration test, and the owner has approved it for
-  the slice's evaluable behavior.
-- **Implemented, runtime unavailable**: components exist, but production
-  startup does not construct or register the required service. The
-  component is exercised by deterministic tests only.
-- **Implemented, runtime available, quality unmeasured**: the
-  deterministic vertical integration is proven, but the slice has
-  not yet been calibrated against a frozen benchmark. Absence of a
-  measurement is not equivalent to a measurement of zero.
-- **Optional**: wired only when an operator supplies explicit configuration.
-- **Deferred**: intentionally outside the supported evaluator path.
-- **Absent**: no implementation, no test, no documentation claim.
-- **Design only**: documented for a later slice; no runtime behavior exists.
+Every ledger row uses exactly one of the eight statuses below. No
+row uses a status not in this list. The Slice 0 vocabulary
+collapsed "runtime" and "live provider" into a single state; the
+post-1C3 vocabulary separates them.
 
-The vocabulary above replaces the Slice 0 status vocabulary, which
-collapsed "runtime" and "live provider" into a single
-"runtime unavailable" state. Slice 1C2 and Slice 1C3 split those
-states apart.
+- **Supported** — wired into the documented default startup path,
+  covered by its deterministic integration test, and the owner has
+  approved it for the slice's evaluable behavior. Enabled by
+  default. No operator opt-in is required to use the documented
+  behavior.
+- **Implemented, runtime available behind opt-in** — components
+  exist and the composition root will construct and register them
+  ONLY when the operator supplies explicit configuration (for
+  example `HERMES_DEEP_RESEARCH_ENABLED=true`). Without the
+  opt-in, the service is not constructed and the route returns a
+  defensive 503 or 500. The deterministic vertical integration
+  test exercises the wired path; the live product surface is
+  gated by the configuration flag.
+- **Implemented, runtime available, quality unmeasured** — the
+  deterministic vertical integration is proven (real HTTP, real
+  DB, real phase pipeline, real atomic writer, real reader, real
+  DTO mapping) and the wired path is exercised by the
+  deterministic E2E, but the slice has not been calibrated
+  against a frozen benchmark. No live Tavily, no live cloud LLM,
+  no benchmark has been run. Absence of a measurement is not
+  equivalent to a measurement of zero.
+- **Implemented, runtime unavailable** — components exist, but
+  production startup does not construct or register the required
+  service. The component is exercised by deterministic unit or
+  integration tests only and is NOT part of the live product
+  path. The route is defensive (returns 503 or 404) and the
+  service is never wired in production.
+- **Optional** — wired only when an operator supplies explicit
+  configuration; the default path does NOT include it. Distinct
+  from "behind opt-in" in that the operator enables a feature
+  flag (for example `use_cloud_provider=true`), not the entire
+  deep-research runtime. Offline diagnostics report enabled
+  state without values.
+- **Deferred** — intentionally outside the supported evaluator
+  path. No implementation, no test, no documentation claim in
+  the current commit. A future experiment MAY propose
+  implementation; the current slice does not approve it.
+- **Absent** — no implementation, no test, no documentation
+  claim. The capability is not part of the current product
+  surface and is not deferred as a future experiment either.
+- **Design only** — documented for a later slice; the design
+  exists in an ADR or sketch but no runtime behavior exists in
+  the current commit.
 
 ## Critical truth distinctions (do not collapse)
 
@@ -55,13 +84,47 @@ states apart.
 6. **Product support is documented.** Public README, ADRs, and
    evaluator paths describe this slice as a supported product path.
 
-The current Oroimen state at `b95afb4` is at level 3
-(Deterministic vertical integration is proven) for the deep-research
-report-retrieval vertical. It is at level 1 (Code exists) and level 2
-(Runtime composition exists) for the deep-research runtime pipeline
-behind opt-in. It is at level 0 for live-provider behavior and for
-research-quality measurement. Slice 1C3 does not raise the level
-beyond 3; it proves the deterministic vertical only.
+The current Oroimen state at `b95afb4` is summarized below using
+the same six named states above. Numeric level numbers are not
+used; the named state itself is the only label.
+
+- **Deep Research report-retrieval vertical (HTTP → create → real
+  5-phase pipeline → atomic write → owner-scoped detail → owner-
+  scoped report → notifier → owner isolation → cleanup):**
+  **Deterministic vertical integration is proven.** Real
+  components exercise the full product path through authenticated
+  HTTP; external seams (search, fetch, LLM, notifier, scheduler
+  trigger) are scripted fakes. NOT **Live provider behavior is
+  proven** and NOT **Research quality is measured.**
+- **Deep Research runtime pipeline behind opt-in
+  (`HERMES_DEEP_RESEARCH_ENABLED=true`):** **Code exists** AND
+  **Runtime composition exists.** The composition root
+  constructs the real `LocalReportStore`, scheduler, and recovery,
+  publishes `model_output_enforced=True` only after full wiring,
+  and is fail-closed on any failure. NOT **Deterministic vertical
+  integration is proven** (no public deterministic vertical is
+  wired behind opt-in outside the
+  `tests/e2e/test_deep_research_vertical.py` test) and NOT **Live
+  provider behavior is proven.**
+- **Live Tavily behavior, live cloud LLM behavior, Telegram
+  notifier transport:** **Code exists** only. No live provider
+  run has been authorized and no live state is proven in this
+  commit.
+- **Research quality:** **Code exists** (the calibration plan
+  exists in this slice) — but NOT **Deterministic vertical
+  integration is proven** (no frozen benchmark has been executed
+  against the production pipeline) and NOT **Research quality is
+  measured** (no structured human review has been published).
+- **Product support:** **Code exists** (the public repo describes
+  the deterministic vertical and the calibration plan) — but NOT
+  **Product support is documented** (no public README or ADR
+  claims "supported product path" for deep-research quality,
+  because the calibration has not been run).
+
+Slice 1C3 raised the report-retrieval vertical to **Deterministic
+vertical integration is proven**; it did not raise the
+live-provider or research-quality states, and the ledger does not
+conflate them.
 
 ## Ledger
 
@@ -70,26 +133,26 @@ beyond 3; it proves the deterministic vertical only.
 | Local chat and health path | `README.md`; `hermes/receivers/http_api.py`; `tests/unit/test_http_api.py`; `tests/e2e/test_phase1_smoke.py` | Supported | Retain and regression-test | Local model and container readiness | Follow the README quickstart and complete health plus first-chat checks | P0 |
 | File ingestion and grounded retrieval | `hermes/memory/drop_watcher.py`; `hermes/memory/ingest_router.py`; `hermes/memory/vault.py`; `tests/integration/test_files_e2e.py`; `tests/e2e/test_sprint_19_pipeline.py` | Supported | Retain and regression-test | Extractor and embedding availability; untrusted document content | Ingest a public fixture and retrieve grounded content through the documented path | P0 |
 | Prompt-injection classification and tool bounds | `hermes/security/classifier.py`; `hermes/tools/security.py`; `hermes/agent/loop.py`; `tests/e2e/test_rag_injection.py`; `tests/unit/test_agent_loop.py` | Supported | Retain and regression-test | Model-dependent behavior remains separately evaluated | Deterministic security tests pass; live-model evidence is never inferred from skipped tests | P0 |
-| Deep Research service components (orchestration, scheduler, recovery) | `hermes/jobs/service.py`; `hermes/jobs/scheduler.py`; `hermes/jobs/recovery.py`; `hermes/jobs/models.py`; `hermes/memory/db.py`; `hermes/__main__.py` (composition root) | Implemented, runtime available behind explicit opt-in (`HERMES_DEEP_RESEARCH_ENABLED=true`); the composition root constructs the real `LocalReportStore` inside the outer `try:` and publishes the singleton only after the report store, scheduler, and recovery succeed | Retain and regression-test | Disabled-by-default posture is preserved; runtime wiring is fail-closed (a failure anywhere in the outer `try:` runs `rollback()` and returns `(unavailable, None, None)`; the singleton is never published with a missing report store); a failed `LocalReportStore` construction propagates and the route returns 503 (defensive) or 500 (unavailable) rather than publishing a half-built service | The composition root's `DeepResearchCapabilities` is published with `service_wiring=True`, `recovery_wiring=True`, `search_backend_configured=True`, `llm_provider_configured=True`, `fetch_policy=True`, `external_fetch=True`, `model_output_enforced=True`, and `report_retrieval=True` only when the full wired path succeeds | P0 |
-| Deep Research jobs API contract | `hermes/receivers/jobs_api.py`; `hermes/jobs/models.py`; `tests/integration/test_jobs_api.py` | Supported behind the same opt-in: with a wired service singleton the routes return the documented contract (200 detail, 200 report, 200 list, 200 budget, 200 preflight, 200/409 cancel, 201/409 retry); without a singleton the routes return 503 `service_unavailable` | Retain and regression-test | A defensive 503 branch protects against a service that was wired but lacks `_report_store`; this branch is a safety net, not a normal path | A real application instance serves create, detail, list, budget, preflight, cancel, and retry without test-only dependency injection | P0 |
-| Deep Research preflight | `hermes/jobs/preflight.py`; `hermes/receivers/jobs_api.py` (route); `tests/unit/test_jobs_preflight.py`; `tests/integration/test_jobs_api.py` (`test_preflight_*`) | Supported (offline) | Retain and regression-test | The `evaluate_deep_research_preflight` evaluator is the single source of truth; the route wires the `DeepResearchCapabilities` from the composition root, NOT a patched response | `GET /v1/jobs/preflight` returns the contract from the real evaluator with `status` derived from the wired `capabilities` object; live checks remain `skip` in offline mode | P0 |
+| Deep Research service components (orchestration, scheduler, recovery) | `hermes/jobs/service.py`; `hermes/jobs/scheduler.py`; `hermes/jobs/recovery.py`; `hermes/jobs/models.py`; `hermes/memory/db.py`; `hermes/__main__.py` (composition root) | Implemented, runtime available behind opt-in (`HERMES_DEEP_RESEARCH_ENABLED=true`); the composition root constructs the real `LocalReportStore` inside the outer `try:` and publishes the singleton only after the report store, scheduler, and recovery succeed | Retain and regression-test | Disabled-by-default posture is preserved; runtime wiring is fail-closed (a failure anywhere in the outer `try:` runs `rollback()` and returns `(unavailable, None, None)`; the singleton is never published with a missing report store); a failed `LocalReportStore` construction propagates and the route returns 503 (defensive) or 500 (unavailable) rather than publishing a half-built service | The composition root's `DeepResearchCapabilities` is published with `service_wiring=True`, `recovery_wiring=True`, `search_backend_configured=True`, `llm_provider_configured=True`, `fetch_policy=True`, `external_fetch=True`, `model_output_enforced=True`, and `report_retrieval=True` only when the full wired path succeeds | P0 |
+| Deep Research jobs API contract | `hermes/receivers/jobs_api.py`; `hermes/jobs/models.py`; `tests/integration/test_jobs_api.py` | Implemented, runtime available behind opt-in: with a wired service singleton the routes return the documented contract (200 detail, 200 report, 200 list, 200 budget, 200 preflight, 200/409 cancel, 201/409 retry); without a singleton the routes return 503 `service_unavailable` | Retain and regression-test | A defensive 503 branch protects against a service that was wired but lacks `_report_store`; this branch is a safety net, not a normal path | A real application instance serves create, detail, list, budget, preflight, cancel, and retry without test-only dependency injection | P0 |
+| Deep Research preflight | `hermes/jobs/preflight.py`; `hermes/receivers/jobs_api.py` (route); `tests/unit/test_jobs_preflight.py`; `tests/integration/test_jobs_api.py` (`test_preflight_*`) | Implemented, runtime available behind opt-in (offline evaluator) | Retain and regression-test | The `evaluate_deep_research_preflight` evaluator is the single source of truth; the route wires the `DeepResearchCapabilities` from the composition root, NOT a patched response | `GET /v1/jobs/preflight` returns the contract from the real evaluator with `status` derived from the wired `capabilities` object; live checks remain `skip` in offline mode | P0 |
 | Search routing | `hermes/services/search/`; `hermes/tools/web_search.py`; `hermes/__main__.py`; `tests/unit/test_search_router.py`; `tests/unit/test_search_tavily.py` | Optional; Deep Research intent routes to Tavily when configured | Retain as opt-in and expose redacted readiness | Cloud credentials, provider budget, network egress, and backend health semantics | Offline preflight reports configuration only; explicit live checks prove reachability without sending a user query | P0 |
-| Safe external fetch for Deep Research | `hermes/jobs/safe_fetcher.py`; `hermes/jobs/service.py` (phase 2 uses `_fetcher.fetch(url)`); `tests/integration/test_safe_external_fetcher_transport.py`; `tests/integration/test_jobs_service_phases.py` | Implemented, runtime available; the production service uses `SafeExternalFetcher` exclusively for phase 2; no direct `httpx.AsyncClient` or fallback transport exists in the service | Retain and regression-test | Redirect SSRF, private and special-use addresses, IPv6, DNS rebinding, proxy inheritance, and fully buffered oversized responses are covered by adversarial unit tests | Adversarial tests cover the initial URL, every redirect hop, A and AAAA results, proxy behavior, and streamed byte limits | P0 |
-| Deep Research model-output limits | `hermes/jobs/service.py` (per-source and final synthesis pass `max_tokens` to `llm.chat`); `hermes/jobs/cost.py`; `tests/integration/test_jobs_service_phases.py`; `tests/integration/test_jobs_cost_drift.py` | Implemented, runtime available; phase 3 (per-source) calls `llm.chat(..., max_tokens=settings.deep_research_per_source_max_tokens)` and phase 4 (final synthesis) calls `llm.chat(..., max_tokens=settings.deep_research_output_max_tokens)`; the composition root sets `model_output_enforced=True` only after this wiring is in place | Retain and regression-test | The two settings must reach both LLM call sites; cost drift between checkpoint, token-usage sum, and DB aggregate is reconciled via `reconcile_cost` | Per-source `max_tokens` matches `settings.deep_research_per_source_max_tokens`; final `max_tokens` matches `settings.deep_research_output_max_tokens` | P0 |
-| Daily budget admission control | `hermes/jobs/service.py`; `hermes/config.py`; `tests/integration/test_jobs_cost_drift.py` | Implemented, runtime available; pre-check on submit + atomic TOCTOU check inside the running transaction | Retain and regression-test | The daily cap is checked before enqueue and re-checked at job start (atomic) to prevent TOCTOU | A job submitted and run after the cap is reached transitions to `failed` with `error_taxonomy="budget_exceeded"`; it is NOT silently enqueued | P0 |
-| Per-job monetary budget enforcement | `hermes/jobs/service.py` (per-job `cost` recorded via `_record_token_usage` + `reconcile_cost`); `hermes/jobs/cost.py` | Implemented, runtime available, but **soft warning only** | Retain as soft warning; a hard per-job cancellation boundary is NOT yet implemented | The service records the per-job cost and surfaces it through the notifier and the report; it does NOT cancel the job mid-flight when the per-job budget is exceeded | The per-job cost is exposed in `JobDetail.cost_usd` and in the notifier call; the per-job budget is documented as a soft warning, not a hard cancellation | P0 |
-| Deep Research report persistence | `hermes/jobs/service.py` (`_phase_write` uses `tmp + flush + os.fsync + os.replace`); `hermes/jobs/models.py` (DTOs without `output_path` / `partial_output_path` / `checkpoint_path` / `report_available`); `hermes/jobs/report_paths.py`; `hermes/jobs/report_store.py`; `hermes/receivers/jobs_api.py` (route); `tests/integration/test_jobs_api.py`; `tests/unit/test_report_paths.py`; `tests/unit/test_report_store.py`; `tests/e2e/test_deep_research_vertical.py` | Supported (Slice 1C2 + 1C3): owner-scoped `GET /v1/jobs/{job_id}/report` returns the final Markdown through the real `LocalReportStore`; the public DTOs no longer carry filesystem paths; the notifier template no longer embeds a path; the deterministic vertical golden journey proves the full owner-scoped flow through real HTTP | Retain and regression-test | A failed report-store construction is fail-closed (the singleton is not published and the route returns 500 `report_unavailable` or 503 `service_unavailable` defensively); the read path uses `report_store.derive_path(job_id)` and never reads from the DB `output_path` column; the writer and the reader share the same resolved absolute Path through `service._data_root = report_store.root` (round 2 wiring) | The owner retrieves report content by job ID with a constant `text/markdown; charset=utf-8` body, the documented headers, and a deterministic body shape; missing and foreign-owned jobs return byte-identical 404 `job_not_found`; complete status with a missing/oversize/invalid-UTF-8 file returns 500 `report_unavailable` with no internal details leaked | P0 |
-| Deep Research report settings: `deep_research_data_root` and `deep_research_max_report_bytes` | `hermes/config.py`; `hermes/jobs/report_store.py`; `hermes/jobs/preflight.py`; `hermes/jobs/service.py` (writer uses canonical store root); `hermes/__main__.py` (composition root) | Supported (Slice 1C2): the report-store root is resolved at startup and the max-bytes cap is enforced inside the bounded read of the single opened handle (round 2); the composition root resolves `data_root` and the service uses `report_store.root` as `service._data_root` (round 2) | Retain and regression-test | The two settings must reach both the composition root and the read path; the max-bytes floor (10 KiB) and ceiling (50 MiB) are validated at construction | An oversize report is rejected with 500 `report_unavailable` (logs may tag `report_size_limit_exceeded`); a missing or non-creatable data root fails closed at startup; the writer and the reader share the same canonical Path | P0 |
+| Safe external fetch for Deep Research | `hermes/jobs/safe_fetcher.py`; `hermes/jobs/service.py` (phase 2 uses `_fetcher.fetch(url)`); `tests/integration/test_safe_external_fetcher_transport.py`; `tests/integration/test_jobs_service_phases.py` | Implemented, runtime available behind opt-in; the production service uses `SafeExternalFetcher` exclusively for phase 2; no direct `httpx.AsyncClient` or fallback transport exists in the service | Retain and regression-test | Redirect SSRF, private and special-use addresses, IPv6, DNS rebinding, proxy inheritance, and fully buffered oversized responses are covered by adversarial unit tests | Adversarial tests cover the initial URL, every redirect hop, A and AAAA results, proxy behavior, and streamed byte limits | P0 |
+| Deep Research model-output limits | `hermes/jobs/service.py` (per-source and final synthesis pass `max_tokens` to `llm.chat`); `hermes/jobs/cost.py`; `tests/integration/test_jobs_service_phases.py`; `tests/integration/test_jobs_cost_drift.py` | Implemented, runtime available behind opt-in; phase 3 (per-source) calls `llm.chat(..., max_tokens=settings.deep_research_per_source_max_tokens)` and phase 4 (final synthesis) calls `llm.chat(..., max_tokens=settings.deep_research_output_max_tokens)`; the composition root sets `model_output_enforced=True` only after this wiring is in place | Retain and regression-test | The two settings must reach both LLM call sites; cost drift between checkpoint, token-usage sum, and DB aggregate is reconciled via `reconcile_cost` | Per-source `max_tokens` matches `settings.deep_research_per_source_max_tokens`; final `max_tokens` matches `settings.deep_research_output_max_tokens` | P0 |
+| Daily budget admission control | `hermes/jobs/service.py`; `hermes/config.py`; `tests/integration/test_jobs_cost_drift.py` | Implemented, runtime available behind opt-in; pre-check on submit + atomic TOCTOU check inside the running transaction | Retain and regression-test | The daily cap is checked before enqueue and re-checked at job start (atomic) to prevent TOCTOU | A job submitted and run after the cap is reached transitions to `failed` with `error_taxonomy="budget_exceeded"`; it is NOT silently enqueued | P0 |
+| Per-job monetary budget enforcement | `hermes/jobs/service.py` (per-job `cost` recorded via `_record_token_usage` + `reconcile_cost`); `hermes/jobs/cost.py` | Implemented, runtime available behind opt-in; soft warning only (the service records the per-job cost and emits a log warning when the soft budget is exceeded, but does NOT cancel the job mid-flight) | Retain as soft warning; a hard per-job cancellation boundary is NOT yet implemented | The service records the per-job cost and surfaces it through the notifier and the report; it does NOT cancel the job mid-flight when the per-job budget is exceeded | The per-job cost is exposed in `JobDetail.cost_usd` and in the notifier call; the per-job budget is documented as a soft warning, not a hard cancellation | P0 |
+| Deep Research report persistence | `hermes/jobs/service.py` (`_phase_write` uses `tmp + flush + os.fsync + os.replace`); `hermes/jobs/models.py` (DTOs without `output_path` / `partial_output_path` / `checkpoint_path` / `report_available`); `hermes/jobs/report_paths.py`; `hermes/jobs/report_store.py`; `hermes/receivers/jobs_api.py` (route); `tests/integration/test_jobs_api.py`; `tests/unit/test_report_paths.py`; `tests/unit/test_report_store.py`; `tests/e2e/test_deep_research_vertical.py` | Implemented, runtime available behind opt-in (Slice 1C2 + 1C3): owner-scoped `GET /v1/jobs/{job_id}/report` returns the final Markdown through the real `LocalReportStore`; the public DTOs no longer carry filesystem paths; the notifier template no longer embeds a path; the deterministic vertical golden journey proves the full owner-scoped flow through real HTTP | Retain and regression-test | A failed report-store construction is fail-closed (the singleton is not published and the route returns 500 `report_unavailable` or 503 `service_unavailable` defensively); the read path uses `report_store.derive_path(job_id)` and never reads from the DB `output_path` column; the writer and the reader share the same resolved absolute Path through `service._data_root = report_store.root` (round 2 wiring) | The owner retrieves report content by job ID with a constant `text/markdown; charset=utf-8` body, the documented headers, and a deterministic body shape; missing and foreign-owned jobs return byte-identical 404 `job_not_found`; complete status with a missing/oversize/invalid-UTF-8 file returns 500 `report_unavailable` with no internal details leaked | P0 |
+| Deep Research report settings: `deep_research_data_root` and `deep_research_max_report_bytes` | `hermes/config.py`; `hermes/jobs/report_store.py`; `hermes/jobs/preflight.py`; `hermes/jobs/service.py` (writer uses canonical store root); `hermes/__main__.py` (composition root) | Implemented, runtime available behind opt-in (Slice 1C2): the report-store root is resolved at startup and the max-bytes cap is enforced inside the bounded read of the single opened handle (round 2); the composition root resolves `data_root` and the service uses `report_store.root` as `service._data_root` (round 2) | Retain and regression-test | The two settings must reach both the composition root and the read path; the max-bytes floor (10 KiB) and ceiling (50 MiB) are validated at construction | An oversize report is rejected with 500 `report_unavailable` (logs may tag `report_size_limit_exceeded`); a missing or non-creatable data root fails closed at startup; the writer and the reader share the same canonical Path | P0 |
 | Deterministic Deep Research vertical E2E | `tests/e2e/test_deep_research_vertical.py` (NEW, 1 file, 831 lines, merged in Slice 1C3) | Implemented, runtime available, quality unmeasured | Retain and regression-test; a frozen benchmark execution is a separate future slice (see `docs/DR_Q1A_BASELINE_CALIBRATION_PLAN.md`) | The golden journey drives the full 9-step product path through authenticated HTTP: preflight, create, real 5-phase pipeline, atomic write, owner-scoped detail, owner-scoped report, notifier privacy, owner isolation, and lifecycle cleanup. Only the external seams (search, fetch, LLM, notifier, scheduler trigger) are faked; everything else is real | The 4 tests pass on every run, in 3 consecutive runs, and in 3 in-process cycles; the test carries `@pytest.mark.e2e` and no `slow` / `network` markers; the LLM mock uses a modulo-wrap `side_effect` counter for determinism | P0 |
-| Memory collections and embeddings | `hermes/memory/collections.py`; `hermes/services/embedding_router.py`; `hermes/services/embed_vault.py`; corresponding unit and integration tests | Present; supported behavior depends on the selected local or optional provider | Retain; document provider readiness separately | Model availability and resource limits | Public fixture ingestion and retrieval pass without cloud credentials on the default path | P1 |
-| OCR routing and edge coordination | `hermes/memory/ocr_decision.py`; `hermes/memory/edge_coordinator.py`; `hermes/receivers/ocr_api.py`; OCR unit tests | Present; advanced edge paths are deployment-dependent | Retain public generic behavior; keep deployment assumptions out of public docs | External binaries, local vision model, and edge lifecycle | Public OCR decision tests pass; deployment-specific readiness is not claimed | P2 |
-| LLM provider cascade and streaming | `hermes/llm/router.py`; `hermes/llm/ollama.py`; `hermes/llm/chatgpt5_6.py`; provider and streaming tests | Local provider is the supported default; cloud and frontier providers are opt-in | Retain explicit selection and fallback semantics | Credentials, cost, data egress, provider availability | Offline diagnostics list provider modes without values; live probes are explicit and bounded | P1 |
-| Container egress firewall | `hermes/security/egress.py`; `tests/unit/security/test_egress.py` | Optional and disabled by default | Retain as defense in depth, not as request-level URL authorization | DNS is resolved when rules are applied; stale DNS and request-level SSRF remain separate concerns | Diagnostics report only enabled state and policy validity, never addresses or sensitive configuration | P1 |
-| Deep Research iterative retrieval | absent | **Absent**: no multi-pass planning, no reflection step, no re-query with refined terms, no stopping decision | Deferred | An iterative loop would require a new boundary in the service, new preflight codes, and a benchmark to prove it improves quality; none of these is justified at the current baseline | Not supported as a product path | P2 |
-| Deep Research query decomposition | absent | **Absent**: the service calls a single search query per job; no static or learned decomposition of complex queries into sub-questions | Deferred | A decomposition layer would require a new phase, new prompts, and a benchmark to prove it improves quality; none of these is justified at the current baseline | Not supported as a product path | P2 |
-| Deep Research claim-level provenance and citation verification | absent | **Absent**: the service does not extract individual claims, does not verify citation support, and does not produce a claim ledger | Deferred | A claim parser + verifier would require a new phase, a new boundary, and a benchmark to prove it improves quality; none of these is justified at the current baseline | Not supported as a product path | P2 |
-| Deep Research contradiction handling | absent | **Absent**: the service does not explicitly detect or surface contradictions between retrieved sources | Deferred | A contradiction-handling phase would require a new boundary, new prompts, and a benchmark; none of these is justified at the current baseline | Not supported as a product path | P2 |
-| Deep Research quality benchmark | absent | **Absent (UNMEASURED)**: no frozen benchmark, no rubric, no run manifest, no human audit procedure has been published; the existing deterministic E2E is a smoke, not a quality measurement | Calibration slice planned (see `docs/DR_Q1A_BASELINE_CALIBRATION_PLAN.md`) | A real benchmark needs an owner-approved corpus, rubric, and reviewer workflow; the calibration plan exists but the benchmark has not been executed | A future measurement may show that the existing pipeline meets the bar; the existing pipeline MUST NOT be modified in response to LLM recommendations until a measurement is published | P0 |
+| Memory collections and embeddings | `hermes/memory/collections.py`; `hermes/services/embedding_router.py`; `hermes/services/embed_vault.py`; corresponding unit and integration tests | Optional: supported behavior depends on the operator-selected local or cloud provider; the default path runs without cloud credentials | Retain; document provider readiness separately | Model availability and resource limits | Public fixture ingestion and retrieval pass without cloud credentials on the default path | P1 |
+| OCR routing and edge coordination | `hermes/memory/ocr_decision.py`; `hermes/memory/edge_coordinator.py`; `hermes/receivers/ocr_api.py`; OCR unit tests | Implemented, runtime unavailable: the public generic OCR decision and route are present and unit-tested offline, but the production startup does not wire the advanced edge-coordinator path; the edge path is deployment-dependent and not part of the public product surface | Retain public generic behavior; keep deployment assumptions out of public docs | External binaries, local vision model, and edge lifecycle | Public OCR decision tests pass; deployment-specific readiness is not claimed | P2 |
+| LLM provider cascade and streaming | `hermes/llm/router.py`; `hermes/llm/ollama.py`; `hermes/llm/chatgpt5_6.py`; provider and streaming tests | Supported: the local provider is the default and is enabled without operator opt-in; the cloud and frontier providers are separately Optional and require operator opt-in (per the row above for cloud providers) | Retain explicit selection and fallback semantics | Credentials, cost, data egress, provider availability | Offline diagnostics list provider modes without values; live probes are explicit and bounded | P1 |
+| Container egress firewall | `hermes/security/egress.py`; `tests/unit/security/test_egress.py` | Optional (disabled by default) | Retain as defense in depth, not as request-level URL authorization | DNS is resolved when rules are applied; stale DNS and request-level SSRF remain separate concerns | Diagnostics report only enabled state and policy validity, never addresses or sensitive configuration | P1 |
+| Deep Research iterative retrieval | absent | Absent: no multi-pass planning, no reflection step, no re-query with refined terms, no stopping decision | Deferred | An iterative loop would require a new boundary in the service, new preflight codes, and a benchmark to prove it improves quality; none of these is justified at the current baseline | Not supported as a product path | P2 |
+| Deep Research query decomposition | absent | Absent: the service calls a single search query per job; no static or learned decomposition of complex queries into sub-questions | Deferred | A decomposition layer would require a new phase, new prompts, and a benchmark to prove it improves quality; none of these is justified at the current baseline | Not supported as a product path | P2 |
+| Deep Research claim-level provenance and citation verification | absent | Absent: the service does not extract individual claims, does not verify citation support, and does not produce a claim ledger | Deferred | A claim parser + verifier would require a new phase, a new boundary, and a benchmark to prove it improves quality; none of these is justified at the current baseline | Not supported as a product path | P2 |
+| Deep Research contradiction handling | absent | Absent: the service does not explicitly detect or surface contradictions between retrieved sources | Deferred | A contradiction-handling phase would require a new boundary, new prompts, and a benchmark; none of these is justified at the current baseline | Not supported as a product path | P2 |
+| Deep Research quality benchmark | absent | Absent: no frozen benchmark, no rubric, no run manifest, no human audit procedure has been published in the current commit; the existing deterministic E2E is a smoke, not a quality measurement; the calibration plan in `docs/DR_Q1A_BASELINE_CALIBRATION_PLAN.md` is a design-only artifact, not an executed benchmark | Calibration slice planned (see `docs/DR_Q1A_BASELINE_CALIBRATION_PLAN.md`) | A real benchmark needs an owner-approved corpus, rubric, and reviewer workflow; the calibration plan exists but the benchmark has not been executed | A future measurement may show that the existing pipeline meets the bar; the existing pipeline MUST NOT be modified in response to LLM recommendations until a measurement is published | P0 |
 
 ## Sanitized disposition policy
 
