@@ -1208,6 +1208,56 @@ def test_report_503_when_service_missing(
     assert "not initialized" in detail["error"]["message"]
 
 
+def test_report_503_when_service_has_no_report_store(
+    authed_settings: Any, db: Any, bearer: dict[str, str]
+) -> None:
+    """Service singleton exists but has no report_store wired → 503 (NOT 500).
+
+    Defensive guard: production composition is fail-closed and never
+    publishes a service without a real LocalReportStore. The route
+    preserves the 503 service_unavailable contract for an uninitialized
+    reader rather than returning 500 report_unavailable (which is
+    reserved for per-job read failures with a valid store).
+    """
+    # Register a service that explicitly has no report_store. Use the
+    # real _FakeService (which already accepts report_store=None).
+    service = _FakeService(db, authed_settings, report_store=None)
+    jobs_api.set_deep_research_service(service)
+    app = create_app(
+        authed_settings,
+        db,
+        _fake_router(),
+        ToolRegistry(),
+    )
+    try:
+        with TestClient(app) as client:
+            # Create a complete job first so the status check passes.
+            resp = client.post(
+                "/v1/jobs",
+                json={"query": "no-store-503-test"},
+                headers=bearer,
+            )
+            job_id = resp.json()["id"]
+            import sqlite3
+
+            with sqlite3.connect(str(db.path)) as conn:
+                conn.execute(
+                    "UPDATE research_jobs SET status = 'complete' WHERE id = ?",
+                    (job_id,),
+                )
+                conn.commit()
+            response = client.get(
+                f"/v1/jobs/{job_id}/report",
+                headers=bearer,
+            )
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert detail["error"]["type"] == "service_unavailable"
+        assert "no report reader" in detail["error"]["message"]
+    finally:
+        jobs_api.set_deep_research_service(None)  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # 16. Public JobDetail omits all three internal path fields
 # ---------------------------------------------------------------------------

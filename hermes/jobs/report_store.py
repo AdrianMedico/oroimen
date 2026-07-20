@@ -8,8 +8,6 @@ Markdown reports that ``DeepResearchService._phase_write`` produces
     - ``derive_path(job_id) -> Path``: validation + canonical derivation
     - ``assert_inside_root(canonical)``: confinement check
     - ``exists(job_id) -> bool``: file presence (after confinement)
-    - ``stat_size(job_id) -> int``: file size in bytes; raises
-      ``ReportTooLargeError`` if the size exceeds ``max_bytes``
     - ``read(job_id) -> str``: full UTF-8-strict read; raises on
       size, symlink escape, UTF-8 invalidity, or any file system error
 
@@ -21,11 +19,18 @@ Sync interface: ``read`` is synchronous. The HTTP route (which IS
 async) calls it via FastAPI's threaded path — the read is bounded by
 ``max_bytes`` (default 5 MiB) and is dispatched off the event loop by
 ``asyncio.to_thread`` in the route. The store does no async I/O itself.
+
+Bounded read (Slice 1C2 round 2): the read uses a SINGLE opened file
+handle and reads at most ``max_bytes + 1`` bytes from it. The
+``+ 1`` lets us detect a file that grew past the limit between the
+open and the read (TOCTOU between the pre-read stat and the read
+itself) without ever loading an unbounded payload into memory. If
+the read returned ``max_bytes + 1`` bytes we raise
+``ReportTooLargeError`` and the route returns 500 ``report_unavailable``.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from hermes.jobs.exceptions import (
@@ -35,12 +40,8 @@ from hermes.jobs.exceptions import (
     ReportTooLargeError,
     SymlinkEscapeError,
 )
-from hermes.jobs.report_paths import (
-    assert_inside_root as _assert_inside_root_module,
-)
-from hermes.jobs.report_paths import (
-    derive_report_path as _derive_report_path_module,
-)
+from hermes.jobs.report_paths import assert_inside_root as _assert_inside_root_module
+from hermes.jobs.report_paths import derive_report_path as _derive_report_path_module
 
 # Re-export the exceptions for convenience so the route imports from
 # one place. The route also imports ``assert_inside_root`` /
@@ -48,13 +49,13 @@ from hermes.jobs.report_paths import (
 # directly. ``FileNotFoundError`` is the built-in; we expose it for
 # callers that want a single import surface.
 __all__ = [
+    "FileNotFoundError",
+    "InvalidJobIdError",
+    "InvalidUTF8Error",
     "LocalReportStore",
     "PathEscapeError",
-    "SymlinkEscapeError",
     "ReportTooLargeError",
-    "InvalidUTF8Error",
-    "InvalidJobIdError",
-    "FileNotFoundError",
+    "SymlinkEscapeError",
 ]
 
 
@@ -83,7 +84,15 @@ class LocalReportStore:
             raise ValueError(
                 f"max_bytes must be >= {self._MIN_MAX_BYTES} (got {max_bytes})"
             )
-        self._root = Path(root)
+        # Persist the resolved absolute root so the writer (in
+        # ``DeepResearchService._phase_write``) and the reader (this
+        # class) use the same canonical path for the full process
+        # lifetime. Without this, a relative ``deep_research_data_root``
+        # could resolve against different cwds in different processes
+        # or different calls. The composition root passes an already-
+        # resolved absolute path; this ``resolve(strict=False)`` is a
+        # belt-and-braces guard.
+        self._root = Path(root).resolve(strict=False)
         self._max_bytes = int(max_bytes)
 
     @property
@@ -95,7 +104,7 @@ class LocalReportStore:
         return self._max_bytes
 
     def derive_path(self, job_id: str) -> Path:
-        """Return the canonical report path for ``job_id`` (no I/O).
+        """Return the candidate report path for ``job_id`` (no I/O).
 
         Raises:
             InvalidJobIdError: if ``job_id`` is not a valid UUID12 hex.
@@ -128,6 +137,12 @@ class LocalReportStore:
     def stat_size(self, job_id: str) -> int:
         """Return the report's size in bytes; raise if > ``max_bytes``.
 
+        Used by tests and for fast pre-flight size checks. The
+        ``read`` method does its own bounded read; this method
+        uses the canonical path's ``stat`` (which follows symlinks
+        at stat time — safe because ``assert_inside_root`` already
+        verified the realpath).
+
         Raises:
             InvalidJobIdError: bad UUID12.
             PathEscapeError / SymlinkEscapeError: traversal attempt.
@@ -151,37 +166,72 @@ class LocalReportStore:
         return size
 
     def read(self, job_id: str) -> str:
-        """Read and decode the report as strict UTF-8.
+        """Read and decode the report as strict UTF-8, bounded to ``max_bytes``.
+
+        The read is performed against a SINGLE opened file handle and
+        is bounded to ``max_bytes + 1`` bytes. The ``+ 1`` lets us
+        detect a file that grew past the limit between the open and
+        the read without ever loading an unbounded payload into
+        memory. If the read returned the extra byte, we raise
+        ``ReportTooLargeError`` and the route returns 500
+        ``report_unavailable``.
 
         Sequence:
-          1. derive_path + assert_inside_root
-          2. stat_size (catches missing + over-size)
-          3. read bytes
-          4. strict UTF-8 decode (raises ``InvalidUTF8Error`` on failure)
+          1. ``derive_path(job_id)`` — validates UUID12 and constructs
+             the candidate ``<root>/<job_id>.md`` (no symlink follow).
+          2. ``assert_inside_root(canonical)`` — verifies the candidate
+             is lexically and realpath-wise inside the root.
+          3. ``open(canonical, "rb")`` — opens the file. ``open``
+             follows the symlink at open time; if the target escaped
+             the root it would have already been caught in step (2).
+          4. ``f.read(max_bytes + 1)`` — bounded read from the
+             opened handle.
+          5. If the returned length is ``> max_bytes``, raise
+             ``ReportTooLargeError``.
+          6. ``decode("utf-8", errors="strict")`` — strict UTF-8
+             decode; ``UnicodeDecodeError`` → ``InvalidUTF8Error``.
 
         Raises:
             InvalidJobIdError: bad UUID12.
             PathEscapeError / SymlinkEscapeError: traversal attempt.
             FileNotFoundError: file does not exist.
-            ReportTooLargeError: file > max_bytes.
+            ReportTooLargeError: file is (or grew past) ``max_bytes``.
             InvalidUTF8Error: file is not valid UTF-8.
         """
-        # (1)+(2) — size check first so an oversize file is rejected
-        # WITHOUT reading the entire body into memory.
-        self.stat_size(job_id)
+        # (1) derive + (2) confine. Both happen BEFORE the open so a
+        # bad path is rejected without ever touching the filesystem.
         canonical = self.derive_path(job_id)
-        # (3) read raw bytes. ``open(..., "rb")`` does not follow
-        # symlinks (the OS resolves at open time, so a symlink whose
-        # target escaped the root would have already raised
-        # SymlinkEscapeError above).
+        self.assert_inside_root(canonical)
+
+        # (3) Open the file. The path may be a symlink; the OS will
+        # follow it at open time. Step (2) already verified the
+        # realpath target is inside the root.
         try:
-            raw = canonical.read_bytes()
+            with open(canonical, "rb") as f:
+                # (4) Bounded read from the SAME opened handle. We
+                # read ``max_bytes + 1`` so we can detect a file that
+                # grew past the limit without ever reading an
+                # unbounded payload.
+                raw = f.read(self._max_bytes + 1)
         except FileNotFoundError as exc:
-            # Race: file deleted between stat and read. Surface as
-            # not-found; the route maps to 500 report_unavailable.
+            # Race: file deleted between confine and open, OR file
+            # never existed. Surface as not-found; the route maps to
+            # 500 report_unavailable.
             raise FileNotFoundError(f"report not found: {job_id}") from exc
-        # (4) strict UTF-8 decode. ``strict`` mode raises ``UnicodeDecodeError``
-        # on any invalid byte sequence; we translate to ``InvalidUTF8Error``.
+
+        # (5) Size guard. The +1 trick: if we read MORE than
+        # ``max_bytes`` bytes, the file is at least ``max_bytes + 1``
+        # bytes long and we MUST reject it. We do NOT read the
+        # remainder of the file; the open handle is closed by the
+        # ``with`` block above and the unbounded payload never
+        # reaches memory.
+        if len(raw) > self._max_bytes:
+            raise ReportTooLargeError(
+                job_id=job_id,
+                size_bytes=len(raw),
+            )
+
+        # (6) Strict UTF-8 decode.
         try:
             text = raw.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:

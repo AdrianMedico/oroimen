@@ -210,9 +210,28 @@ class DeepResearchService:
         # y los de pytest/pytest-asyncio en tests → ruidoso.
         self._scrape_active = 0
 
-        # Path raíz para outputs. Default: data/jobs/ relative a cwd.
-        # Tests inyectan via settings.output_dir si necesitan tmp_path.
-        self._data_root = Path(getattr(settings, "deep_research_data_root", None) or "data/jobs")
+        # Path raíz para outputs. The writer (this class) and the
+        # reader (LocalReportStore) MUST use the SAME canonical path
+        # for the full process lifetime. The composition root in
+        # ``hermes.__main__._compose_deep_research_runtime`` resolves
+        # ``settings.deep_research_data_root`` against the current
+        # working directory and passes the resolved absolute path to
+        # both the LocalReportStore and this service. If a report
+        # store is wired, we use ITS root (the canonical path
+        # already resolved at startup); otherwise we fall back to
+        # the raw setting so the writer still works in tests that
+        # bypass the composition root.
+        _store_root = (
+            self._report_store.root
+            if self._report_store is not None
+            else None
+        )
+        if _store_root is not None:
+            self._data_root = _store_root
+        else:
+            self._data_root = Path(
+                getattr(settings, "deep_research_data_root", None) or "data/jobs"
+            )
 
         # =====================================================================
         # Slice 1C1c: explicit stopping / closed lifecycle state.

@@ -19,7 +19,6 @@ privileges on most Windows configurations.
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -33,7 +32,6 @@ from hermes.jobs.report_paths import (
     assert_inside_root,
     derive_report_path,
 )
-
 
 # =====================================================================
 # derive_report_path — happy path

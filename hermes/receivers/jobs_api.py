@@ -533,9 +533,16 @@ async def get_job_report(
     # (missing, escaped, symlink, oversize, invalid UTF-8) is mapped
     # to 500 ``report_unavailable`` by the translation block below.
 
-    # (4) Resolve the data root from settings and derive the path. The
-    # store is OPTIONAL: if it was not constructed at startup, the route
-    # returns 500 ``report_unavailable`` (the fail-closed contract).
+    # (4) Resolve the report store from the wired service. The store
+    # is REQUIRED: production composition is fail-closed and never
+    # publishes a service without a real LocalReportStore. The
+    # ``None`` branch is a defensive guard for tests or future
+    # refactors that might bypass the composition root; in that
+    # case we return the same 503 contract that
+    # ``get_deep_research_service_dep`` returns for an uninitialized
+    # singleton. We do NOT return 500 ``report_unavailable`` here
+    # because the route is the read path, and an uninitialized
+    # reader is a service-level concern, not a per-job concern.
     report_store = getattr(service, "_report_store", None)
     if report_store is None:
         logger.warning(
@@ -543,11 +550,15 @@ async def get_job_report(
             extra={"job_id": job_id},
         )
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
                 "error": {
-                    "type": "report_unavailable",
-                    "message": "Report is not available for this job.",
+                    "type": "service_unavailable",
+                    "message": (
+                        "DeepResearchService has no report reader wired. "
+                        "The composition root is responsible for the "
+                        "fail-closed invariant; this is a misconfiguration."
+                    ),
                 }
             },
         )

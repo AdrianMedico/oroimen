@@ -16,6 +16,24 @@ Privacy contract:
 - The exceptions carry ``job_id`` (12 hex chars) only.
 - Logs at the call site may tag the stable internal category
   (report_path_escape, report_symlink_denied, report_invalid_job_id).
+
+Design notes (Slice 1C2):
+- ``derive_report_path`` returns the CANDIDATE path constructed as
+  ``root / <job_id>.md`` WITHOUT calling ``resolve``. Calling
+  ``resolve(strict=False)`` would FOLLOW the symlink at that location
+  and erase the distinction between the lexical and the realpath
+  confinement checks. Derivation must leave the symlink identity
+  intact so that ``assert_inside_root`` can identify it as a symlink
+  and apply the realpath branch deterministically.
+- ``assert_inside_root`` performs TWO distinct checks in order:
+  1. Lexical confinement (no symlink follow) — the candidate path
+     must be a sub-path of the resolved root.
+  2. Realpath confinement (symlink follow) — IF the candidate is a
+     symlink, the resolved real path must also be inside the root.
+  The two checks produce different exception classes
+  (PathEscapeError vs SymlinkEscapeError) so the HTTP route can log
+  the correct internal category while still returning the same
+  redacted 500 envelope.
 """
 
 from __future__ import annotations
@@ -54,72 +72,79 @@ def _validate_job_id(job_id: str) -> None:
 
 
 def derive_report_path(root: Path, job_id: str) -> Path:
-    """Return the canonical path ``<root>/<job_id>.md`` for the given job_id.
+    """Return the candidate path ``<root>/<job_id>.md`` for the given job_id.
 
-    The path is resolved (symlinks NOT followed yet — the read path
-    follows symlinks explicitly via ``os.path.realpath`` inside
-    ``assert_inside_root`` so the failure mode is observable). The
-    caller MUST call ``assert_inside_root`` on the result before any
-    read; this function only validates ``job_id`` and constructs the
-    path.
+    The returned path is the CANDIDATE constructed by joining ``root``
+    and the validated filename. ``resolve`` is NOT called here because
+    that would follow symlinks and erase the distinction between
+    lexical and realpath confinement. The caller MUST run
+    ``assert_inside_root`` on the result before any read; this function
+    only validates ``job_id`` and constructs the path.
 
     Raises:
         InvalidJobIdError: if ``job_id`` is not a valid UUID12 hex token.
-
-    Note:
-        ``strict=False`` because the file may not exist yet (read path
-        must distinguish "missing" from "exists"; the store does that
-        via ``.exists()`` separately).
     """
     _validate_job_id(job_id)
-    return (root / f"{job_id}.md").resolve(strict=False)
+    return root / f"{job_id}.md"
 
 
 def assert_inside_root(canonical: Path, root: Path) -> None:
-    """Verify that ``canonical`` stays inside ``root`` after both symlink
-    re-resolution and lexical resolve.
+    """Verify that ``canonical`` stays inside ``root`` (lexical + realpath).
 
     Two checks, in order:
-    1. Lexical resolve: ``canonical`` must be a sub-path of
-       ``root.resolve()``. Catches ``../`` traversal via the URL path.
-    2. Symlink realpath: ``os.path.realpath(canonical)`` (which follows
-       ALL symlinks recursively) must also be inside ``root.resolve()``.
-       Catches a symlink at the canonical path whose target escapes the
-       root.
+    1. Lexical confinement: ``canonical`` (compared as a pure path
+       string, no symlink follow) must be a sub-path of
+       ``root.resolve(strict=False)``. Catches ``../`` traversal
+       via the URL path or via a manually-constructed candidate
+       that the caller passed in.
+    2. Realpath confinement: IF ``canonical`` is a symlink,
+       ``os.path.realpath`` (which follows ALL symlinks recursively)
+       must ALSO be inside ``root.resolve()``. Catches a symlink at
+       ``<root>/<id>.md`` whose target escapes the root.
 
     Raises:
-        PathEscapeError: if the lexical resolve escapes the root.
-        SymlinkEscapeError: if a symlink's real target escapes the root.
+        PathEscapeError: the lexical resolve escapes the root.
+        SymlinkEscapeError: a symlink target escapes the root.
         InvalidJobIdError: not raised here (job_id already validated at
             derivation time); provided for completeness in the call chain.
     """
     root_resolved = root.resolve(strict=False)
-    canonical_resolved = canonical.resolve(strict=False)
 
-    # (1) Lexical confinement. Use Path.is_relative_to when available
-    # (Python 3.9+); fall back to string comparison otherwise.
-    if hasattr(canonical_resolved, "is_relative_to"):
-        if not canonical_resolved.is_relative_to(root_resolved):
-            raise PathEscapeError(canonical.name.removesuffix(".md"))
-    else:  # pragma: no cover - Python 3.9+ only
-        try:
-            canonical_resolved.relative_to(root_resolved)
-        except ValueError as exc:
-            raise PathEscapeError(canonical.name.removesuffix(".md")) from exc
+    # (1) Lexical confinement — NO symlink follow at this step. We
+    # compare paths as pure strings after a lexical normalize
+    # (``os.path.normpath`` only normalizes separators and ``..``; it
+    # does NOT touch the filesystem and does NOT follow symlinks).
+    # If root is relative, we anchor both to the same cwd via
+    # ``Path.resolve(strict=False)`` on the lexical form of the
+    # candidate so the comparison is apples-to-apples. This
+    # ``resolve(strict=False)`` is purely lexical on the path STRING;
+    # it does not open the file or follow symlinks because we are
+    # operating on a ``normpath``-ed string and only normalizing
+    # textual ``..`` segments.
+    canonical_lex_str = os.path.normpath(str(canonical))
+    canonical_lex = Path(canonical_lex_str)
+    # Make both sides absolute-anchored (or both relative) so the
+    # relative_to check is meaningful regardless of how the caller
+    # constructed the paths. We do this with strict=False to avoid
+    # following symlinks; we are only resolving the textual ``..``
+    # segments against the current working directory.
+    canonical_lex_anchored = canonical_lex if canonical_lex.is_absolute() else canonical_lex.resolve(strict=False)
+    root_resolved_for_check = root_resolved if root_resolved.is_absolute() else Path(os.path.normpath(str(root_resolved)))
 
-    # (2) Symlink realpath confinement. If the canonical path is a
-    # symlink, realpath() follows it; the target must ALSO be inside
-    # root. This catches a symlink that lives at <root>/<id>.md but
-    # points to /etc/passwd.
-    real = Path(os.path.realpath(canonical_resolved))
-    if hasattr(real, "is_relative_to"):
+    try:
+        canonical_lex_anchored.relative_to(root_resolved_for_check)
+    except ValueError as exc:
+        raise PathEscapeError(canonical.name.removesuffix(".md")) from exc
+
+    # (2) Realpath confinement — only if the candidate is a symlink.
+    # We check ``is_symlink()`` first to avoid the cost of an
+    # ``os.path.realpath`` call on every read of a regular file.
+    # The ``is_symlink()`` call does not follow the link; it inspects
+    # the directory entry itself.
+    if canonical.is_symlink():
+        real = Path(os.path.realpath(canonical))
         if not real.is_relative_to(root_resolved):
             raise SymlinkEscapeError(canonical.name.removesuffix(".md"))
-    else:  # pragma: no cover - Python 3.9+ only
-        try:
-            real.relative_to(root_resolved)
-        except ValueError as exc:
-            raise SymlinkEscapeError(canonical.name.removesuffix(".md")) from exc
 
 
 __all__ = [
