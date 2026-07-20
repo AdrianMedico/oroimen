@@ -210,20 +210,26 @@ class TelegramNotifier:
     async def send_research_complete(
         self,
         job_id: str,
-        output_path: str,
         cost_usd: float,
     ) -> bool:
         """Push al user cuando un research job completa exitosamente.
+
+        Slice 1C2: the signature is now ``(job_id, cost_usd)`` — no
+        ``output_path`` / ``report_ref`` parameter. The template is
+        redacted to remove the filesystem path: clients retrieve the
+        report content via ``GET /v1/jobs/{id}/report`` (which is
+        auth-gated, owner-scoped, and path-confined). The Telegram
+        message is now a delivery notice only.
 
         Cooldown: 1h por job_id (NO por alert_type, cada job tiene 1 notif).
         Implementación: usar alert_type=f"research_complete:{job_id}" para
         granularidad job_id (cada job su propio slot de cooldown).
 
-        Format del mensaje (TDD §9.1):
-            ✅ Research done · Job `abc123def456`
-            📄 /data/Cache/.../data/jobs/abc123def456.md
+        Format del mensaje (Slice 1C2, owner-adjudicated):
+            ✅ Research complete · Job `abc123def456`
+            📄 Report ready in Oroimen
             💰 $0.0420
-            🌐 open in webapp
+            🌐 Open Oroimen to view it
 
         Returns:
             True si enviado, False si suppressed (cooldown o not enabled).
@@ -233,10 +239,10 @@ class TelegramNotifier:
             return False
 
         text = (
-            f"✅ Research done · Job `{job_id}`\n"
-            f"📄 `{output_path}`\n"
+            f"✅ Research complete · Job `{job_id}`\n"
+            f"📄 Report ready in Oroimen\n"
             f"💰 ${cost_usd:.4f}\n"
-            f"🌐 open in webapp"
+            f"🌐 Open Oroimen to view it"
         )
         return await self._send_telegram(text)
 

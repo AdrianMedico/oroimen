@@ -1179,11 +1179,34 @@ def dr_patched_hermes_main(
     }
 
 
-def _dr_settings(*, enabled: bool) -> SimpleNamespace:
+def _dr_settings(
+    *,
+    enabled: bool,
+    data_root: Path | None = None,
+    max_report_bytes: int = 5_242_880,
+) -> SimpleNamespace:
+    """Settings factory for ``_compose_deep_research_runtime`` tests.
+
+    Slice 1C2: the 1C2 composition root reads ``deep_research_data_root``
+    and ``deep_research_max_report_bytes`` from settings. The 6 existing
+    callers in this file (which only set ``enabled=True/False``) keep
+    working because the two new fields default to a path the test
+    workspace can ``mkdir`` and a max-bytes value above the
+    ``LocalReportStore._MIN_MAX_BYTES`` floor.
+
+    Test-only overrides:
+    - ``data_root`` lets a test pass ``tmp_path`` to control where the
+      report store is constructed.
+    - ``max_report_bytes`` lets a test trigger a construction failure
+      (e.g. ``10_239`` below the floor) and prove the composition root
+      is fail-closed.
+    """
     return SimpleNamespace(
         deep_research_enabled=enabled,
         search_enabled=True,
         search_size_guard_chars=1000,
+        deep_research_data_root=data_root or Path("data/jobs"),
+        deep_research_max_report_bytes=max_report_bytes,
     )
 
 
@@ -1993,3 +2016,308 @@ async def test_compose_rollback_on_cancelled_error_re_raises(
     assert "scheduler_shutdown" in scheduler.events
     # Singleton was never published and is cleared.
     assert _jobs_api_mod._service_singleton is None
+
+
+# ---------------------------------------------------------------------------
+# Slice 1C2: composition root wires LocalReportStore (fail-closed)
+# ---------------------------------------------------------------------------
+# These tests exercise the BINDING FAIL-CLOSED CORRECTION:
+# - successful composition constructs and injects a real LocalReportStore;
+# - successful composition reports ``report_retrieval=True`` ONLY when
+#   construction succeeded;
+# - disabled and missing-prerequisite early returns do NOT construct a
+#   report store and keep ``report_retrieval=False``;
+# - a construction failure (e.g. invalid max_bytes) propagates to the
+#   outer ``except Exception:`` rollback, does NOT publish the
+#   singleton, and returns the ``unavailable`` capability defaults;
+# - ``set_deep_research_service`` remains the LAST step in the
+#   success path;
+# - existing lifecycle / cancellation contracts do not regress.
+#
+# The preflight gate's consumption of ``capabilities.report_retrieval``
+# is already covered by ``test_jobs_preflight.py``. These tests prove
+# the producer side (composition root) that the preflight tests
+# assume.
+
+
+def _recording_settings_stub(
+    tmp_path: Path, *, max_report_bytes: int = 5_242_880
+) -> SimpleNamespace:
+    """Settings stub that resolves a real ``tmp_path`` for the report root.
+
+    The composition root calls ``Path(settings.deep_research_data_root)
+    .resolve(strict=False).mkdir(parents=True, exist_ok=True)`` and
+    then constructs ``LocalReportStore(root=..., max_bytes=...)``. We
+    point the root at a real ``tmp_path`` so ``mkdir`` succeeds and
+    the construction can be verified end-to-end.
+    """
+    return SimpleNamespace(
+        deep_research_enabled=True,
+        search_enabled=True,
+        search_size_guard_chars=1000,
+        deep_research_data_root=tmp_path,
+        deep_research_max_report_bytes=max_report_bytes,
+    )
+
+
+@pytest.mark.asyncio
+async def test_1c2_compose_constructs_real_local_report_store_and_injects_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Successful composition constructs a real ``LocalReportStore`` and
+    injects it into ``DeepResearchService``. ``capabilities.report_retrieval``
+    is ``True`` ONLY because the construction succeeded.
+    """
+    scheduler = _RecordingDRScheduler()
+    logs = _patch_dr_runtime(monkeypatch, scheduler=scheduler)
+    settings = _recording_settings_stub(tmp_path)
+
+    caps, returned_scheduler, service = await main_module._compose_deep_research_runtime(
+        settings=settings,
+        db=MagicMock(),
+        notifier=MagicMock(),
+        llm=SimpleNamespace(cloud_client_configured=True),
+        search_backends={"tavily": MagicMock()},
+        search_budget=MagicMock(),
+        search_circuit_breaker=MagicMock(),
+        search_concurrency=MagicMock(),
+    )
+
+    # The runtime was successfully composed.
+    assert returned_scheduler is scheduler
+    assert service is logs["constructed_services"][0]
+    assert caps.report_retrieval is True
+    # The report store was constructed and passed to the service.
+    service_kwargs = logs["service_constructor_calls"][0]
+    assert "report_store" in service_kwargs
+    assert service_kwargs["report_store"] is not None
+    # The directory was created (mkdir -p on tmp_path).
+    assert tmp_path.exists() and tmp_path.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_1c2_compose_disabled_keeps_report_retrieval_false_and_no_construction(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Disabled runtime does NOT construct a report store; returns unavailable.
+
+    The disabled early return at ``if not settings.deep_research_enabled``
+    must fire BEFORE any report-store construction. This is verified by
+    asserting the constructed service count is 0.
+    """
+    scheduler = _RecordingDRScheduler()
+    logs = _patch_dr_runtime(monkeypatch, scheduler=scheduler)
+
+    caps, returned_scheduler, service = await main_module._compose_deep_research_runtime(
+        settings=_dr_settings(enabled=False),
+        db=MagicMock(),
+        notifier=MagicMock(),
+        llm=SimpleNamespace(cloud_client_configured=True),
+        search_backends={"tavily": MagicMock()},
+        search_budget=MagicMock(),
+        search_circuit_breaker=MagicMock(),
+        search_concurrency=MagicMock(),
+    )
+
+    # Disabled path: no construction, no service, no scheduler, no
+    # singleton published, report_retrieval stays False.
+    assert caps.report_retrieval is False
+    assert returned_scheduler is None and service is None
+    assert logs["service_constructor_calls"] == []
+    assert logs["set_singleton_calls"] == []
+    assert logs["ordering"] == []
+
+
+@pytest.mark.asyncio
+async def test_1c2_compose_missing_prereqs_keeps_report_retrieval_false(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing-prerequisite runtime does NOT construct a report store.
+
+    The missing-prereq early return at the ``if not (tavily and ... and
+    search_concurrency is not None)`` block must fire BEFORE any
+    report-store construction.
+    """
+    scheduler = _RecordingDRScheduler()
+    logs = _patch_dr_runtime(monkeypatch, scheduler=scheduler)
+
+    # Empty search_backends → no Tavily → missing prereq.
+    caps, returned_scheduler, service = await main_module._compose_deep_research_runtime(
+        settings=_dr_settings(enabled=True),
+        db=MagicMock(),
+        notifier=MagicMock(),
+        llm=SimpleNamespace(cloud_client_configured=True),
+        search_backends={},  # no Tavily
+        search_budget=MagicMock(),
+        search_circuit_breaker=MagicMock(),
+        search_concurrency=MagicMock(),
+    )
+
+    assert caps.report_retrieval is False
+    assert returned_scheduler is None and service is None
+    assert logs["service_constructor_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_1c2_compose_construction_failure_rolls_back_and_does_not_publish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``LocalReportStore`` construction failure triggers the outer
+    rollback, does NOT publish the singleton, and returns the
+    ``unavailable`` capability defaults. This is the BINDING FAIL-CLOSED
+    CORRECTION end-to-end.
+    """
+    import hermes.receivers.jobs_api as _jobs_api_mod
+
+    _jobs_api_mod._service_singleton = None
+    scheduler = _RecordingDRScheduler()
+    logs = _patch_dr_runtime(monkeypatch, scheduler=scheduler)
+
+    # Force LocalReportStore construction failure by passing
+    # max_bytes below the store's floor (10_240). The composition
+    # root calls ``int(settings.deep_research_max_report_bytes)`` and
+    # passes it directly to ``LocalReportStore(...)``, which raises
+    # ``ValueError`` in __init__.
+    caps, returned_scheduler, service = await main_module._compose_deep_research_runtime(
+        settings=_recording_settings_stub(tmp_path, max_report_bytes=10_239),
+        db=MagicMock(),
+        notifier=MagicMock(),
+        llm=SimpleNamespace(cloud_client_configured=True),
+        search_backends={"tavily": MagicMock()},
+        search_budget=MagicMock(),
+        search_circuit_breaker=MagicMock(),
+        search_concurrency=MagicMock(),
+    )
+
+    # Composition returned the unavailable defaults; no scheduler, no
+    # service.
+    assert caps.report_retrieval is False
+    assert caps.service_wiring is False
+    assert caps.recovery_wiring is False
+    assert returned_scheduler is None and service is None
+    # The singleton was NEVER published.
+    assert logs["set_singleton_calls"] == []
+    # The singleton is also cleared (matches the rollback path).
+    assert _jobs_api_mod._service_singleton is None
+    # No service was constructed because the LocalReportStore failure
+    # raised before the service line ran.
+    assert logs["service_constructor_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_1c2_compose_recovery_failure_does_not_publish_singleton(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A recovery failure (post-store-construction) triggers the outer
+    rollback and does NOT publish the singleton.
+    """
+    import hermes.jobs.recovery as recovery_module
+    import hermes.receivers.jobs_api as _jobs_api_mod
+
+    _jobs_api_mod._service_singleton = None
+    scheduler = _RecordingDRScheduler()
+    logs = _patch_dr_runtime(monkeypatch, scheduler=scheduler)
+
+    async def _recovery_raises(**kwargs: Any) -> int:
+        raise RuntimeError("recovery exploded after store was constructed")
+
+    monkeypatch.setattr(recovery_module, "recover_research_jobs", _recovery_raises)
+
+    caps, returned_scheduler, service = await main_module._compose_deep_research_runtime(
+        settings=_recording_settings_stub(tmp_path),
+        db=MagicMock(),
+        notifier=MagicMock(),
+        llm=SimpleNamespace(cloud_client_configured=True),
+        search_backends={"tavily": MagicMock()},
+        search_budget=MagicMock(),
+        search_circuit_breaker=MagicMock(),
+        search_concurrency=MagicMock(),
+    )
+
+    # The store was constructed (so the service was built), but
+    # recovery failed, so the singleton is NOT published.
+    assert caps.report_retrieval is False
+    assert caps.service_wiring is False
+    assert returned_scheduler is None
+    assert service is None  # rolled back; function returns None for service
+    assert logs["set_singleton_calls"] == []
+    assert _jobs_api_mod._service_singleton is None
+
+
+@pytest.mark.asyncio
+async def test_1c2_compose_singleton_published_last_after_recovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``set_deep_research_service`` is the LAST step in the success path.
+
+    This is the late-publication contract from 1C1c (P1-B1). Slice 1C2
+    preserves it: the store is constructed BEFORE recovery, recovery
+    completes, and only then is the singleton published.
+    """
+    scheduler = _RecordingDRScheduler()
+    logs = _patch_dr_runtime(monkeypatch, scheduler=scheduler)
+
+    caps, _returned_scheduler, service = await main_module._compose_deep_research_runtime(
+        settings=_recording_settings_stub(tmp_path),
+        db=MagicMock(),
+        notifier=MagicMock(),
+        llm=SimpleNamespace(cloud_client_configured=True),
+        search_backends={"tavily": MagicMock()},
+        search_budget=MagicMock(),
+        search_circuit_breaker=MagicMock(),
+        search_concurrency=MagicMock(),
+    )
+
+    # The full success ordering shows recovery BEFORE the singleton.
+    assert logs["ordering"] == [
+        "construct_fetcher",
+        "construct_service",
+        "attach_to_scheduler",
+        "scheduler_start",
+        "recover",
+        "singleton_register",
+    ]
+    assert caps.report_retrieval is True
+    assert service is not None
+
+
+@pytest.mark.asyncio
+async def test_1c2_compose_disabled_keeps_existing_capabilities_unchanged(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Disabled runtime returns the same capability shape as 1C1b plus
+    report_retrieval=False. The other 7 capabilities stay False (the
+    default unavailable shape). Existing tests that compare
+    ``DeepResearchCapabilities()`` to the 1C1b shape do not regress.
+    """
+    scheduler = _RecordingDRScheduler()
+    _patch_dr_runtime(monkeypatch, scheduler=scheduler)
+
+    caps, returned_scheduler, service = await main_module._compose_deep_research_runtime(
+        settings=_dr_settings(enabled=False),
+        db=MagicMock(),
+        notifier=MagicMock(),
+        llm=SimpleNamespace(cloud_client_configured=True),
+        search_backends={"tavily": MagicMock()},
+        search_budget=MagicMock(),
+        search_circuit_breaker=MagicMock(),
+        search_concurrency=MagicMock(),
+    )
+
+    # The 7 1C1b capability fields are still False on the disabled
+    # path; report_retrieval is also False.
+    for field in (
+        "service_wiring",
+        "recovery_wiring",
+        "fetch_policy",
+        "external_fetch",
+        "search_backend_configured",
+        "llm_provider_configured",
+        "model_output_enforced",
+        "report_retrieval",
+    ):
+        assert getattr(caps, field) is False, (
+            f"disabled runtime must keep {field}=False; got {getattr(caps, field)!r}"
+        )
+    assert returned_scheduler is None
+    assert service is None

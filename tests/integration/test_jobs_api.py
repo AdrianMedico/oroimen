@@ -31,6 +31,7 @@ Total: 17 tests.
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -53,6 +54,7 @@ from hermes.jobs.models import (
     PhaseName,
 )
 from hermes.jobs.preflight import DeepResearchCapabilities
+from hermes.jobs.report_store import LocalReportStore
 from hermes.receivers import jobs_api
 from hermes.receivers.http_api import create_app
 from hermes.tools.registry import ToolRegistry
@@ -75,9 +77,19 @@ class _FakeService:
       - _settings (con deep_research_daily_budget_usd)
     """
 
-    def __init__(self, db: Any, settings: Any) -> None:
+    def __init__(
+        self,
+        db: Any,
+        settings: Any,
+        *,
+        report_store: Any | None = None,
+    ) -> None:
         self._db = db
         self._settings = settings
+        # Slice 1C2: optional LocalReportStore for GET /v1/jobs/{id}/report.
+        # When None (default), the route returns 500 ``report_unavailable``
+        # for complete jobs — the fail-closed contract.
+        self._report_store = report_store
 
     async def submit_job(
         self,
@@ -131,6 +143,9 @@ class _FakeService:
         if row is None:
             raise JobNotFoundError(f"Job {job_id} not found")
         # token_usage vacio en el fake (drill-down no es scope US-2.1).
+        # Slice 1C2: JobDetail no longer carries output_path /
+        # partial_output_path / checkpoint_path. Clients retrieve
+        # report content via GET /v1/jobs/{id}/report.
         return JobDetail(
             id=row["id"],
             query=row["query"],
@@ -143,8 +158,6 @@ class _FakeService:
             completed_at=row.get("completed_at"),
             job_type=row.get("job_type", "deep_research"),
             notify_via_tg=bool(row.get("notify_via_tg", 1)),
-            output_path=row.get("output_path"),
-            partial_output_path=row.get("partial_output_path"),
             error_taxonomy=row.get("error_taxonomy"),
             error_message=row.get("error_message"),
             tokens_in=row["tokens_in"],
@@ -152,7 +165,6 @@ class _FakeService:
             notified=bool(row.get("notified", 0)),
             updated_at=row["updated_at"],
             token_usage=[],
-            checkpoint_path=None,
         )
 
     async def list_jobs(
@@ -198,13 +210,11 @@ class _FakeService:
                 id=job_id,
                 status=JobStatus.CANCELLED,
                 graceful=False,
-                partial_output_path=None,
             )
         return CancelResponse(
             id=job_id,
             status=JobStatus.CANCELLING,
             graceful=True,
-            partial_output_path=None,
         )
 
     async def retry_job(self, job_id: str, user_id: int = 0) -> JobResponse:
@@ -282,6 +292,38 @@ def client_with_auth(
 def bearer() -> dict[str, str]:
     """Header ``Authorization`` valido para client_with_auth."""
     return {"Authorization": "Bearer test-bearer-key-xyz"}
+
+
+@pytest.fixture
+def report_store(tmp_path: Path) -> LocalReportStore:
+    """LocalReportStore apuntando a ``tmp_path`` (5 MiB cap, 10 KiB floor)."""
+    return LocalReportStore(root=tmp_path, max_bytes=5_242_880)
+
+
+@pytest.fixture
+def client_with_report_store(
+    authed_settings: Any,
+    db: Any,
+    report_store: LocalReportStore,
+) -> Any:
+    """TestClient con un ``LocalReportStore`` real inyectado en el service.
+
+    Los tests que recuperan un reporte necesitan escribir el archivo
+    directamente en ``report_store.root`` (no exponemos una API de
+    escritura — el writer real es ``_phase_write`` que no es scope de
+    estos tests). El path canónico es ``<root>/<UUID12 job_id>.md``.
+    """
+    app = create_app(
+        authed_settings,
+        db,
+        _fake_router(),
+        ToolRegistry(),
+    )
+    service = _FakeService(db, authed_settings, report_store=report_store)
+    jobs_api.set_deep_research_service(service)
+    with TestClient(app) as client:
+        yield client, report_store
+    jobs_api.set_deep_research_service(None)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +474,12 @@ async def test_get_jobs_list_pagination(
 
 
 async def test_get_job_detail_200(client_with_auth: Any, bearer: dict[str, str], db: Any) -> None:
-    """Crea job, get by id → 200 con todos los campos de JobDetail."""
+    """Crea job, get by id → 200 con todos los campos de JobDetail.
+
+    Slice 1C2: JobDetail no longer exposes filesystem paths. The
+    assertions confirm the four forbidden fields are NOT in the
+    response body.
+    """
     resp = client_with_auth.post(
         "/v1/jobs",
         json={"query": "Detail test query"},
@@ -448,6 +495,12 @@ async def test_get_job_detail_200(client_with_auth: Any, bearer: dict[str, str],
     assert "job_type" in data
     assert "tokens_in" in data
     assert "progress_percent" in data
+    # Slice 1C2: path fields removed from the public DTO.
+    assert "output_path" not in data
+    assert "checkpoint_path" not in data
+    assert "partial_output_path" not in data
+    # No `report_available` either (status is the source of truth).
+    assert "report_available" not in data
 
 
 async def test_get_job_detail_404_unknown(client_with_auth: Any, bearer: dict[str, str]) -> None:
@@ -778,3 +831,501 @@ def test_preflight_static_route_precedes_job_id() -> None:
     paths = [getattr(route, "path", None) for route in jobs_api.router.routes]
 
     assert paths.index("/v1/jobs/preflight") < paths.index("/v1/jobs/{job_id}")
+
+
+# ===========================================================================
+# Slice 1C2 — GET /v1/jobs/{job_id}/report
+# ===========================================================================
+#
+# The HTTP route is the SOLE reader of the report store. It is derived
+# from ``settings.deep_research_data_root + validated job_id`` (NEVER
+# from the DB ``output_path`` column). The contract is:
+#   200 markdown, exact headers
+#   401 missing bearer
+#   422 invalid job id
+#   404 job_not_found (constant — missing and foreign-owned identical)
+#   409 report_not_ready — owner job in {pending, running, cancelling}
+#   409 report_unavailable — owner job in {failed, cancelled}
+#   500 report_unavailable — complete job, file missing/escaped/oversize/utf-8
+#   503 — service singleton not initialized
+#
+# All redacted-error bodies use the constant phrase "Job not found." or
+# "Report is not available for this job." — the route MUST NOT echo
+# the job_id in 404, nor filesystem paths in 500.
+
+# ---------------------------------------------------------------------------
+# Test helpers for the report endpoint
+# ---------------------------------------------------------------------------
+
+_REPORT_MD = "# Research Report\n\nThis is the body of the markdown report.\n"
+
+
+def _create_pending_job(client: Any, bearer: dict[str, str]) -> str:
+    """Helper: POST a new job, return its UUID12 id."""
+    resp = client.post(
+        "/v1/jobs",
+        json={"query": "report-endpoint-test"},
+        headers=bearer,
+    )
+    assert resp.status_code == 201
+    return resp.json()["id"]
+
+
+def _write_report(store: LocalReportStore, job_id: str, body: str) -> None:
+    """Helper: write a report file to the store's root, named ``{job_id}.md``.
+
+    Uses ``write_bytes`` to avoid Windows newline conversion — the
+    content must round-trip byte-for-byte for the 200 test.
+    """
+    target = store.derive_path(job_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(body.encode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# 1. Happy path: valid owner + complete + report present → 200 + exact headers
+# ---------------------------------------------------------------------------
+
+
+async def test_report_200_with_complete_job(
+    client_with_report_store: Any, bearer: dict[str, str], db: Any
+) -> None:
+    client, store = client_with_report_store
+    job_id = _create_pending_job(client, bearer)
+    _write_report(store, job_id, _REPORT_MD)
+    await db.update_research_job_status(job_id, "complete")
+
+    response = client.get(f"/v1/jobs/{job_id}/report", headers=bearer)
+    assert response.status_code == 200
+    assert response.content.decode("utf-8") == _REPORT_MD
+    # Exact headers per owner-adjudicated contract.
+    assert response.headers["content-type"].startswith("text/markdown")
+    assert "charset=utf-8" in response.headers["content-type"].lower()
+    assert response.headers["content-disposition"] == (
+        f'inline; filename="research-{job_id}.md"'
+    )
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+# ---------------------------------------------------------------------------
+# 2. Missing bearer → existing 401
+# ---------------------------------------------------------------------------
+
+
+def test_report_401_without_bearer(client_with_report_store: Any) -> None:
+    client, _ = client_with_report_store
+    response = client.get("/v1/jobs/000000000000/report")
+    assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# 3. Invalid job id (not UUID12 hex) → FastAPI 422
+# ---------------------------------------------------------------------------
+
+
+def test_report_422_invalid_job_id(
+    client_with_report_store: Any, bearer: dict[str, str]
+) -> None:
+    client, _ = client_with_report_store
+    # 11 hex chars — fails the min_length=12 constraint
+    response = client.get("/v1/jobs/abcdef01234/report", headers=bearer)
+    assert response.status_code == 422
+    # Non-hex pattern also rejected
+    response2 = client.get("/v1/jobs/zzzzzzzzzzzz/report", headers=bearer)
+    assert response2.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 4. Missing job → constant 404
+# ---------------------------------------------------------------------------
+
+
+def test_report_404_missing_job(
+    client_with_report_store: Any, bearer: dict[str, str]
+) -> None:
+    client, _ = client_with_report_store
+    # Valid UUID12 format but no row in DB
+    response = client.get("/v1/jobs/000000000000/report", headers=bearer)
+    assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert detail["error"]["type"] == "job_not_found"
+    assert detail["error"]["message"] == "Job not found."
+    # Must NOT echo the job_id anywhere in the body.
+    assert "000000000000" not in response.text
+
+
+# ---------------------------------------------------------------------------
+# 5. Foreign job → byte-identical constant 404
+# ---------------------------------------------------------------------------
+
+
+async def test_report_404_foreign_job_byte_identical(
+    client_with_report_store: Any, bearer: dict[str, str], db: Any
+) -> None:
+    """Foreign-owned job must return the SAME 404 body as a missing job.
+
+    The contract is "owner cannot enumerate other users' job IDs".
+    We compare the byte-exact body (status + headers + body) between
+    a missing-job request and a foreign-job request, using the same
+    syntactically valid UUID12 in isolated DB states.
+    """
+    client, _ = client_with_report_store
+
+    # (a) Foreign-owned job: create as user 0, change user_id to 99.
+    import sqlite3
+
+    resp = client.post(
+        "/v1/jobs",
+        json={"query": "foreign-report-test"},
+        headers=bearer,
+    )
+    job_id = resp.json()["id"]
+    with sqlite3.connect(str(db.path)) as conn:
+        conn.execute("UPDATE research_jobs SET user_id = 99 WHERE id = ?", (job_id,))
+        conn.commit()
+
+    foreign_resp = client.get(f"/v1/jobs/{job_id}/report", headers=bearer)
+
+    # (b) Missing job: pick a different valid UUID12 that is NOT in DB.
+    # We use the same test client with a fresh id; row absence returns 404.
+    missing_resp = client.get("/v1/jobs/000000000000/report", headers=bearer)
+
+    # Byte-identical response (status + body).
+    assert foreign_resp.status_code == missing_resp.status_code == 404
+    assert foreign_resp.content == missing_resp.content
+    # And neither response leaks the job_id.
+    assert job_id.encode() not in foreign_resp.content
+    assert b"000000000000" not in foreign_resp.content
+
+
+# ---------------------------------------------------------------------------
+# 6. Pending → 409 report_not_ready
+# ---------------------------------------------------------------------------
+
+
+def test_report_409_pending(
+    client_with_report_store: Any, bearer: dict[str, str]
+) -> None:
+    client, _ = client_with_report_store
+    job_id = _create_pending_job(client, bearer)
+    # Default status is 'pending'.
+    response = client.get(f"/v1/jobs/{job_id}/report", headers=bearer)
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["error"]["type"] == "report_not_ready"
+    assert "not ready" in detail["error"]["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# 7. Running → 409 report_not_ready
+# ---------------------------------------------------------------------------
+
+
+async def test_report_409_running(
+    client_with_report_store: Any, bearer: dict[str, str], db: Any
+) -> None:
+    client, _ = client_with_report_store
+    job_id = _create_pending_job(client, bearer)
+    await db.update_research_job_status(job_id, "running")
+    response = client.get(f"/v1/jobs/{job_id}/report", headers=bearer)
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"]["type"] == "report_not_ready"
+
+
+# ---------------------------------------------------------------------------
+# 8. Cancelling → 409 report_not_ready
+# ---------------------------------------------------------------------------
+
+
+async def test_report_409_cancelling(
+    client_with_report_store: Any, bearer: dict[str, str], db: Any
+) -> None:
+    client, _ = client_with_report_store
+    job_id = _create_pending_job(client, bearer)
+    await db.update_research_job_status(job_id, "cancelling")
+    response = client.get(f"/v1/jobs/{job_id}/report", headers=bearer)
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"]["type"] == "report_not_ready"
+
+
+# ---------------------------------------------------------------------------
+# 9. Failed without report → 409 report_unavailable
+# ---------------------------------------------------------------------------
+
+
+async def test_report_409_failed_no_report(
+    client_with_report_store: Any, bearer: dict[str, str], db: Any
+) -> None:
+    client, _ = client_with_report_store
+    job_id = _create_pending_job(client, bearer)
+    await db.update_research_job_status(
+        job_id, "failed", error_taxonomy="llm_5xx"
+    )
+    response = client.get(f"/v1/jobs/{job_id}/report", headers=bearer)
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"]["type"] == "report_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# 10. Cancelled without report → 409 report_unavailable
+# ---------------------------------------------------------------------------
+
+
+async def test_report_409_cancelled_no_report(
+    client_with_report_store: Any, bearer: dict[str, str], db: Any
+) -> None:
+    client, _ = client_with_report_store
+    job_id = _create_pending_job(client, bearer)
+    await db.update_research_job_status(job_id, "cancelled")
+    response = client.get(f"/v1/jobs/{job_id}/report", headers=bearer)
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"]["type"] == "report_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# 11. Complete + missing report → redacted 500
+# ---------------------------------------------------------------------------
+
+
+async def test_report_500_complete_missing_file(
+    client_with_report_store: Any, bearer: dict[str, str], db: Any
+) -> None:
+    client, store = client_with_report_store
+    job_id = _create_pending_job(client, bearer)
+    # Move to 'complete' WITHOUT writing the file.
+    await db.update_research_job_status(job_id, "complete")
+    response = client.get(f"/v1/jobs/{job_id}/report", headers=bearer)
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert detail["error"]["type"] == "report_unavailable"
+    # Redacted message; must NOT include the file path or the OS error.
+    assert detail["error"]["message"] == "Report is not available for this job."
+    assert "No such file" not in response.text
+    assert str(store.root) not in response.text
+
+
+# ---------------------------------------------------------------------------
+# 12. Complete + oversized report → redacted 500
+# ---------------------------------------------------------------------------
+
+
+async def test_report_500_complete_oversized(
+    client_with_report_store: Any, bearer: dict[str, str], db: Any
+) -> None:
+    client, store = client_with_report_store
+    job_id = _create_pending_job(client, bearer)
+    # Write a file LARGER than the store's max_bytes (5 MiB).
+    oversize_bytes = b"x" * (5_242_880 + 1)
+    _write_report_bytes(store, job_id, oversize_bytes)
+    await db.update_research_job_status(job_id, "complete")
+    response = client.get(f"/v1/jobs/{job_id}/report", headers=bearer)
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert detail["error"]["type"] == "report_unavailable"
+    assert detail["error"]["message"] == "Report is not available for this job."
+    # Must not leak size, path, or specific exception text.
+    assert "5242881" not in response.text
+    assert str(store.root) not in response.text
+
+
+# ---------------------------------------------------------------------------
+# 13. Complete + invalid UTF-8 → redacted 500
+# ---------------------------------------------------------------------------
+
+
+async def test_report_500_complete_invalid_utf8(
+    client_with_report_store: Any, bearer: dict[str, str], db: Any
+) -> None:
+    client, store = client_with_report_store
+    job_id = _create_pending_job(client, bearer)
+    # Write bytes that are NOT valid UTF-8 (lone 0x80 continuation byte).
+    _write_report_bytes(store, job_id, b"\x80\x81\x82 invalid utf-8")
+    await db.update_research_job_status(job_id, "complete")
+    response = client.get(f"/v1/jobs/{job_id}/report", headers=bearer)
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert detail["error"]["type"] == "report_unavailable"
+    assert detail["error"]["message"] == "Report is not available for this job."
+    assert "UnicodeDecode" not in response.text
+
+
+# ---------------------------------------------------------------------------
+# 14. Symlink / path-confinement failure → redacted 500
+# ---------------------------------------------------------------------------
+
+
+async def test_report_500_symlink_path_confinement(
+    client_with_report_store: Any, bearer: dict[str, str], db: Any
+) -> None:
+    client, store = client_with_report_store
+    job_id = _create_pending_job(client, bearer)
+    # Replace the canonical file with a symlink pointing OUTSIDE the root.
+    canonical = store.derive_path(job_id)
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    # Create a target file outside the root, then symlink to it.
+    outside = store.root.parent / f"outside-{job_id}.md"
+    outside.write_text("# Outside\n", encoding="utf-8")
+    if canonical.exists() or canonical.is_symlink():
+        canonical.unlink()
+    canonical.symlink_to(outside)
+    await db.update_research_job_status(job_id, "complete")
+    response = client.get(f"/v1/jobs/{job_id}/report", headers=bearer)
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert detail["error"]["type"] == "report_unavailable"
+    assert detail["error"]["message"] == "Report is not available for this job."
+    # Must not leak the symlink target or the outside path.
+    assert str(outside) not in response.text
+    assert "symlink" not in response.text.lower()
+    # Cleanup
+    outside.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 15. Service not initialized → existing 503
+# ---------------------------------------------------------------------------
+
+
+def test_report_503_when_service_missing(
+    authed_settings: Any, db: Any, bearer: dict[str, str]
+) -> None:
+    """Without a service singleton, the route returns 503 (existing pattern)."""
+    jobs_api.set_deep_research_service(None)  # type: ignore[arg-type]
+    app = create_app(
+        authed_settings,
+        db,
+        _fake_router(),
+        ToolRegistry(),
+    )
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/jobs/000000000000/report",
+            headers={"Authorization": "Bearer test-bearer-key-xyz"},
+        )
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "not initialized" in detail["error"]["message"]
+
+
+def test_report_503_when_service_has_no_report_store(
+    authed_settings: Any, db: Any, bearer: dict[str, str]
+) -> None:
+    """Service singleton exists but has no report_store wired → 503 (NOT 500).
+
+    Defensive guard: production composition is fail-closed and never
+    publishes a service without a real LocalReportStore. The route
+    preserves the 503 service_unavailable contract for an uninitialized
+    reader rather than returning 500 report_unavailable (which is
+    reserved for per-job read failures with a valid store).
+    """
+    # Register a service that explicitly has no report_store. Use the
+    # real _FakeService (which already accepts report_store=None).
+    service = _FakeService(db, authed_settings, report_store=None)
+    jobs_api.set_deep_research_service(service)
+    app = create_app(
+        authed_settings,
+        db,
+        _fake_router(),
+        ToolRegistry(),
+    )
+    try:
+        with TestClient(app) as client:
+            # Create a complete job first so the status check passes.
+            resp = client.post(
+                "/v1/jobs",
+                json={"query": "no-store-503-test"},
+                headers=bearer,
+            )
+            job_id = resp.json()["id"]
+            import sqlite3
+
+            with sqlite3.connect(str(db.path)) as conn:
+                conn.execute(
+                    "UPDATE research_jobs SET status = 'complete' WHERE id = ?",
+                    (job_id,),
+                )
+                conn.commit()
+            response = client.get(
+                f"/v1/jobs/{job_id}/report",
+                headers=bearer,
+            )
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert detail["error"]["type"] == "service_unavailable"
+        assert "no report reader" in detail["error"]["message"]
+    finally:
+        jobs_api.set_deep_research_service(None)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# 16. Public JobDetail omits all three internal path fields
+# ---------------------------------------------------------------------------
+
+
+def test_job_detail_omits_path_fields(
+    client_with_auth: Any, bearer: dict[str, str]
+) -> None:
+    """GET /v1/jobs/{id} response MUST NOT contain output_path,
+    partial_output_path, or checkpoint_path. These were removed in
+    Slice 1C2; report retrieval is the only sanctioned read path."""
+    resp = client_with_auth.post(
+        "/v1/jobs",
+        json={"query": "job-detail-omits-paths"},
+        headers=bearer,
+    )
+    job_id = resp.json()["id"]
+    detail_resp = client_with_auth.get(f"/v1/jobs/{job_id}", headers=bearer)
+    assert detail_resp.status_code == 200
+    body = detail_resp.json()
+    for forbidden in ("output_path", "partial_output_path", "checkpoint_path"):
+        assert forbidden not in body, (
+            f"JobDetail must not expose {forbidden!r} in 1C2; got {body!r}"
+        )
+    # And no synthetic `report_available` either.
+    assert "report_available" not in body
+
+
+# ---------------------------------------------------------------------------
+# 17. CancelResponse retains id, status, graceful and omits partial_output_path
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_response_omits_partial_output_path(
+    client_with_auth: Any, bearer: dict[str, str]
+) -> None:
+    """POST /v1/jobs/{id}/cancel response must NOT contain
+    ``partial_output_path``. The 1C2 DTO only carries id, status,
+    graceful."""
+    resp = client_with_auth.post(
+        "/v1/jobs",
+        json={"query": "cancel-omits-partial-path"},
+        headers=bearer,
+    )
+    job_id = resp.json()["id"]
+    cancel_resp = client_with_auth.post(
+        f"/v1/jobs/{job_id}/cancel?graceful=true",
+        headers=bearer,
+    )
+    assert cancel_resp.status_code == 200
+    body = cancel_resp.json()
+    # Required fields retained.
+    assert body["id"] == job_id
+    assert body["status"] in ("cancelling", "cancelled")
+    assert body["graceful"] is True
+    # Forbidden field removed.
+    assert "partial_output_path" not in body
+
+
+# ---------------------------------------------------------------------------
+# Internal helper: write raw bytes to a job's report path
+# ---------------------------------------------------------------------------
+
+
+def _write_report_bytes(store: LocalReportStore, job_id: str, body: bytes) -> None:
+    """Helper: write RAW bytes (not str) to a job's report path. Used by
+    the oversize + invalid-UTF-8 tests to bypass the natural UTF-8 writer
+    used by ``_write_report``."""
+    target = store.derive_path(job_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(body)

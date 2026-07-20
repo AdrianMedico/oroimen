@@ -112,7 +112,6 @@ async def test_recovery_5_cases() -> None:
     # Case 4: unnotified complete → notifier.send_research_complete called
     notifier.send_research_complete.assert_called_once_with(
         job_id="unnot1",
-        output_path="/x.md",
         cost_usd=0.05,
     )
     db.mark_research_job_notified.assert_called_once_with("unnot1")

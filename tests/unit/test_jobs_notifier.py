@@ -28,7 +28,12 @@ def _make_notifier(*, cooldown_seconds: int = 3600) -> TelegramNotifier:
 
 @pytest.mark.asyncio
 async def test_send_research_complete_first_time() -> None:
-    """First send → message sent, includes job_id and output_path."""
+    """First send → message sent, includes job_id and the redacted template.
+
+    Slice 1C2: signature is now (job_id, cost_usd). The template uses
+    the static phrase "Report ready in Oroimen" and "Open Oroimen to
+    view it" — no filesystem path, no relative URL, no extension.
+    """
     notifier = _make_notifier()
 
     # Mock _send_telegram (the actual HTTP caller) to avoid network.
@@ -36,19 +41,23 @@ async def test_send_research_complete_first_time() -> None:
 
     ok = await notifier.send_research_complete(
         job_id="abc123def456",
-        output_path="/data/Cache/.../data/jobs/abc123def456.md",
         cost_usd=0.0420,
     )
 
     assert ok is True
     notifier._send_telegram.assert_called_once()
     text = notifier._send_telegram.call_args[0][0]
-    # Format checks (TDD §9.1)
+    # Format checks (Slice 1C2 owner-adjudicated)
     assert "abc123def456" in text
-    assert "data/jobs/abc123def456.md" in text
+    assert "Report ready in Oroimen" in text
+    assert "Open Oroimen to view it" in text
     assert "$0.0420" in text
     # Cooldown slot for this job_id was registered
     assert "research_complete:abc123def456" in notifier._last_sent
+    # Negative asserts: filesystem path, extension, relative URL are gone.
+    assert "data/" not in text
+    assert ".md" not in text
+    assert "/v1/" not in text
 
 
 @pytest.mark.asyncio
@@ -61,7 +70,6 @@ async def test_send_research_complete_cooldown() -> None:
     # First send: OK
     ok1 = await notifier.send_research_complete(
         job_id="abc123",
-        output_path="/x.md",
         cost_usd=0.01,
     )
     assert ok1 is True
@@ -69,7 +77,6 @@ async def test_send_research_complete_cooldown() -> None:
     # Second send same job_id: suppressed
     ok2 = await notifier.send_research_complete(
         job_id="abc123",
-        output_path="/x.md",
         cost_usd=0.01,
     )
     assert ok2 is False
@@ -81,7 +88,6 @@ async def test_send_research_complete_cooldown() -> None:
     notifier._send_telegram.reset_mock()
     ok3 = await notifier.send_research_complete(
         job_id="different",
-        output_path="/x.md",
         cost_usd=0.01,
     )
     assert ok3 is True
@@ -141,7 +147,6 @@ async def test_send_research_complete_disabled_notifier() -> None:
     assert not notifier._enabled
     ok = await notifier.send_research_complete(
         job_id="x",
-        output_path="/x.md",
         cost_usd=0.01,
     )
     assert ok is False

@@ -101,12 +101,21 @@ class JobSummary(BaseModel):
 
 
 class JobDetail(JobSummary):
-    """GET /v1/jobs/{id} response — extiende JobSummary con más campos."""
+    """GET /v1/jobs/{id} response — extiende JobSummary con más campos.
+
+    Slice 1C2: ``output_path`` / ``partial_output_path`` / ``checkpoint_path``
+    have been REMOVED from the public DTO. The internal DB columns stay
+    (no migration in 1C2) but the HTTP response no longer leaks filesystem
+    paths. Clients that previously called ``GET /v1/jobs/{id}`` and read
+    ``output_path`` should now call ``GET /v1/jobs/{id}/report`` and
+    interpret the HTTP status code per the Slice 1C2 contract.
+
+    NO ``report_available`` flag is added. The status field is the
+    source of truth for "is the report ready".
+    """
 
     job_type: JobType
     notify_via_tg: bool
-    output_path: str | None = None
-    partial_output_path: str | None = None
     error_taxonomy: ErrorTaxonomy | None = None
     error_message: str | None = None
     tokens_in: int
@@ -114,16 +123,20 @@ class JobDetail(JobSummary):
     notified: bool
     updated_at: str
     token_usage: list[TokenUsageEntry] = Field(default_factory=list)
-    checkpoint_path: str | None = Field(None, description="Path al .json si existe")
 
 
 class CancelResponse(BaseModel):
-    """POST /v1/jobs/{id}/cancel response."""
+    """POST /v1/jobs/{id}/cancel response.
+
+    Slice 1C2: ``partial_output_path`` REMOVED. The DB column stays (no
+    migration in 1C2) but the field was always ``None`` in the wire
+    response because every service path hardcoded it. The
+    ``graceful`` / ``status`` semantics are preserved unchanged.
+    """
 
     id: str
     status: JobStatus  # 'cancelling' o 'cancelled' si ya estaba finished
     graceful: bool  # True si partial output guardado, False si hard cancel
-    partial_output_path: str | None = None
 
 
 class TokenUsageEntry(BaseModel):

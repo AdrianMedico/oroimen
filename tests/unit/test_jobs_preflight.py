@@ -215,3 +215,89 @@ def test_setting_accepts_explicit_opt_in(monkeypatch: pytest.MonkeyPatch) -> Non
     settings = Settings(_env_file=None)
 
     assert settings.deep_research_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# Slice 1C2: report_retrieval capability gate
+# ---------------------------------------------------------------------------
+# The brief mandates the EXACT rule: ``report_retrieval`` flips to True
+# ONLY when ``LocalReportStore`` has been successfully constructed in
+# the current process. A class existing in the codebase or a configured
+# ``deep_research_data_root`` is NOT sufficient. The composition root
+# is the single authority over this flip; the preflight gate is a
+# pure consumer of the ``capabilities.report_retrieval`` field.
+#
+# These tests prove:
+# 1. Default value of ``capabilities.report_retrieval`` is False.
+# 2. Setting it to True unblocks the gate.
+# 3. Setting it to False keeps the gate blocked even when other
+#    capabilities are True (defense in depth: a partially-wired
+#    runtime cannot pass preflight by accident).
+# 4. The composition test in ``test_main.py`` proves the wiring step
+#    is the source of the flag (a class existing on disk is not
+#    sufficient; only a constructed ``LocalReportStore`` counts).
+
+
+def test_report_retrieval_default_false() -> None:
+    """``DeepResearchCapabilities()`` defaults ``report_retrieval`` to False.
+
+    The composition root MUST explicitly set it to True after a
+    successful ``LocalReportStore`` construction. A class existing in
+    the codebase or a configured ``deep_research_data_root`` is NOT
+    sufficient — see ``test_main.py::test_compose_*`` for the wiring
+    proof.
+    """
+    caps = DeepResearchCapabilities()
+    assert caps.report_retrieval is False
+
+
+def test_preflight_honors_report_reader_wired_flag() -> None:
+    """The preflight gate honors ``capabilities.report_retrieval`` exactly.
+
+    When the composition root successfully constructs a
+    ``LocalReportStore``, it MUST set ``capabilities.report_retrieval
+    = True``. The preflight gate consumes that field — the test
+    proves the gate transitions from BLOCKED to DEGRADED/READY when
+    the flag flips, and stays BLOCKED when it does not.
+    """
+    # (1) Without report_retrieval: preflight is BLOCKED (required
+    # gate fails). Construct a minimal settings + capability set.
+    base_caps = DeepResearchCapabilities(
+        service_wiring=True,
+        recovery_wiring=True,
+        search_backend_configured=True,
+        llm_provider_configured=True,
+        fetch_policy=True,
+        external_fetch=True,
+        model_output_enforced=True,
+        # report_retrieval: explicitly NOT set (defaults to False).
+    )
+    settings = SimpleNamespace(deep_research_enabled=True)
+    report_blocked = evaluate_deep_research_preflight(settings, base_caps)
+    assert report_blocked.status is PreflightStatus.BLOCKED
+    report_check = next(
+        c for c in report_blocked.checks if c.code == "dr.report.retrieval_available"
+    )
+    assert report_check.state is PreflightCheckState.FAIL
+
+    # (2) With report_retrieval=True: preflight is at least DEGRADED
+    # (the optional egress / decomposition checks are still WARN
+    # unless explicitly set). The required report_retrieval check
+    # transitions to PASS.
+    report_wired_caps = DeepResearchCapabilities(
+        service_wiring=True,
+        recovery_wiring=True,
+        search_backend_configured=True,
+        llm_provider_configured=True,
+        fetch_policy=True,
+        external_fetch=True,
+        model_output_enforced=True,
+        report_retrieval=True,  # the flag the composition root flips
+    )
+    report_ok = evaluate_deep_research_preflight(settings, report_wired_caps)
+    report_check = next(c for c in report_ok.checks if c.code == "dr.report.retrieval_available")
+    assert report_check.state is PreflightCheckState.PASS
+    # No required gate failed → status is DEGRADED (because the
+    # optional egress / decomposition checks are WARN) or READY (if
+    # those are also PASS). Either way: NOT BLOCKED.
+    assert report_ok.status in (PreflightStatus.DEGRADED, PreflightStatus.READY)

@@ -183,9 +183,13 @@ async def recover_research_jobs(
                     )
             else:
                 if hasattr(notifier, "send_research_complete"):
+                    # Slice 1C2: signature is now (job_id, cost_usd) — no
+                    # output_path. The Telegram template is the redacted
+                    # form. The output_path column is still READ from
+                    # the row (it's the skip-if-output marker) but it
+                    # is NEVER passed to the notifier.
                     await notifier.send_research_complete(
                         job_id=job_id,
-                        output_path=output_path,
                         cost_usd=cost_usd,
                     )
             await db.mark_research_job_notified(job_id)
