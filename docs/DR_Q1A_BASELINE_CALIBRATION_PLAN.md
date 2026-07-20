@@ -161,12 +161,17 @@ in this slice.
   IF the case sheet's `unacceptable_failures` list explicitly
   includes "report treats the premise as true". Otherwise the
   case is rewritten.
-- **Freshness metadata is meaningful.** Every case has
-  `evaluated_at` and `stale_after`. Volatile cases (the recent
-  factual and travel and logistics families) have a non-trivial
-  `stale_after` that the reviewer can use to flag the case at
-  run time. Non-volatile cases have `stale_after = null` or a
-  date far in the future, recorded in the case sheet.
+- **Freshness metadata is meaningful.** Every case carries
+  three freshness fields: `case.evaluated_at` (the case review
+  date), `case.stale_after` (the date the case sheet expires and
+  must be re-audited), and the case's **required evidence window**
+  (the time range over which the case's sources must be drawn).
+  Volatile cases (the recent factual and travel and logistics
+  families) have a non-trivial `stale_after` that the reviewer
+  uses to flag the case at run time. Non-volatile cases have
+  `stale_after = null` or a date far in the future, recorded in
+  the case sheet. Source recency is judged against the required
+  evidence window, NOT against `stale_after`.
 - **No unverifiable ranking.** A case that requires a single
   authoritative ranking (for example, "the top three", "the
   best", "the largest") must define the ranking basis AND a
@@ -185,9 +190,11 @@ in this slice.
   conflate freshness with quality.
 - Prefer cases that can be audited from primary sources that the
   reviewer can fetch independently.
-- Mark every volatile fact with `evaluated_at` and `stale_after`.
-  Cases whose answer changed between `evaluated_at` and the pilot
-  execution date are flagged for the reviewer.
+- Mark every volatile fact with `evaluated_at`, `stale_after`, and
+  a required evidence window. Cases whose answer changed between
+  `evaluated_at` and the pilot execution date are flagged for the
+  reviewer. Source recency is judged against the required
+  evidence window, not against `stale_after`.
 - Do not fabricate gold answers for rapidly changing cases. The
   reviewer judges the process, not a single answer.
 - Prevent the corpus from becoming a trivia benchmark by including
@@ -202,7 +209,7 @@ in this slice.
 | --- | --- | --- | --- |
 | rec-01 | Recent factual | Select three representative peer-reviewed benchmark papers on long-context LLM evaluation. Use Semantic Scholar (semanticscholar.org) as the bibliographic database, restrict to publication type "Journal" or "Conference" with publication date in calendar year 2025, and choose the three papers with the highest Semantic Scholar `citationCount` for the query "long-context LLM evaluation". If citation counts are equal, prefer the paper with the more recent publication date; if still tied, pick the one with the higher Semantic Scholar `influentialCitationCount`; document any tie-break rule applied. | stale_after=2026-12-31 |
 | rec-02 | Recent factual | As of evaluation date 2026-07-20, what is the documented state of EU AI Act enforcement actions against foundation-model providers? Use only official EU sources: the European AI Office (digital-strategy.ec.europa.eu/policies/ai-office), the Official Journal of the EU (eur-lex.europa.eu), and the European Commission's AI Act pages. Record the source URL and the published date for every enforcement claim. | stale_after=2026-12-31 |
-| rec-03 | Recent factual | Enumerate CVE-class RCE vulnerabilities disclosed in the NVD (nvd.nist.gov) and the project-specific advisories for OpenWrt (openwrt.org) and pfSense (pfsense.org) in the 12-month window [2025-07-20, 2026-07-20]. For each CVE, record: CVE id, CVSS v3.1 base score >= 7.0, affected product and version range, disclosure date, and the primary advisory URL. "RCE" means CVSS v3.1 vector contains "C" (Confidentiality), "I" (Integrity), and "A" (Availability) all High, with attack vector Network and attack complexity Low, OR an explicit "Remote Code Execution" tag in the CVE description. | stale_after=2026-12-31 |
+| rec-03 | Recent factual | Enumerate CVE-class Remote Code Execution vulnerabilities disclosed in the NVD (nvd.nist.gov) and the project-specific advisories for OpenWrt (openwrt.org) and pfSense (pfsense.org) in the 12-month window [2025-07-20, 2026-07-20]. For each CVE, record: CVE id, disclosure date, affected product and version range, the primary advisory URL, and the CVSS v3.1 base score (recorded as metadata, NOT as the RCE definition). "RCE" is defined as: the NVD description OR the project's primary security advisory explicitly identifies remote code execution, arbitrary code execution, or an equivalent code-execution condition. CVSS impact fields are recorded as metadata but do NOT define RCE. | stale_after=2026-12-31 |
 | arch-01 | Technical architecture | Compare the architectures of PostgreSQL's MVCC implementation and FoundationDB's record-layer implementation. | low |
 | arch-02 | Technical architecture | Explain how Rust's borrow checker handles async closures. Cite the relevant language reference sections. | low |
 | arch-03 | Technical architecture | How does the Linux kernel's cgroup v2 freezer interact with systemd-managed services? | low |
@@ -218,11 +225,11 @@ in this slice.
 | contra-01 | Contradictory sources | Summarize the current evidence on the effect of intermittent fasting on insulin resistance, citing primary sources that disagree. | moderate |
 | contra-02 | Contradictory sources | What does the evidence say about coffee consumption and cardiovascular risk? Surface the disagreement. | moderate |
 | contra-03 | Contradictory sources | How effective is static typing at preventing bugs in large codebases? Surface both sides. | moderate |
-| multi-01 | Multi-branch | Plan a 7-day trip to Japan from 2026-10-24 to 2026-10-30 inclusive for a vegetarian family of four (two adults, two children aged 8 and 12) on a moderate budget of approximately EUR 6,000 total excluding international flights, arriving at Tokyo Narita (NRT) and departing from Osaka Kansai (KIX). Required destinations in order: Tokyo (3 nights), Hakone (1 night), Kyoto (2 nights), Nara day-trip from Kyoto, Osaka (1 night). Compare the Japan Rail Pass (JR Pass) 7-day ordinary adult price against a calculated point-to-point Shinkansen + local train itinerary that covers Tokyo-Hakone-Kyoto-Nara-Osaka; record both totals in JPY and EUR at the exchange rate published by the European Central Bank on 2026-07-20. | low |
+| multi-01 | Multi-branch | Plan a 7-day trip to Japan from 2026-10-24 to 2026-10-30 (7 nights, departing 2026-10-31) for a vegetarian family of four (two adults, two children aged 8 and 12) on a moderate budget of approximately EUR 6,000 total excluding international flights, arriving at Tokyo Narita (NRT) on 2026-10-24 and departing from Osaka Kansai (KIX) on 2026-10-31. Required destinations in order: Tokyo (3 nights), Hakone (1 night), Kyoto (2 nights), Nara day-trip from Kyoto, Osaka (1 night). Compare the Japan Rail Pass (JR Pass) 7-day ordinary adult price against a calculated point-to-point Shinkansen + local train itinerary that covers Tokyo-Hakone-Kyoto-Nara-Osaka; record both totals in JPY and EUR at the exchange rate published by the European Central Bank on 2026-07-20. | low |
 | multi-02 | Multi-branch | Summarize the past 5 years of the Python packaging story (PEP 517, PEP 518, PEP 621, pyproject.toml, uv, hatchling). | low |
 | multi-03 | Multi-branch | Compare the data-protection regimes of Brazil (LGPD), California (CCPA/CPRA), and the EU (GDPR) for a small SaaS company. | low |
 | uncert-01 | Legitimate uncertainty | Predict the most likely 2027 standardization outcome for the W3C Web Neural Network API (WebNN). State the prediction, the probability assigned to each plausible outcome (W3C Recommendation, W3C Working Draft, deprecation, no consensus), the W3C working group status as of evaluation date 2026-07-20, and at least two independent evidence sources for the probability assignment. The expected disposition is an explicit "unknown" with reasoned scenario analysis, NOT a single point forecast. | explicit "unknown" disposition required |
-| uncert-02 | Legitimate uncertainty | Forecast the average spot price in USD of one Corsair Vengeance 32GB (2x16GB) DDR5-6000 CL30 desktop memory kit (CMK32GX5M2B6000C30) on newegg.com (US) on 2026-12-31. Use the historical price series from camelcamelcamel.com (or pcpartpicker's price history) for the trailing 365 days as the evidence window. State the forecast, the confidence interval, the model class used (e.g. random-walk, ARIMA, naive seasonal), and at least two external supply-chain signals (e.g. TrendForce DRAM contract-price reports, manufacturer guidance). The expected disposition is an explicit forecast with uncertainty band, NOT a single point prediction. | explicit "unknown" disposition required |
+| uncert-02 | Legitimate uncertainty | Forecast the US-market minimum price in USD of one Corsair Vengeance 32GB (2x16GB) DDR5-6000 CL30 desktop memory kit (CMK32GX5M2B6000C30) on 2026-12-31, as tracked by PCPartPicker's price history across the retailers PCPartPicker monitors (e.g. Amazon, Newegg, B&H, Micro Center). The historical source and the forecast target are the SAME variable: PCPartPicker's US-market minimum price series for the trailing 365 days. State the forecast, the confidence interval, the model class used (e.g. random-walk, ARIMA, naive seasonal), and at least two external supply-chain signals (e.g. TrendForce DRAM contract-price press releases, manufacturer guidance from Micron / Samsung / SK Hynix earnings transcripts). The expected disposition is an explicit forecast with uncertainty band, NOT a single point prediction. | explicit "unknown" disposition required |
 | uncert-03 | Legitimate uncertainty | A residential customer in Toronto, Ontario wants to know whether the average peak household demand on a typical weekday in January 2027 is more likely to be above or below 4.5 kW, given the 2023-2026 trend in Toronto Hydro published distribution-system data and Statistics Canada household energy-use statistics. State the prediction, the confidence band, the evidence sources, and the assumptions (e.g. electric-vehicle charging excluded, gas-heated home). The expected disposition is a reasoned scenario analysis with a stated "unknown" range, NOT a single point forecast. | explicit "unknown" disposition required |
 
 No personal data. No medical diagnosis. No personalized financial
@@ -248,10 +255,11 @@ Every case in the corpus carries the following documentary fields:
 | `critical_claims_to_inspect` | The claims the reviewer MUST verify by hand. |
 | `unacceptable_failures` | What would cause this case to score 0 (e.g. fabricated citation). |
 | `freshness_level` | `low` / `moderate` / `volatile`. |
-| `evaluated_at` | The date the case was last audited. |
-| `stale_after` | The date after which the case must be re-audited before running. |
+| `evaluated_at` | The case review date — when the case sheet was last audited. |
+| `stale_after` | The date the case sheet expires and must be re-audited before the case is run again. NOT a source-publication cutoff. |
+| `required_evidence_window` | The time range over which the case's sources must be drawn (e.g. `[2025-07-20, 2026-07-20]`). Source recency is judged against this window. |
 | `expected_difficulty` | `easy` / `moderate` / `hard` (reviewer's qualitative sense). |
-| `estimated_research_cost_class` | `low` (~$0.01-$0.05), `medium` (~$0.05-$0.20), `high` (~$0.20-$0.50). |
+| `expected_review_complexity` | Qualitative review-load signal: `low` (single reviewer, minutes) / `moderate` (single reviewer, ~1 hour) / `high` (two reviewers, hours). This is a non-monetary reviewer-load hint, NOT a cost forecast. |
 | `owner_notes` | Free text. |
 | `approval_state` | `proposed` / `owner_review_required` / `frozen` / `rejected`. |
 
@@ -262,12 +270,13 @@ to a future owner-approved pilot run, not to this slice.
 
 The summary table in §4 is a condensed view; every field above
 lives in the populated case sheet for each case, not in the
-table. In particular, `evaluated_at` and `stale_after` are
-populated per case sheet when the corpus moves from
-`approval_state = owner_review_required` to `frozen`, and the
-table inherits the relevant freshness annotations only for the
-cases that need them at review time. The selection rule that
-volatile facts must carry both `evaluated_at` and `stale_after`
+table. In particular, `evaluated_at`, `stale_after`, and
+`required_evidence_window` are populated per case sheet when
+the corpus moves from `approval_state = owner_review_required`
+to `frozen`, and the table inherits the relevant freshness
+annotations only for the cases that need them at review time.
+The selection rule that volatile facts must carry
+`evaluated_at`, `stale_after`, and `required_evidence_window`
 is enforced at case-sheet freeze time, not at table-summary
 time.
 
@@ -308,14 +317,26 @@ The pilot explicitly excludes any personal, medical, or
 personalized-financial case. No provider spending happens in this
 slice.
 
-### 6.1 Expansion gate to the remaining 16 cases
+### 6.1 Expansion gate to the remaining 16 cases (quality gate AND explicit owner authorization)
 
 The 24-case corpus is the eventual measurement; the 8-case
 pilot is a variance and rubric-validity pilot. The remaining
-16 cases (the 2 non-pilot cases per family) are NOT executed
-automatically after the 8-case pilot. They are gated by the
-following 6 conditions; ALL six must be true before any of the
-remaining 16 cases is executed.
+16 cases (the 2 non-pilot cases per family) are NOT authorized
+by the 8-case pilot. The 8-case pilot does NOT authorize the
+remaining 16 cases under any condition.
+
+Expansion requires TWO things, both of which must be true:
+
+1. The 6 quality-gate conditions below are all met. The
+   quality gate is evaluated objectively from the pilot
+   output; it is a STOP condition, not an authorization.
+2. The owner issues a SEPARATE EXPLICIT owner authorization
+   for the expansion. The owner authorization is required
+   even when all 6 quality-gate conditions are met. Without
+   the explicit owner authorization, the remaining 16 cases
+   are NOT executed, regardless of the quality-gate outcome.
+
+The 6 quality-gate conditions are:
 
 1. **Rubric usable.** Two reviewers applying the rubric
    independently to the same report agree on every graded
@@ -343,11 +364,23 @@ remaining 16 cases is executed.
    report path). A critical protocol defect halts the
    measurement and the protocol is revised.
 
-If any of the six conditions is not met, the pilot is NOT
-expanded; the 8-case result is published, the owner decides
-whether to revise the protocol, revise the corpus, expand the
-spend cap, or halt the calibration entirely. The remaining
-16 cases are NOT authorized by the 8-case pilot.
+If any of the 6 quality-gate conditions is not met, the
+remaining 16 cases are NOT executed. The 8-case result is
+published, and the owner decides whether to revise the
+protocol, revise the corpus, expand the spend cap, or halt
+the calibration entirely. The quality-gate outcome is
+informational to the owner; the owner authorization is a
+SEPARATE decision.
+
+If all 6 quality-gate conditions are met, the owner STILL
+must issue a separate explicit authorization to expand. The
+owner authorization is a fresh product decision that
+re-confirms the model, the provider, the search backend, the
+reviewer roster, the report storage, the maximum spend, and
+any other item that the owner has decided to gate (§14).
+Without that separate authorization, the remaining 16 cases
+are NOT executed, the 8-case pilot result is published, and
+the calibration is paused pending owner decision.
 
 ## 7. Repetition protocol
 
@@ -413,6 +446,59 @@ fields are recorded as raw numbers, never as classes. The
 egress sub-fields are recorded as a list of records with the
 fields above.
 
+### 8.1 Manifest field feasibility (current baseline)
+
+Every future manifest field is classified by (a) the source
+that produces it, (b) whether the current baseline
+(`b95afb4943a855eb0cc4fdd911218bbf0d6087b6`) actually exposes
+it, and (c) the allowed UNKNOWN / UNMEASURED state. A field
+marked "Currently unobservable" CANNOT be recorded at the
+current baseline without production instrumentation, which is
+NOT authorized in this PR. The pilot records UNKNOWN or
+UNMEASURED for those fields and the reviewer treats them as
+not applicable for the corresponding dimension.
+
+| Field | Source | Currently observable? | Allowed UNKNOWN / UNMEASURED state |
+| --- | --- | --- | --- |
+| `case_id` | caller | Yes | n/a |
+| `run_id` | caller | Yes | n/a |
+| `job_id` | `POST /v1/jobs` response | Yes | n/a |
+| `git_commit` | `git rev-parse HEAD` at startup | Yes | n/a |
+| `configuration_fingerprint` | hash of frozen config | Yes | n/a |
+| `model_identifier` | recorded by the LLM router at call time | Yes | n/a |
+| `provider_identifier` | recorded by the LLM router at call time | Yes | n/a |
+| `search_backend` | recorded by the search router at call time | Yes | n/a |
+| `started_at` | timestamp at submit | Yes | n/a |
+| `completed_at` | timestamp at terminal state | Yes | n/a |
+| `total_latency_s` | `completed_at - started_at` | Yes | n/a |
+| `tokens_in` | LLM call accumulator | Yes | n/a |
+| `tokens_out` | LLM call accumulator | Yes | n/a |
+| `cost_usd` | per-job cost computation | Yes | n/a |
+| `final_status` | `complete` / `failed` / `cancelled` | Yes | n/a |
+| `terminal_status` | same as `final_status` | Yes | n/a |
+| `truncation_observed` | per-call LLM truncation flag (NEW) | **No** (current baseline does not expose per-call truncation flags) | UNMEASURED for the current baseline; record as a binary once the LLM router surfaces a per-call truncation signal. |
+| `repetition_observed` | comparison of per-source and final synthesis content (NEW) | **No** (current baseline does not perform this comparison) | UNMEASURED for the current baseline. |
+| `retry_count` | retry-event counter | Yes | n/a |
+| `wasted_work_observed` | diff between fetched sources and cited sources (NEW) | **No** (current baseline does not compute this) | UNMEASURED for the current baseline. |
+| `source_urls` | list of fetched URLs | Yes | n/a |
+| `source_urls_in_fetch_order` | fetch-order list (NEW) | **No** (current baseline records the list but not the order) | UNMEASURED for the current baseline; the dimension is scored against the unsorted list only. |
+| `report_artifact_ref` | job_id | Yes | n/a |
+| `report_storage_destination` | `settings.deep_research_data_root` at startup | Yes | n/a |
+| `search_provider_egress` | per-call search records (NEW — query, response count, provider, timestamp) | **Partially** (provider and result count are recorded; per-call query text and timestamp are NOT) | UNKNOWN for the per-call query text and per-call timestamp components. |
+| `llm_provider_egress` | per-call LLM records (phase, tokens, model, timestamp) | **Partially** (phase, tokens, model are recorded; per-call timestamp is NOT) | UNKNOWN for the per-call timestamp. |
+| `notifier_egress` | per-call notifier records (notifier, function, arguments, timestamp) | **Partially** (notifier, function, and arguments are recorded; per-call timestamp is NOT) | UNKNOWN for the per-call timestamp. |
+| `retry_information` | retry event log | Yes | n/a |
+| `reviewer` | caller | Yes | n/a |
+| `rubric_version` | caller | Yes | n/a |
+
+A field marked "No" or "Partially" CANNOT be improved in this
+PR. Improving it requires production instrumentation, which is
+NOT authorized. The pilot records UNKNOWN / UNMEASURED for
+those components; the reviewer does NOT score the corresponding
+dimension at 0 just because the field is unavailable — the
+dimension is scored against whatever IS available, and the
+UNKNOWN / UNMEASURED state is recorded alongside the score.
+
 ## 9. Draft quality rubric
 
 The draft rubric has **15 dimension-level entries** below, with
@@ -447,9 +533,9 @@ issues; `0` is a regression that the reviewer must describe.
 | Factual accuracy | Graded | Consistency with the best available evidence after considering all relevant sources. | Multiple false claims. | Some correct, some unverifiable. | Mostly correct, minor inaccuracies. | All verifiable claims correct. | A claim asserted as fact is contradicted by the best available evidence. | Manual; reviewer considers all relevant sources, not only the cited ones. | "Best available evidence" includes the cited source AND any related sources the reviewer can locate. |
 | Citation support | Graded | Whether the cited source actually supports the attached claim. | Citations present but unrelated to claims. | Some citations support their claim. | Most citations support. | Every cited source supports its claim. | A claim is directly contradicted by its own citation. | Manual; reviewer reads the cited passage. | A cited source that does not address the specific claim but is in a related field scores 0 unless the report acknowledges the gap. |
 | Citation validity | Graded | The reference identity is valid (real DOI, real URL, real document). | Multiple citations have non-existent reference identity. | One or more citations have invalid identity. | Most citations have valid identity. | All citations have valid reference identity. | A citation with a fabricated reference identity (a made-up DOI, a URL that never existed). | Manual; reviewer checks DOI resolution, URL existence via archive.org if the live URL is unavailable. | An invalid identity is NOT the same as an unavailable source (see Source availability). |
-| Source availability | Graded | The source was retrievable, the content was available, and support could be evaluated. | Multiple sources were not retrievable. | One or more sources were not retrievable. | Most sources were retrievable. | All sources were retrievable. | (No veto; this is a descriptive dimension, not a quality veto.) | Recorded in the manifest. | A 200 OK from a landing page is sufficient; the specific passage need not be retrievable if the URL is real. Redirects, DOI landing pages, PDFs, bot blocks, authentication walls, and post-run availability changes do NOT automatically become fabricated citations. |
+| Source availability | Graded | The four sub-conditions of source access: (1) reference identity is valid (the URL, DOI, or document identifier exists); (2) the source is accessible at review (HTTP/HEAD returns 200 or the document is reachable); (3) the relevant content is retrievable from the source (the cited passage is reachable, not just a landing page); (4) citation support is evaluable (the reviewer can read the passage and judge whether it supports the claim). | Multiple sources fail on 2 or more sub-conditions. | One or more sources fail on 1+ sub-conditions. | Most sources pass all 4 sub-conditions. | All sources pass all 4 sub-conditions. | (No veto; this is a descriptive dimension, not a quality veto.) | Recorded in the manifest. | A landing page may prove sub-condition (1) identity without proving sub-condition (2) accessibility, (3) relevant content, or (4) support evaluability. Redirects, DOI landing pages, PDFs, bot blocks, authentication walls, and post-run availability changes do NOT automatically become fabricated citations. UNKNOWN / UNMEASURED is allowed for any sub-condition the current runtime cannot evaluate. |
 | Citation completeness | Graded | All important claims are cited. | Multiple important claims have no citation. | Some important claims cited. | Most important claims cited. | All important claims cited. | A claim listed in the case's `critical_claims_to_inspect` has no citation. | Manual; reviewer checks each claim against the citation list. | "Important" is defined by the case sheet. |
-| Recency | Graded | Sources are within the case's required evidence window. | All sources are outside the required window. | Some sources are within the window. | Most sources are within the window. | All sources are within the required window. | A case marked with a `freshness_level` other than `low` produces a report whose primary sources are all older than `case.stale_after` AND the report does not acknowledge staleness. | Manual; reviewer checks each source's publication or last-update date. | `case.stale_after` is the EXPIRATION of the case sheet; it bounds the run, not the source. Source recency is judged relative to (a) the case's `evaluated_at`, (b) the task's required evidence window, and (c) each source's own publication or last-update date. |
+| Recency | Graded | Sources are within the case's required evidence window. | All sources are outside the required window. | Some sources are within the window. | Most sources are within the window. | All sources are within the required window. | A case marked with a `freshness_level` other than `low` produces a report whose primary sources are all outside the case's required evidence window AND the report does not acknowledge the window violation. | Manual; reviewer checks each source's publication or last-update date against the case's required evidence window. | `case.evaluated_at` is the case review date. `case.stale_after` is the date the case sheet expires and must be re-audited before the case is run again. Source recency is judged relative to (a) `case.evaluated_at`, (b) the case's required evidence window, and (c) each source's own publication or last-update date. The comparison is between the source's publication date and the case's evidence window, NOT between the source's publication date and `case.stale_after`. |
 | Source authority | Graded | Sources are authoritative for the question. | Sources are low-authority for the question. | Mixed authority. | Mostly authoritative. | Sources are the canonical authority for the question. | A primary source listed in the case's `expected_primary_source_types` is missing AND no acknowledgement. | Manual; reviewer compares to `expected_primary_source_types`. | "Authoritative" is judged per-family, not globally. |
 | Evidence independence | Graded | Sources are editorially and evidentially independent. | Multiple sources are duplicates, syndication, or share the same underlying evidence. | Some duplication, some independent sources. | Mostly independent. | All sources are editorially and evidentially independent. | 3+ citations resolve to the same underlying document without acknowledgement. | Manual; reviewer checks domain, editorial ownership, and shared content. | Domain count MAY be recorded in the manifest but is not the sole criterion; multiple pages from one canonical authority (e.g. EU regulation chapters) are legitimate. |
 | Contradiction handling | Graded | Contradictions between sources are surfaced. | Contradictions silently merged or hidden. | One contradiction surfaced. | Most contradictions surfaced. | All contradictions surfaced with their sources. | A known contradiction (in the `contra-*` family) is silently merged. | Manual. | N/A for cases that have no known contradiction; reviewer marks N/A. |
@@ -470,26 +556,50 @@ sub-scores (§9.2). The 2 descriptive dimensions are recorded as
 raw numbers. The 1 N/A-for-baseline dimension (Stopping) is
 recorded as raw descriptive fields.
 
-### 9.1 Aggregation rule (deterministic per-claim to per-dimension mapping)
+### 9.1 Aggregation rule (per-dimension unit of analysis)
 
-Steps 3-10 of the §10 procedure produce per-claim binary flags
-(the claim fails dimension X at 0 / the claim does not fail).
-The 11 individual graded dimensions are scored 0-3 on a per-case
-basis using the provisional percentage bands below. The bands
-are explicitly marked for pilot calibration; the owner will
-adjust them after the pilot, not before.
+Each graded dimension is scored against a SPECIFIC unit of
+analysis. "Fraction of compliant claims" applies only where the
+unit of analysis is claim-shaped; report-level dimensions are
+scored using the qualitative anchors directly. The unit of
+analysis is a property of the dimension, not of the report.
 
-For each graded dimension, the reviewer counts the
-proportion of inspected claims (from `critical_claims_to_inspect`
-plus the reviewer's own additions) that the dimension finds
-"compliant":
+| Dimension | Unit of analysis |
+| --- | --- |
+| Factual accuracy | Verifiable factual claims. |
+| Citation support | Cited claims. |
+| Citation validity | References (URLs, DOIs, document identifiers). |
+| Source availability | Sources, each scored against the 4 sub-conditions (§9.0). |
+| Citation completeness | Critical claims (from `critical_claims_to_inspect`). |
+| Recency | Relevant sources, compared against the case's required evidence window. |
+| Source authority | Relevant sources, compared against the case's `expected_primary_source_types`. |
+| Evidence independence | Independent evidence clusters. |
+| Contradiction handling | Known contradictions (one per contradiction). |
+| Fact / inference / uncertainty separation | Important claims. |
+| Completeness | Expected subquestions. |
+| Clarity | **Whole report** — use the qualitative anchors directly; do NOT apply percentage bands. |
+| Sovereignty sub-dimensions | Egress channel records. |
+
+For all dimensions except Clarity, the reviewer counts the
+proportion of the unit-of-analysis items that the dimension
+finds "compliant", and the dimension score is the corresponding
+provisional band:
 
 | Dimension score | Provisional band (compliance fraction) | Anchor meaning |
 | --- | --- | --- |
-| 0 | < 50% of inspected claims compliant | Anchor 0. |
+| 0 | < 50% of unit items compliant | Anchor 0. |
 | 1 | 50% to < 70% | Anchor 1. |
 | 2 | 70% to < 90% | Anchor 2. |
 | 3 | >= 90% | Anchor 3. |
+
+The bands are explicitly marked for pilot calibration; the
+owner will adjust them after the pilot, not before. The bands
+are provisional. A `1` is **not** a passing score; a `3` is the
+only clean-pass score; `2` is acceptable with minor issues;
+`0` is a regression that the reviewer must describe. For
+Clarity, the reviewer applies the qualitative anchors (0/1/2/3
+described in §9.0) directly to the whole report; no fraction
+is computed.
 
 **Hard veto.** The `Unacceptable failure` column above is a HARD
 VETO that overrides the gradient: a single veto event collapses
@@ -561,10 +671,18 @@ For every report:
    the source does not support the claim (or contradicts it),
    the claim is unsupported.
 5. **Check source availability (Source availability).** The
-   reviewer records whether the source was retrievable at
-   review time, separately from the validity check. The two
-   dimensions are independent: a real URL may be temporarily
-   down, a broken URL may be valid historically.
+   reviewer records the four sub-conditions separately:
+   (a) reference identity is valid (URL / DOI / document
+   identifier exists);
+   (b) the source is accessible at review (HTTP 200 or
+   reachable);
+   (c) the relevant content is retrievable (the cited passage
+   is reachable, not just a landing page);
+   (d) citation support is evaluable (the reviewer can read
+   the passage and judge whether it supports the claim).
+   A landing page may prove (a) without proving (b), (c),
+   or (d). Each sub-condition that cannot be evaluated by
+   the current runtime is recorded as UNKNOWN / UNMEASURED.
 6. **Identify important uncited claims (Citation completeness).**
    The reviewer flags specific claims with no citation. A
    claim listed in `critical_claims_to_inspect` with no
@@ -606,13 +724,15 @@ For every report:
 
 **Aggregation rule.** The aggregation rule is defined in §9.1
 and is the single source of truth. The reviewer applies the
-provisional percentage bands in §9.1 to the per-claim flags
-from steps 3-10. The `Unacceptable failure` column is a HARD
-VETO restricted to `critical_claims_to_inspect` failures. A
-minor uncited number outside the `critical_claims_to_inspect`
-list is recorded as a score reduction but does NOT trigger a
-veto. The sovereignty/egress sub-scores are recorded separately
-and are NOT averaged into a single dimension score.
+unit-of-analysis table in §9.1 to the flags from steps 3-13
+and the qualitative anchors in §9.0 for the Clarity dimension
+(whole report, no fraction). The `Unacceptable failure`
+column is a HARD VETO restricted to `critical_claims_to_inspect`
+failures. A minor uncited number outside the
+`critical_claims_to_inspect` list is recorded as a score
+reduction but does NOT trigger a veto. The sovereignty/egress
+sub-scores are recorded separately and are NOT averaged into a
+single dimension score.
 
 **LLM assist.** An LLM MAY assist with steps 1, 2, 3 (URL
 existence only), 4 (claim-citation pairing), 5 (HTTP HEAD probe
@@ -652,14 +772,53 @@ finding from the 8-case pilot is a finding about the 8 cases
 sampled, NOT a finding about the family, the corpus, or the
 pipeline in general.
 
-| Pilot finding | Phrasing used in the pilot report | Proposed next experiment (NOT yet approved) |
+**Candidate-dominant evidence.** A failure observed in the
+pilot qualifies as candidate-dominant evidence for a future
+experiment ONLY if at least one of the following is true:
+
+- the failure appears in BOTH runs of one pilot case with
+  critical severity (i.e. the case's `unacceptable_failures`
+  or `critical_claims_to_inspect` veto fires in both run 1
+  and run 2);
+- the failure appears in at least TWO distinct pilot cases
+  (with any severity);
+- the failure triggers a case-defined hard veto on a CENTRAL
+  claim of the case (a veto on a minor uncited number does
+  not qualify as central).
+
+A single non-critical failure in one pilot case, observed in
+only one of the two runs, does NOT qualify as candidate-dominant
+evidence. Such a finding is recorded as an **isolated finding**
+and triggers one of:
+
+- revise the case sheet and re-run the case;
+- expand the measurement (one or more additional cases) and
+  re-evaluate;
+- revise the rubric and re-score the existing report;
+- accept the finding as a known limitation and document it.
+
+**The pilot does NOT select a production feature experiment on
+the strength of an isolated finding.** A production feature
+experiment is proposed ONLY if at least one failure rises to
+candidate-dominant evidence. The mapping below applies ONLY to
+candidate-dominant evidence, NOT to every observed failure.
+
+| Candidate-dominant evidence (criterion above) | Phrasing used in the pilot report | Allowed next step (the pilot may recommend at most one) |
 | --- | --- | --- |
-| Citation support / completeness failure observed in 1+ pilot cases | "Citation support / completeness failure observed in the pilot" | Claim parser and citation verifier experiment (next experiment, NOT yet approved). |
-| Multi-branch coverage failure observed in 1+ pilot cases | "Multi-branch coverage failure observed in the pilot" | Static query-decomposition experiment (NOT yet approved). |
-| Source quality / evidence-independence failure observed in 1+ pilot cases | "Source quality / evidence-independence failure observed in the pilot" | Source-policy experiment (NOT yet approved). |
-| Cost or redundant-search failure observed in 1+ pilot cases | "Cost or redundant-search failure observed in the pilot" | Stopping / depth experiment (NOT yet approved). |
-| Contradiction handling failure observed in 1+ pilot cases | "Contradiction handling failure observed in the pilot" | Contradiction experiment (NOT yet approved). |
-| No dominant failure observed across the 8 pilot cases | "No dominant failure observed in the pilot" (NOT "no dominant failure exists") | No pipeline change. The owner retains the right to commission a follow-up measurement on the remaining 16 cases before authorising a no-change posture. |
+| Citation support / completeness failure qualifies as candidate-dominant. | "Citation support / completeness failure observed as candidate-dominant in the pilot." | Claim parser and citation verifier experiment (NOT yet approved). OR further measurement. OR case/rubric revision. OR no change. |
+| Multi-branch coverage failure qualifies as candidate-dominant. | "Multi-branch coverage failure observed as candidate-dominant in the pilot." | Static query-decomposition experiment (NOT yet approved). OR further measurement. OR case/rubric revision. OR no change. |
+| Source quality / evidence-independence failure qualifies as candidate-dominant. | "Source quality / evidence-independence failure observed as candidate-dominant in the pilot." | Source-policy experiment (NOT yet approved). OR further measurement. OR case/rubric revision. OR no change. |
+| Cost or redundant-search failure qualifies as candidate-dominant. | "Cost or redundant-search failure observed as candidate-dominant in the pilot." | Stopping / depth experiment (NOT yet approved). OR further measurement. OR case/rubric revision. OR no change. |
+| Contradiction handling failure qualifies as candidate-dominant. | "Contradiction handling failure observed as candidate-dominant in the pilot." | Contradiction experiment (NOT yet approved). OR further measurement. OR case/rubric revision. OR no change. |
+| No failure qualifies as candidate-dominant. | "No candidate-dominant failure observed in the pilot" (NOT "no failure exists" and NOT "no quality issue exists"). | One of: further measurement; case/rubric revision; no change. The owner retains the right to commission a follow-up measurement on the remaining 16 cases before authorising a no-change posture. |
+
+The pilot may recommend at most ONE next step: one next
+experiment, OR further measurement, OR case/rubric revision,
+OR no change. Multiple next steps are NOT a single
+recommendation. The pilot's recommendation is the dominant
+candidate-dominant evidence's corresponding next step, OR a
+revision/measurement/no-change if no candidate-dominant
+evidence exists.
 
 Each proposed experiment is a future slice, not a current one.
 None of them is approved in this slice. None of them is implemented
@@ -686,18 +845,21 @@ the following:
 8. How the resulting reports are stored and for how long.
 9. The reviewer workflow (number of reviewers, conflict resolution).
 
-Until the owner approves all nine, the pilot does not begin, no
+Until the owner approves all ten, the pilot does not begin, no
 provider credentials are requested, and no benchmark is executed.
 
-**Expansion gate.** A separate set of six conditions (rubric
-usable, review time acceptable, cases auditable, disagreement
-manageable, cost within owner cap, no critical protocol defect)
-gates the expansion from the 8-case pilot to the remaining
-16 cases. See §6.1. The expansion gate is a quality gate, not
-an owner approval: the conditions are evaluated objectively
-from the pilot output. The owner is informed of the expansion
-or the halt, but the owner does not need to re-authorize the
-remaining 16 cases unless the conditions fail.
+10. **Expansion authorization for the remaining 16 cases.** The
+    8-case pilot does NOT authorize the remaining 16 cases.
+    Expansion requires a separate explicit owner authorization
+    after the 6 quality-gate conditions in §6.1 are met. See
+    §6.1.
+
+**Expansion gate.** The expansion from the 8-case pilot to
+the remaining 16 cases requires BOTH (a) the 6 quality-gate
+conditions in §6.1 and (b) a separate explicit owner
+authorization for the expansion. The 8-case pilot does NOT
+authorize the remaining 16 cases; the owner authorization is
+a separate fresh product decision. See §6.1.
 
 ## 14. Open owner decisions (genuine, not implementation detail)
 
