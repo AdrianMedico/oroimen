@@ -317,13 +317,20 @@ The pilot explicitly excludes any personal, medical, or
 personalized-financial case. No provider spending happens in this
 slice.
 
-### 6.1 Expansion gate to the remaining 16 cases (quality gate AND explicit owner authorization)
+### 6.1 Post-pilot expansion gate (quality conditions only — owner authorization is in §13.B)
 
 The 24-case corpus is the eventual measurement; the 8-case
 pilot is a variance and rubric-validity pilot. The remaining
-16 cases (the 2 non-pilot cases per family) are NOT authorized
-by the 8-case pilot. The 8-case pilot does NOT authorize the
-remaining 16 cases under any condition.
+16 cases (the 2 non-pilot cases per family) are NOT executed
+as part of the 8-case pilot. The 8-case pilot does NOT
+authorize the remaining 16 cases under any condition.
+
+This section defines the 6 **quality-gate** conditions that
+must be met for expansion. The separate **owner authorization**
+for expansion is defined in §13.B as the third post-pilot
+condition. Expansion requires BOTH (a) all 6 quality-gate
+conditions below AND (b) the explicit owner authorization in
+§13.B.
 
 Expansion requires TWO things, both of which must be true:
 
@@ -396,9 +403,13 @@ research job that produces a "good" report on run 1 and a "bad"
 report on run 2 (or vice versa) is a HIGH-VARIANCE finding, not a
 PASS. The rubric will record this explicitly.
 
-The 16 research jobs are NOT executed in this slice. They are
-described here as the protocol that the owner will approve in a
-later authorization.
+The 16 research jobs (8 cases × 2 independent executions) are
+NOT executed in this slice. They are described here as the
+protocol that the 8-case pilot will execute only after the owner
+approves all 9 pre-pilot gates in §13.A. The remaining 16
+corpus cases (the 2 non-pilot cases per family) are NOT part of
+the 8-case pilot and require the post-pilot expansion gate in
+§13.B.
 
 ## 8. Run manifest
 
@@ -501,14 +512,14 @@ UNKNOWN / UNMEASURED state is recorded alongside the score.
 
 ## 9. Draft quality rubric
 
-The draft rubric has **15 dimension-level entries** below, with
+The draft rubric has **16 dimension-level entries** below, with
 one of them (Sovereignty and egress auditability) scored as 5
 sub-dimensions. Each dimension-level entry uses one of three
 modes:
 
-- **Graded (0-3):** 12 dimension-level entries, with explicit
+- **Graded (0-3):** 13 dimension-level entries, with explicit
   anchors per score, an Unacceptable-failure veto, and a
-  deterministic aggregation rule (§9.1). Of these, 11 are
+  deterministic aggregation rule (§9.1). Of these, 12 are
   individual dimensions and 1 is the Sovereignty dimension whose
   score is the 5-tuple of its sub-scores.
 - **Descriptive:** 2 dimensions (Cost, Latency), recorded as raw
@@ -547,9 +558,9 @@ issues; `0` is a regression that the reviewer must describe.
 | Stopping | N/A for baseline | Whether the service stopped at a sensible point. | n/a | n/a | n/a | n/a | n/a | Recorded in the manifest as `truncation_observed`, `repetition_observed`, `retry_count`, `wasted_work_observed`. | The current single-pass pipeline does not have adaptive stopping; the 0-3 anchors for adaptive stopping are reserved for future iterations of the pipeline. |
 | Sovereignty and egress auditability (5 sub-dimensions) | Graded per sub-dimension | See §9.2. | See §9.2. | See §9.2. | See §9.2. | See §9.2. | See §9.2. | Recorded in the manifest. | If the current runtime cannot expose one of these, the score is recorded as UNKNOWN or UNMEASURED, NOT as 0. |
 
-**Total graded dimension-level entries: 12 (11 individual + 1
+**Total graded dimension-level entries: 13 (12 individual + 1
 Sovereignty dimension whose 5 sub-dimensions are scored
-separately and NOT averaged).** The 11 individual graded
+separately and NOT averaged).** The 12 individual graded
 dimensions are scored 0-3 with the anchors above. The
 Sovereignty dimension is recorded as the 5-tuple of its
 sub-scores (§9.2). The 2 descriptive dimensions are recorded as
@@ -642,8 +653,9 @@ auditability is the 5-tuple, not an average.
 
 The first pilot MUST use structured manual review. The procedure
 below is what the human reviewer follows for each of the 16
-reports. The procedure maps step-by-step to the 12 graded
-dimensions and the 5 sovereignty/egress sub-dimensions in §9.
+reports. The procedure maps step-by-step to the 12 individual
+graded dimensions and the 1 Sovereignty dimension (with 5
+sub-dimensions) in §9.
 
 For every report:
 
@@ -831,8 +843,17 @@ system. The pilot does not produce a product-readiness verdict.
 
 ## 13. Stop and quality gates
 
-The pilot MUST NOT begin until the owner explicitly approves ALL of
-the following:
+The pre-pilot and post-pilot gates are separated. Expansion
+authorization is NOT a pre-pilot gate; it is a separate post-pilot
+gate that applies only after the 8-case pilot has been executed,
+audited, and reviewed.
+
+### 13.A Pre-pilot authorization gate (9 items)
+
+The 8-case pilot may begin ONLY after the owner explicitly approves
+ALL of the following nine items. No provider credentials are
+requested and no benchmark is executed until all nine are
+approved.
 
 1. The 8 pilot cases (or a revised subset).
 2. The rubric draft (or a revised version).
@@ -845,21 +866,45 @@ the following:
 8. How the resulting reports are stored and for how long.
 9. The reviewer workflow (number of reviewers, conflict resolution).
 
-Until the owner approves all ten, the pilot does not begin, no
-provider credentials are requested, and no benchmark is executed.
+Until the owner approves all nine, the 8-case pilot does not
+begin, no provider credentials are requested, and no benchmark
+is executed.
 
-10. **Expansion authorization for the remaining 16 cases.** The
-    8-case pilot does NOT authorize the remaining 16 cases.
-    Expansion requires a separate explicit owner authorization
-    after the 6 quality-gate conditions in §6.1 are met. See
-    §6.1.
+### 13.B Post-pilot expansion gate (3 conditions)
 
-**Expansion gate.** The expansion from the 8-case pilot to
-the remaining 16 cases requires BOTH (a) the 6 quality-gate
-conditions in §6.1 and (b) a separate explicit owner
-authorization for the expansion. The 8-case pilot does NOT
-authorize the remaining 16 cases; the owner authorization is
-a separate fresh product decision. See §6.1.
+The remaining 16 cases (the 2 non-pilot cases per family) are
+NOT executed as part of the 8-case pilot. The 8-case pilot does
+NOT authorize the remaining 16 cases. Expansion requires a
+separate fresh explicit owner authorization after the 8-case
+pilot is complete AND the 6 quality-gate conditions in §6.1
+are all met.
+
+Expansion may begin ONLY when ALL of the following three
+conditions are true:
+
+1. The 8-case pilot has been completed, all 16 reports are
+   stored, and the dominant-failure analysis (§12) has been
+   produced.
+2. All 6 quality-gate conditions in §6.1 are met (rubric
+   usable, review time acceptable, cases auditable, disagreement
+   manageable, cost within owner cap, no critical protocol
+   defect).
+3. A separate fresh explicit owner authorization for the
+   expansion has been issued. The owner authorization is a
+   fresh product decision that re-confirms the model, the
+   provider, the search backend, the reviewer roster, the
+   report storage, the maximum spend, and any other item that
+   the owner has decided to gate (§14).
+
+If any of the three conditions is not met, the remaining 16
+cases are NOT executed. The 8-case result is published, and the
+owner decides whether to revise the protocol, revise the
+corpus, expand the spend cap, or halt the calibration entirely.
+
+**Expansion authorization is NOT required to start the 8-case
+pilot.** Expansion authorization is a post-pilot decision that
+is independent of the pre-pilot nine-item gate. The 8-case
+pilot does not automatically authorize expansion.
 
 ## 14. Open owner decisions (genuine, not implementation detail)
 
@@ -873,8 +918,8 @@ details; each is a real product decision the owner must make.
 2. **Pilot corpus version freeze.** Freeze `corpus-v0.1-draft` or
    request a revision. The freeze decides when new cases require
    a new corpus version.
-3. **Rubric dimensions.** Accept the 15 dimension-level entries
-   above (or the 12 graded + 2 descriptive + 1 N/A, by mode) as-is,
+3. **Rubric dimensions.** Accept the 16 dimension-level entries
+   above (or the 13 graded + 2 descriptive + 1 N/A, by mode) as-is,
    or add/remove dimensions. The Sovereignty dimension has 5
    sub-dimensions; the 5 sub-scores are not averaged. Each
    dimension-level entry is a real review load.
