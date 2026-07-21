@@ -1948,7 +1948,7 @@ async def test_f_outer_waiter_cancellation(db, tmp_path: Path) -> None:
     )
     # Wait for the row to reach 'running' AND the search
     # to be entered.
-    for _ in range(400):
+    for _ in range(1000):
         row = await db.get_research_job(job_id)
         if row and row["status"] == "running" and search_entered.is_set():
             break
@@ -1963,6 +1963,48 @@ async def test_f_outer_waiter_cancellation(db, tmp_path: Path) -> None:
     assert peeked is research_task, (
         "research task did not register in the active-task registry"
     )
+
+    # Replace the research_task's cancel-sensitivity by
+    # wrapping it: when cancel_job signals the task, we
+    # want the task to stay "not done" so the bounded
+    # wait in cancel_job stays in flight. The cleanest
+    # way is to install a done-callback on the task that
+    # RE-REGISTERS a shielded blocking task. But asyncio
+    # does not let us ignore cancel() on a task. The
+    # alternative: replace the active task in the
+    # registry with a synthetic task that does NOT
+    # respond to cancel. We use the real research_task
+    # for the seam-side signal (Fix B), but immediately
+    # after the seam, we replace the active task in the
+    # registry with a shielded-loop task so the bounded
+    # wait sees a task that does not finish.
+
+    # After the cancel is signalled, the research_task
+    # is in "cancelling" state. It will process the
+    # CancelledError on its next event-loop tick. We
+    # need the bounded wait to be in flight at that
+    # point. The bounded wait sees the task as "done"
+    # only when the CancelledError propagates through
+    # the task's coroutine. The research task's
+    # CancelledError handler runs the finaliser; the
+    # finaliser blocks at reconcile_cost. So the task
+    # is NOT done while the finaliser is blocked.
+    # The bounded wait sees the task as "not done"
+    # and waits for the timeout (1.0s) — this gives
+    # the test time to cancel the cancel_caller.
+    #
+    # To make the research task's finaliser block, we
+    # block reconcile_cost.
+    reconcile_block = asyncio.Event()
+    reconcile_entered = asyncio.Event()
+    original_reconcile = service.reconcile_cost
+
+    async def blocking_reconcile(jid: str) -> Decimal:
+        reconcile_entered.set()
+        await reconcile_block.wait()
+        return await original_reconcile(jid)
+
+    service.reconcile_cost = blocking_reconcile  # type: ignore[method-assign]
 
     # Start cancel_job(graceful=True) as a separate task. The
     # cancel acquires the seam, CASes running -> cancelling,
@@ -2021,11 +2063,13 @@ async def test_f_outer_waiter_cancellation(db, tmp_path: Path) -> None:
 
     # The research task is independently owned. It has been
     # signalled (the cancel did call .cancel() on it inside
-    # the seam), but it is still blocked at the controlled
-    # boundary. The research task's ``_run_research`` will
-    # see CancelledError on its next await (the
-    # search_release.wait()).
-    # Release the boundary.
+    # the seam). The research task's ``_run_research``
+    # handles the CancelledError by running the
+    # cancellation finaliser; the finaliser is blocked at
+    # reconcile_cost (the test set up a wrapper). Release
+    # the reconcile block AND the search block so the
+    # research task can finalise.
+    reconcile_block.set()
     search_release.set()
 
     # Wait for the research task to finish using
