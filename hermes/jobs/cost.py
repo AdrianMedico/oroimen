@@ -8,6 +8,24 @@ Punto único de decisión:
   lexicografica SQLite: `.12` < `.120` falla en comparación TEXT).
 - calculate_cost(): Decimal con 4 decimales, quantize ROUND_HALF_UP.
 - PRICING_TABLE: input/output USD per 1M tokens por modelo.
+
+Cost-truth semantics (DR-Q1A-PRE1A):
+
+    cost_usd exposed by the API, the notifier, and the report is an
+    **estimated pay-as-you-go-equivalent amount** (see PRICING_BASIS).
+
+    It is NOT:
+      - actual provider billing (the operator may use a subscription
+        or quota-backed plan, in which case the operator's invoice
+        is governed by the plan, not by this estimate);
+      - actual marginal spend on a pay-as-you-go account;
+      - remaining subscription balance or quota consumption;
+      - invoice truth.
+
+    The estimate is computed from the public per-million-token rates
+    listed in PRICING_TABLE and the recorded token_usage rows. Token
+    counts remain the primary provider-independent resource telemetry
+    and are the only client-observable quantity.
 """
 
 from __future__ import annotations
@@ -16,12 +34,40 @@ from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 
 # Pricing en USD por 1M tokens (input, output).
-# Fuente: architecture v1.1 §2.8, TBD empíricamente S14 D2-3 measurement run.
-# Sprint 14 inicia con valores estimados; se ajustan tras measurement run.
+#
+# Source: official MiniMax Pay-as-you-go pricing page, retrieved
+# 2026-07-21 from https://platform.minimax.io/docs/guides/pricing-paygo
+# (verified 2026-07-21, see PRICING_AS_OF).
+#
+# The rates below are the official **standard** tier, "Permanent 50% off"
+# promotional pricing, <=512k input tokens tier for MiniMax-M3.
+#
+# Note: the M3 standard tier at >512k input tokens has different
+# rates (input $0.60/M, output $2.40/M, cache read $0.12/M per the
+# official page); the current pilot corpus targets the <=512k tier
+# and the PRICING_TABLE reflects that. A future slice may add a
+# per-tier dispatch; this slice does NOT change call-site behavior.
+#
+# PRICING_BASIS = "official_paygo_equivalent" makes the cost_usd
+# semantics explicit: an estimate of what the run WOULD HAVE cost at
+# the official standard pay-as-you-go rates, NOT actual billing.
+PRICING_BASIS: str = "official_paygo_equivalent"
+PRICING_AS_OF: str = "2026-07-21"
+PRICING_SOURCE: str = "https://platform.minimax.io/docs/guides/pricing-paygo"
+
 PRICING_TABLE: dict[str, tuple[Decimal, Decimal]] = {
-    "MiniMax-M3": (Decimal("0.30"), Decimal("0.60")),
-    "MiniMax-M2.7-highspeed": (Decimal("0.10"), Decimal("0.20")),  # estimado
-    "deepseek-v3": (Decimal("0.05"), Decimal("0.10")),  # estimado, budget mode
+    # MiniMax-M3 (standard, <=512k input, "Permanent 50% off" promo):
+    #   input  $0.30 / M tokens
+    #   output $1.20 / M tokens
+    "MiniMax-M3": (Decimal("0.30"), Decimal("1.20")),
+    # MiniMax-M2.7-highspeed (standard, no cache-write in this row; the
+    # current cost calculation does not consume cache_write):
+    #   input  $0.60 / M tokens
+    #   output $2.40 / M tokens
+    "MiniMax-M2.7-highspeed": (Decimal("0.60"), Decimal("2.40")),
+    # Deepseek-v3: preserved from prior estimate. This slice does not
+    # verify or change the rate. See _DR_Q1A_PRE1A_SCOPE.
+    "deepseek-v3": (Decimal("0.05"), Decimal("0.10")),  # estimado, budget mode, sin verificar en PRE1A
 }
 
 
@@ -71,6 +117,16 @@ def calculate_cost(model: str, tokens_in: int, tokens_out: int) -> Decimal:
 
     Pricing por 1M tokens (input, output) según PRICING_TABLE.
 
+    IMPORTANT (DR-Q1A-PRE1A cost truth):
+
+        The returned Decimal is an **estimated pay-as-you-go-equivalent
+        amount** at the official standard rates listed in
+        ``PRICING_TABLE`` (see ``PRICING_BASIS`` and ``PRICING_AS_OF``).
+        It is NOT actual provider billing and is NOT necessarily the
+        amount that will appear on the operator's invoice. Operators
+        using a subscription or quota-backed plan should treat this
+        value as a relative cost proxy, not as a spend figure.
+
     Args:
         model: nombre del modelo (debe estar en PRICING_TABLE).
         tokens_in: tokens de input del LLM call.
@@ -106,6 +162,12 @@ def estimate_research_cost(
     fallback_model: str = "deepseek-v3",
 ) -> Decimal:
     """Heurística conservadora para pre-submit cost estimation.
+
+    Returns an **estimated pay-as-you-go-equivalent amount** (see
+    ``PRICING_BASIS`` and ``PRICING_AS_OF`` at module level). It is NOT
+    actual provider billing; it is the pre-submit estimate used by the
+    daily budget admission control and surfaced in the submit response
+    and the notifier call as ``estimated_cost_usd``.
 
     Asume:
     - Per-source synth: ``per_source_max_tokens`` x output_rate del modelo primario.

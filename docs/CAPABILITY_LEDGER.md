@@ -1,12 +1,14 @@
 # Public capability ledger
 
 This ledger describes the public repository at commit
-`b95afb4943a855eb0cc4fdd911218bbf0d6087b6` (merge of Slice 1C3
-deterministic vertical E2E). It separates code presence from runtime
-availability, runtime availability from deterministic integration, and
-deterministic integration from live-provider behavior and from
-research-quality measurement. A module is not considered a supported
-feature merely because its implementation and component tests exist.
+`0e29dd6f38372ed24e060e1649d8f8456c49adbc` (post-PR #8; the most
+recent merged slice is Slice 1C3 deterministic vertical E2E, and
+the current baseline reflects the DR-Q1A protocol merge). It
+separates code presence from runtime availability, runtime
+availability from deterministic integration, and deterministic
+integration from live-provider behavior and from research-quality
+measurement. A module is not considered a supported feature merely
+because its implementation and component tests exist.
 
 ## Status vocabulary
 
@@ -84,7 +86,7 @@ post-1C3 vocabulary separates them.
 6. **Product support is documented.** Public README, ADRs, and
    evaluator paths describe this slice as a supported product path.
 
-The current Oroimen state at `b95afb4` is summarized below using
+The current Oroimen state at `0e29dd6f` is summarized below using
 the same six named states above. Numeric level numbers are not
 used; the named state itself is the only label.
 
@@ -141,6 +143,7 @@ conflate them.
 | Deep Research model-output limits | `hermes/jobs/service.py` (per-source and final synthesis pass `max_tokens` to `llm.chat`); `hermes/jobs/cost.py`; `tests/integration/test_jobs_service_phases.py`; `tests/integration/test_jobs_cost_drift.py` | Implemented, runtime available behind opt-in; phase 3 (per-source) calls `llm.chat(..., max_tokens=settings.deep_research_per_source_max_tokens)` and phase 4 (final synthesis) calls `llm.chat(..., max_tokens=settings.deep_research_output_max_tokens)`; the composition root sets `model_output_enforced=True` only after this wiring is in place | Retain and regression-test | The two settings must reach both LLM call sites; cost drift between checkpoint, token-usage sum, and DB aggregate is reconciled via `reconcile_cost` | Per-source `max_tokens` matches `settings.deep_research_per_source_max_tokens`; final `max_tokens` matches `settings.deep_research_output_max_tokens` | P0 |
 | Daily budget admission control | `hermes/jobs/service.py`; `hermes/config.py`; `tests/integration/test_jobs_cost_drift.py` | Implemented, runtime available behind opt-in; pre-check on submit + atomic TOCTOU check inside the running transaction | Retain and regression-test | The daily cap is checked before enqueue and re-checked at job start (atomic) to prevent TOCTOU | A job submitted and run after the cap is reached transitions to `failed` with `error_taxonomy="budget_exceeded"`; it is NOT silently enqueued | P0 |
 | Per-job monetary budget enforcement | `hermes/jobs/service.py` (per-job `cost` recorded via `_record_token_usage` + `reconcile_cost`); `hermes/jobs/cost.py` | Implemented, runtime available behind opt-in; soft warning only (the service records the per-job cost and emits a log warning when the soft budget is exceeded, but does NOT cancel the job mid-flight) | Retain as soft warning; a hard per-job cancellation boundary is NOT yet implemented | The service records the per-job cost and surfaces it through the notifier and the report; it does NOT cancel the job mid-flight when the per-job budget is exceeded | The per-job cost is exposed in `JobDetail.cost_usd` and in the notifier call; the per-job budget is documented as a soft warning, not a hard cancellation | P0 |
+| Cost truth and runtime documentation (DR-Q1A-PRE1A) | `hermes/jobs/cost.py` (`PRICING_TABLE`, `PRICING_BASIS`, `PRICING_AS_OF`, `PRICING_SOURCE`); `hermes/jobs/service.py` (`cancel_job`, `_run_phase_with_retry` docstrings); `tests/unit/test_jobs_cost.py`; `tests/unit/test_jobs_cost_truth.py`; `tests/unit/test_jobs_lifecycle_docstring.py` | Implemented, runtime available; the cost truth is enforced at the source-of-truth module (`hermes.jobs.cost`) and propagated through every call site of `calculate_cost` and `estimate_research_cost`; the cancel and retry documentation is corrected to match the actual current behavior | Retain and regression-test | Cost_usd is an **estimated pay-as-you-go-equivalent amount** at the official standard rates, NOT actual provider billing. Operators using a subscription or quota-backed plan must treat `cost_usd` as a relative cost proxy, not as a spend figure. The `PRICING_TABLE` reflects the official standard tier, "Permanent 50% off" promotional pricing, `<=512k` input tokens tier (verified 2026-07-21 from `https://platform.minimax.io/docs/guides/pricing-paygo`); the `>512k` tier is a future-slice dispatch concern. The `cancel_job` and `_run_phase_with_retry` docstrings are now accurate to the current behavior; no implementation changed in this slice | All call sites of `calculate_cost` and `estimate_research_cost` use the verified rates; `PRICING_BASIS == "official_paygo_equivalent"`; `PRICING_AS_OF == "2026-07-21"`; `cancel_job` documentation describes DB-only behavior and the absence of in-flight task or provider-request cancellation; `_run_phase_with_retry` documentation describes 3 total attempts with effective waits [1, 4] and the residue value 16 in `_RETRY_BACKOFF_SCHEDULE` that is not consumed by the current loop | P0 |
 | Deep Research report persistence | `hermes/jobs/service.py` (`_phase_write` uses `tmp + flush + os.fsync + os.replace`); `hermes/jobs/models.py` (DTOs without `output_path` / `partial_output_path` / `checkpoint_path` / `report_available`); `hermes/jobs/report_paths.py`; `hermes/jobs/report_store.py`; `hermes/receivers/jobs_api.py` (route); `tests/integration/test_jobs_api.py`; `tests/unit/test_report_paths.py`; `tests/unit/test_report_store.py`; `tests/e2e/test_deep_research_vertical.py` | Implemented, runtime available behind opt-in (Slice 1C2 + 1C3): owner-scoped `GET /v1/jobs/{job_id}/report` returns the final Markdown through the real `LocalReportStore`; the public DTOs no longer carry filesystem paths; the notifier template no longer embeds a path; the deterministic vertical golden journey proves the full owner-scoped flow through real HTTP | Retain and regression-test | A failed report-store construction is fail-closed (the singleton is not published and the route returns 500 `report_unavailable` or 503 `service_unavailable` defensively); the read path uses `report_store.derive_path(job_id)` and never reads from the DB `output_path` column; the writer and the reader share the same resolved absolute Path through `service._data_root = report_store.root` (round 2 wiring) | The owner retrieves report content by job ID with a constant `text/markdown; charset=utf-8` body, the documented headers, and a deterministic body shape; missing and foreign-owned jobs return byte-identical 404 `job_not_found`; complete status with a missing/oversize/invalid-UTF-8 file returns 500 `report_unavailable` with no internal details leaked | P0 |
 | Deep Research report settings: `deep_research_data_root` and `deep_research_max_report_bytes` | `hermes/config.py`; `hermes/jobs/report_store.py`; `hermes/jobs/preflight.py`; `hermes/jobs/service.py` (writer uses canonical store root); `hermes/__main__.py` (composition root) | Implemented, runtime available behind opt-in (Slice 1C2): the report-store root is resolved at startup and the max-bytes cap is enforced inside the bounded read of the single opened handle (round 2); the composition root resolves `data_root` and the service uses `report_store.root` as `service._data_root` (round 2) | Retain and regression-test | The two settings must reach both the composition root and the read path; the max-bytes floor (10 KiB) and ceiling (50 MiB) are validated at construction | An oversize report is rejected with 500 `report_unavailable` (logs may tag `report_size_limit_exceeded`); a missing or non-creatable data root fails closed at startup; the writer and the reader share the same canonical Path | P0 |
 | Deterministic Deep Research vertical E2E | `tests/e2e/test_deep_research_vertical.py` (NEW, 1 file, 831 lines, merged in Slice 1C3) | Implemented, runtime available, quality unmeasured | Retain and regression-test; a frozen benchmark execution is a separate future slice (see `docs/DR_Q1A_BASELINE_CALIBRATION_PLAN.md`) | The golden journey drives the full 9-step product path through authenticated HTTP: preflight, create, real 5-phase pipeline, atomic write, owner-scoped detail, owner-scoped report, notifier privacy, owner isolation, and lifecycle cleanup. Only the external seams (search, fetch, LLM, notifier, scheduler trigger) are faked; everything else is real | The 4 tests pass on every run, in 3 consecutive runs, and in 3 in-process cycles; the test carries `@pytest.mark.e2e` and no `slow` / `network` markers; the LLM mock uses a modulo-wrap `side_effect` counter for determinism | P0 |
@@ -189,7 +192,7 @@ conflate them.
     of a benchmark as evidence of zero defects. Calibration is
     the next step, not a claim.
 
-## Current deterministic proof (Slice 1C3, merged at b95afb4)
+## Current deterministic proof (Slice 1C3, merged at b95afb4; current ledger at 0e29dd6f)
 
 The deterministic Deep Research vertical journey exercises the
 production code path through authenticated HTTP, in the same process
@@ -312,7 +315,7 @@ status language; the Slice 0 numbers above are preserved only as a
 historical reference for the unit and component baselines that
 underpin the current slice work.
 
-## Approved shortlist (status as of b95afb4)
+## Approved shortlist (status as of 0e29dd6f)
 
 Slice 1 has produced a deterministic vertical for the deep-research
 report-retrieval path. The next authorized step is calibration, not
