@@ -366,8 +366,11 @@ class DeepResearchService:
         Used by the cancel endpoint to obtain the exact task to
         ``.cancel()`` so the cancellation can propagate. The
         registry may legitimately be empty (the task has already
-        finished), in which case the cancel endpoint treats the
-        job as already-finalized and falls back to the DB state.
+        finished). When the registry is empty, the cancel
+        endpoint takes the synchronous-finalize path: the row
+        is in ``cancelling`` (the in-seam CAS just committed
+        it), and the code finalises the row to ``cancelled``
+        without re-reading the DB. There is no DB-read fallback.
         """
         return self._active_tasks.get(job_id)
 
