@@ -3336,6 +3336,56 @@ class Database:
         await self.conn.commit()
         return cur.rowcount > 0
 
+    async def complete_research_job_with_output_path(
+        self,
+        job_id: str,
+        output_path: str,
+        completed_at: str,
+        updated_at: str,
+    ) -> bool:
+        """Atomic CAS: complete + output_path + progress=100 + completed_at.
+
+        DR-Q1A-PRE1B overnight remediation (Fix D). A single
+        ``UPDATE`` statement commits the row to ``complete`` AND
+        the ``output_path`` column AND ``progress_percent = 100``
+        AND ``completed_at`` AND ``updated_at`` together. The
+        predicate is ``status = 'running'``: if a cancellation has
+        already flipped the row to ``cancelling`` (or any other
+        state), the CAS does not match and returns ``False``.
+
+        This removes the previous separate unconditional
+        ``output_path`` write which created a window where a
+        ``complete`` row could exist without a readable
+        ``output_path`` (or vice versa) if a cancellation won the
+        race between the two writes.
+
+        Invariants preserved:
+
+          - no complete row without a readable final report (the
+            caller publishes ``.md`` to ``output_path`` BEFORE this
+            CAS, atomically via ``os.replace``);
+          - output_path and complete status commit together (a
+            single UPDATE);
+          - no completion notifier before successful commit (the
+            caller checks the return value of this CAS and only
+            emits the notifier when it is ``True``);
+          - no network/notifier await while holding the
+            terminal-state lock (the caller releases the seam
+            before invoking the notifier).
+        """
+        cur = await self.conn.execute(
+            "UPDATE research_jobs SET "
+            "status = 'complete', "
+            "output_path = ?, "
+            "completed_at = ?, "
+            "updated_at = ?, "
+            "progress_percent = 100 "
+            "WHERE id = ? AND status = 'running'",
+            (output_path, completed_at, updated_at, job_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
     async def get_today_research_cost(self, user_id: int = 0) -> float:
         """Suma cost_usd de jobs creados hoy (UTC) para un user.
 
