@@ -205,10 +205,29 @@ def estimate_research_cost(
 
     Returns an **estimated pay-as-you-go-equivalent amount** (see
     ``PRICING_BASIS`` and ``PRICING_AS_OF`` at module level). It is NOT
-    actual provider billing; it is the pre-submit estimate used by the
-    daily budget admission control and surfaced in the submit response
-    (``JobResponse.estimated_cost_usd``) and the notifier call. It
-    is NOT embedded in the final Markdown report.
+    actual provider billing. It is the pre-submit estimate used by:
+
+    1. The daily budget admission control (pre-submit check against
+       ``daily_cap_usd`` in the submit path).
+    2. The submit response field ``JobResponse.estimated_cost_usd``
+       (returned to the API caller at submit time, so the caller
+       can see the projected cost before the job runs).
+
+    The pre-submit estimate is **NOT** sent to the completion
+    notifier. The completion notifier (``send_research_complete``)
+    receives the **reconciled recorded job cost** as the
+    ``cost_usd`` argument — that value is read from the database
+    by ``_db.get_research_job_cost(job_id)`` after
+    ``reconcile_cost`` has run, and it reflects the
+    ``TokenUsageEntry.cost_usd`` aggregate (the recorded
+    token-usage sum), NOT the pre-submit estimate produced
+    here. The pre-submit estimate and the reconciled recorded
+    cost may differ — the notifier sees the latter.
+
+    The pre-submit estimate is NOT embedded in the final Markdown
+    report either (the report body is the LLM-generated content
+    only; ``cost_usd`` is exposed through DTOs and metrics, not
+    through the report).
 
     The 30% ``_ESTIMATION_SAFETY_MARGIN_PCT`` padding is an uncalibrated
     pre-submit heuristic, NOT a measured or proven-conservative bound.
@@ -226,8 +245,11 @@ def estimate_research_cost(
 
     Si ``primary_model`` no está en ``pricing_table``, cae a ``fallback_model``
     (deepseek-v3) en lugar de fallar. Esto evita que un typo en settings
-    rompa el submit; el notifier recibirá la estimación del modelo fallback,
-    subóptima pero bounded.
+    rompa el submit. El daily budget admission control y el
+    ``JobResponse.estimated_cost_usd`` verán la estimación del modelo
+    fallback (subóptima pero bounded); el notifier de completion
+    recibirá, como siempre, el cost registrado reconciliado (no la
+    estimación pre-submit).
 
     Args:
         max_sources: número de URLs a scrapear (settings.deep_research_max_sources).
