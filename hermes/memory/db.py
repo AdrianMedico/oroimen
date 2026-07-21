@@ -3177,6 +3177,61 @@ class Database:
             row = await cur.fetchone()
         return float(row[0]) if row else 0.0
 
+    async def set_research_job_cost_monotonic(
+        self, job_id: str, reconciled_cost: float
+    ) -> float:
+        """Atomic monotonic upsert: research_jobs.cost_usd = max(existing, reconciled_cost).
+
+        DR-Q1A-PRE1A cost-reconciliation fix. Used by
+        ``DeepResearchService.reconcile_cost`` to persist the
+        reconciled maximum so that subsequent reads of
+        ``research_jobs.cost_usd`` (e.g. from
+        ``_phase_write``/``_db.get_research_job_cost``) and
+        the completion notifier all see the same value.
+
+        Semantics:
+            research_jobs.cost_usd = max(research_jobs.cost_usd, reconciled_cost)
+            updated_at = now
+
+        The aggregate is never decreased. If the row does not
+        exist for ``job_id`` (orphan call), this is a no-op and
+        returns ``reconciled_cost`` unchanged (caller is
+        expected to verify job existence; this method does
+        not raise to keep reconcile_cost idempotent and
+        non-throwing across retries).
+
+        Returns the post-update aggregate value (the actual
+        persisted ``cost_usd``), read back from the same
+        transaction. This is the value subsequent reads
+        will observe and the value the notifier should send.
+
+        The UPDATE + SELECT are in the same ``aiosqlite``
+        connection but aiosqlite serialises statements per
+        connection inside ``await`` boundaries; combined with
+        SQLite's per-database write lock, this is monotonic
+        within the service's event loop. Cross-process
+        monotonicity is not required (single-writer service
+        per the architecture). The SQL itself uses
+        ``MAX(cost_usd, ?)`` so the write is atomic at the
+        SQLite engine level.
+        """
+        await self.conn.execute(
+            "UPDATE research_jobs SET "
+            "cost_usd = MAX(cost_usd, ?), "
+            "updated_at = ? "
+            "WHERE id = ?",
+            (reconciled_cost, self._now_str(), job_id),
+        )
+        await self.conn.commit()
+        # Read back the post-update value. The UPDATE above is
+        # committed, so a subsequent SELECT observes the
+        # updated value.
+        async with self.conn.execute(
+            "SELECT cost_usd FROM research_jobs WHERE id = ?", (job_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return float(row[0]) if row else float(reconciled_cost)
+
     async def get_today_research_cost(self, user_id: int = 0) -> float:
         """Suma cost_usd de jobs creados hoy (UTC) para un user. Cancelled excluded.
 

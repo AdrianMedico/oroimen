@@ -125,7 +125,7 @@ class _FakeService:
                 pricing_table={
                     "MiniMax-M3": (
                         __import__("decimal").Decimal("0.30"),
-                        __import__("decimal").Decimal("0.60"),
+                        __import__("decimal").Decimal("1.20"),
                     ),
                 },
                 primary_model="MiniMax-M3",

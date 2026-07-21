@@ -572,12 +572,44 @@ class DeepResearchService:
         ]
 
     async def cancel_job(self, job_id: str, graceful: bool = True) -> CancelResponse:
-        """Marca cancelling/cancelled.
+        """Marca el job como cancelling / cancelled en persistencia.
 
-        Si graceful, await current phase finish (max 10s). Si no, hard cancel.
+        Comportamiento actual (DR-Q1A-PRE1A, no implementado en este slice):
+          - ``graceful=True`` (default): marca el job como
+            ``cancelling`` en la base de datos y retorna
+            ``CancelResponse(status=CANCELLING, graceful=True)``
+            INMEDIATAMENTE. NO espera a la fase actual. NO prueba la
+            cancelación de la tarea asyncio en curso. NO prueba la
+            cancelación de un request al proveedor en vuelo. La
+            próxima vez que ``_run_research`` poll-ee el estado,
+            verá ``cancelling`` y marcará ``cancelled``.
+          - ``graceful=False``: marca el job como ``cancelled`` en la
+            base de datos y retorna
+            ``CancelResponse(status=CANCELLED, graceful=False)``
+            INMEDIATAMENTE. NO cancela la tarea asyncio en curso. NO
+            cancela un request al proveedor en vuelo.
+
+        Consecuencias:
+          - La cancelación es BEST-EFFORT desde la perspectiva del
+            proceso. La tarea puede seguir ejecutándose hasta que
+            complete la fase actual o termine por sí misma.
+          - La cancelación NO es una frontera monetaria dura. Un
+            provider que ya haya recibido un request puede haber
+            facturado tokens aunque el cliente no haya visto la
+            respuesta.
+          - Un job de Deep Research con un provider de pago no
+            puede usar ``cancel_job`` como sustituto de un hard cap.
+
+        Esta función NO cambia su comportamiento en este slice.
+        El docstring anterior ("await current phase finish, max 10s")
+        era incorrecto: el código actual NO espera, NO garantiza la
+        terminación del request al proveedor, y NO tiene un timeout
+        de 10 segundos. El cambio es de documentación únicamente.
+
         Raises:
-            JobNotFoundError: si id no existe.
-            JobAlreadyTerminalError: si ya está en complete/failed/cancelled.
+            JobNotFoundError: si el id no existe.
+            JobAlreadyTerminalError: si el job ya está en
+                ``complete``, ``failed`` o ``cancelled``.
         """
         job_row = await self._db.get_research_job(job_id)
         if job_row is None:
@@ -1219,10 +1251,23 @@ class DeepResearchService:
 
         # Reconciliación (TDD §6.8): max(checkpoint, db_sum, aggregate).
         # Si divergen, usa el más alto (asume infra sub-reporta).
-        await self.reconcile_cost(job_id)
+        # DR-Q1A-PRE1A cost-reconciliation fix: ``reconcile_cost``
+        # now persists the reconciled maximum back to
+        # ``research_jobs.cost_usd`` (atomic
+        # ``MAX(cost_usd, reconciled)`` write) and returns the
+        # post-update value. We MUST use that returned value
+        # here (not a fresh ``get_research_job_cost`` read) so
+        # the notifier below and ``JobDetail.cost_usd`` after
+        # completion both expose the same persisted reconciled
+        # value. The previous flow discarded the returned
+        # value and re-read the aggregate, which could return
+        # a stale value if the checkpoint or token-usage sum
+        # legitimately exceeded the pre-reconciliation
+        # aggregate (e.g. after a token-usage DB write
+        # failure that the checkpoint survived).
+        cost = await self.reconcile_cost(job_id)
 
         # DB update
-        cost = await self._db.get_research_job_cost(job_id)
         await self._db.update_research_job_status(
             job_id,
             "complete",
@@ -1280,10 +1325,30 @@ class DeepResearchService:
         phase_name: PhaseName,
         phase_fn,
     ) -> Any:
-        """Wrapper: ejecuta phase_fn con retry exp backoff (1s, 4s, 16s), max 3 attempts.
+        """Wrapper: ejecuta phase_fn con retry de 3 intentos totales.
 
-        Backoff: 1s, 4s, 16s. Si el job total excede ~30min, recovery hook lo detecta
-        y re-enqueua (con checkpoint de última phase exitosa).
+        Comportamiento actual (DR-Q1A-PRE1A, sin cambios de comportamiento):
+          - Máximo de 3 intentos totales para errores retryables
+            (``RETRYABLE_ERRORS``: search_5xx, llm_5xx, timeout, network).
+          - Backoff efectivo: 1 segundo después del primer fallo,
+            4 segundos después del segundo fallo.
+          - El tercer fallo TERMINA la fase (no se reintenta);
+            el ``PhaseError`` se relanza.
+          - El valor 16 en ``_RETRY_BACKOFF_SCHEDULE = (1, 4, 16)``
+            EXISTE en la tupla pero NO se consume en el bucle actual
+            (el bucle itera ``for attempt in range(3)`` y solo lee
+            ``_RETRY_BACKOFF_SCHEDULE[attempt]`` cuando
+            ``attempt < 2``). El valor 16 es un residuo histórico y
+            no afecta el comportamiento observable.
+
+        El docstring anterior ("exp backoff 1s, 4s, 16s, max 3
+        attempts") era incorrecto: las esperas efectivas son 1 y 4
+        segundos, no 1, 4 y 16. El cambio es de documentación
+        únicamente.
+
+        Si el job total excede ~30 minutos, el recovery hook lo
+        detecta y re-enqueua (con el checkpoint de la última fase
+        exitosa).
         """
         last_error: PhaseError | None = None
         for attempt in range(3):
@@ -1477,6 +1542,24 @@ class DeepResearchService:
         tras cada LLM call. La DB write puede perderse por busy_timeout,
         async cancel, container kill. El checkpoint no (write atómico a
         tmp + rename).
+
+        DR-Q1A-PRE1A cost-reconciliation fix: this method now
+        also PERSISTS the reconciled maximum back to
+        ``research_jobs.cost_usd`` via
+        ``_db.set_research_job_cost_monotonic`` (atomic
+        ``MAX(cost_usd, reconciled)`` write) so that
+        subsequent reads of the aggregate (e.g. from
+        ``_phase_write`` or the completion notifier) observe
+        the same reconciled value. Previously, the
+        reconciliation was computed but not persisted, and
+        the subsequent ``get_research_job_cost`` read could
+        return a stale aggregate when the checkpoint or the
+        token-usage sum legitimately exceeded it.
+
+        The method is idempotent: re-running it with the
+        same three sources returns the same persisted
+        value (the aggregate is monotonically non-decreasing,
+        so a second run cannot lower the first run's result).
         """
         # Source 1: checkpoint file
         ckpt_cost = await self._read_checkpoint_cost(job_id)
@@ -1515,7 +1598,18 @@ class DeepResearchService:
                     "aggregate_usd": float(agg_dec),
                 },
             )
-        return reconciled
+
+        # Persist the reconciled maximum back to the aggregate.
+        # The DB op is atomic MAX(cost_usd, reconciled) so this
+        # is monotonic and idempotent: a second call cannot
+        # lower the value set by the first. The method returns
+        # the post-update aggregate value, which is the value
+        # the completion notifier and ``JobDetail.cost_usd``
+        # should expose.
+        persisted = await self._db.set_research_job_cost_monotonic(
+            job_id, float(reconciled)
+        )
+        return Decimal(str(persisted))
 
     async def _read_checkpoint_cost(self, job_id: str) -> Decimal:
         """Lee cost_accumulated_usd del checkpoint.json. 0 si no existe."""

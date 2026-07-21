@@ -291,14 +291,22 @@ async def cancel_job(
     graceful: bool = Query(
         True,
         description=(
-            "Si True (default), cancela tras finalizar la phase actual. "
-            "Si False, hard cancel inmediato."
+            "``True`` (default): marks persistence as ``cancelling`` and "
+            "returns immediately. ``False``: moves persistence directly to "
+            "``cancelled`` and returns immediately. Neither option proves "
+            "cancellation of the running asyncio task or any in-flight "
+            "provider request; neither option waits for the current phase "
+            "to finish."
         ),
     ),
 ) -> CancelResponse:
     """POST /v1/jobs/{job_id}/cancel — cancela un job.
 
-    200 con CancelResponse (graceful, partial_output_path si existía).
+    200 con CancelResponse describiendo la transición de persistencia que
+    se aplicó (``status='cancelling' | 'cancelled'`` y ``graceful`` reflejando
+    si se usó la transición cancelling o la transición directa a cancelled).
+    La respuesta expone únicamente los campos públicos de ``CancelResponse``
+    (``id``, ``status``, ``graceful``).
     404 si no existe o pertenece a otro user.
     409 si ya está en estado terminal (complete/failed/cancelled).
     503 si el service no está inicializado.
