@@ -175,11 +175,21 @@ def calculate_cost(model: str, tokens_in: int, tokens_out: int) -> Decimal:
     return (cost_in + cost_out).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 
-# Safety margin (Q3 verifier finding): estimación heurística para pre-submit.
-# Cubre input tokens (no medibles antes de la primera LLM call) + retries.
-# 30% conservador: el modelo real rinde input ~50% del output en longitud,
-# más 2 retries promedio con la mitad del cost, da ~+25-35% por encima de
-# la estimación naive de solo output. Ver deliverable.md §"Q3 decision".
+# Pre-submit safety margin. Uncalibrated heuristic for the
+# pre-submit cost estimate (Q3 verifier finding; see
+# deliverable.md §"Q3 decision"). The 30% value is NOT a
+# measured or proven-conservative bound; it is an approximate
+# allowance for two unmeasured exposures that ``estimate_research_cost``
+# cannot observe before the first LLM call:
+#   1. input-token volume (the pre-submit estimate counts only
+#      output tokens at the model's output rate, since input
+#      tokens are not yet observable);
+#   2. retry exposure (a transient dispatch error would add an
+#      additional LLM call; the number of retries is not modelled).
+# The 30% value was selected as a round, modest, uncalibrated
+# pre-submit padding and is not a hard upper bound. DR-Q1A
+# measurements (post-pilot) must calibrate or replace this value
+# with a measured one before it is used as a spend ceiling.
 _ESTIMATION_SAFETY_MARGIN_PCT = Decimal("1.30")
 
 
@@ -191,7 +201,7 @@ def estimate_research_cost(
     primary_model: str,
     fallback_model: str = "deepseek-v3",
 ) -> Decimal:
-    """Heurística conservadora para pre-submit cost estimation.
+    """Heurística pre-submit no calibrada para cost estimation.
 
     Returns an **estimated pay-as-you-go-equivalent amount** (see
     ``PRICING_BASIS`` and ``PRICING_AS_OF`` at module level). It is NOT
@@ -200,11 +210,19 @@ def estimate_research_cost(
     (``JobResponse.estimated_cost_usd``) and the notifier call. It
     is NOT embedded in the final Markdown report.
 
+    The 30% ``_ESTIMATION_SAFETY_MARGIN_PCT`` padding is an uncalibrated
+    pre-submit heuristic, NOT a measured or proven-conservative bound.
+    It is an approximate allowance for unmeasured input tokens and
+    retry exposure (see the constant's inline comment for the full
+    rationale). DR-Q1A measurements must calibrate or replace this
+    value before it is used as a spend ceiling.
+
     Asume:
     - Per-source synth: ``per_source_max_tokens`` x output_rate del modelo primario.
     - Final synth: ``output_max_tokens`` x output_rate del modelo primario.
     - Search + scrape: 0 (no LLM).
-    - Padding +30% por safety margin (input tokens estimados + retries).
+    - Padding +30% por safety margin (uncalibrated; cubre input tokens
+      estimados + retries).
 
     Si ``primary_model`` no está en ``pricing_table``, cae a ``fallback_model``
     (deepseek-v3) en lugar de fallar. Esto evita que un typo en settings
@@ -231,8 +249,11 @@ def estimate_research_cost(
     model = primary_model if primary_model in pricing_table else fallback_model
     _in_rate, out_rate = pricing_table[model]
 
-    # Solo output token rate: heurística conservadora (no medimos input antes
-    # de la primera call, así que lo cubrimos con el safety margin +30%).
+    # Pre-submit estimate uses only the output token rate: input
+    # tokens are not measurable before the first LLM call, so the
+    # +30% safety margin is the uncalibrated heuristic that covers
+    # both input-token volume and retry exposure. See the constant's
+    # inline comment for the full rationale.
     per_source_cost = (
         Decimal(max_sources) * Decimal(per_source_max_tokens) / Decimal(1_000_000) * out_rate
     )

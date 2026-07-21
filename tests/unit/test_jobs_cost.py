@@ -47,12 +47,20 @@ def test_calculate_cost_mini_max_m3() -> None:
 def test_calculate_cost_mini_max_m3_at_typical_dr_run() -> None:
     """5 sources x 3000 output + final 10000 output on MiniMax-M3.
 
-    Per-source: 5 * 3000 * 1.20 / 1e6 = 0.018
-    Final:       10000 * 1.20 / 1e6 = 0.012
-    Total raw:   0.030
+    Successful-output envelope (the documented typical Deep
+    Research run): 5 * 3000 + 10000 = 25_000 output tokens.
+
+    At the verified MiniMax-M3 output rate $1.20/M
+    (DR-Q1A-PRE1A):
+      25_000 * 1.20 / 1e6 = 0.0300
+
+    (This test pins only the per-token arithmetic; the
+    pre-submit safety margin that ``estimate_research_cost``
+    applies is tested separately in
+    ``test_estimate_research_cost_*``.)
     """
-    cost = calculate_cost("MiniMax-M3", 0, 30_000)
-    assert cost == Decimal("0.0360")  # 30000 * 1.20 / 1e6 = 0.0360
+    cost = calculate_cost("MiniMax-M3", 0, 25_000)
+    assert cost == Decimal("0.0300")  # 25000 * 1.20 / 1e6 = 0.0300
 
 
 def test_calculate_cost_mini_max_m2_7_highspeed() -> None:
