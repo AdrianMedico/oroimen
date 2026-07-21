@@ -193,24 +193,35 @@ def test_job_response_estimated_cost_usd_description_has_paygo_equivalent() -> N
 
 def test_job_summary_cost_usd_description_has_paygo_equivalent() -> None:
     """JobSummary.cost_usd description states the paygo-equivalent
-    semantics and clarifies that the aggregate is a lower bound on
-    actual billed tokens.
+    semantics and the token-usage-versus-cost truth.
     """
     desc = _field_description(JobSummary, "cost_usd")
     assert "pay-as-you-go-equivalent" in desc
     assert "not actual provider billing" in desc.lower() or "not actual billing" in desc.lower()
     assert "token_usage" in desc.lower() or "token usage" in desc.lower()
-    assert "lower bound" in desc.lower() or "not represented" in desc.lower()
+    # The new wording distinguishes recorded token usage, cost_usd,
+    # and actual provider billing. None of them is a "lower bound".
+    assert "lower bound" not in desc.lower(), (
+        f"JobSummary.cost_usd description must not use the 'lower "
+        f"bound' framing: cost_usd may understate the official "
+        f"paygo-equivalent cost of dispatched calls when a dispatched "
+        f"call times out without returning a response, but cost_usd "
+        f"is NOT described as a lower bound. Got: {desc!r}"
+    )
 
 
 def test_token_usage_entry_cost_usd_description_has_paygo_equivalent() -> None:
     """TokenUsageEntry.cost_usd description states the per-call
-    estimate and the timeout lower-bound truth.
+    estimate and the token-usage-versus-cost truth.
     """
     desc = _field_description(TokenUsageEntry, "cost_usd")
     assert "pay-as-you-go-equivalent" in desc
     assert "per-returned-call" in desc.lower() or "per call" in desc.lower()
     assert "time out" in desc.lower() or "timeout" in desc.lower() or "no response" in desc.lower()
+    assert "lower bound" not in desc.lower(), (
+        f"TokenUsageEntry.cost_usd description must not use the "
+        f"'lower bound' framing. Got: {desc!r}"
+    )
 
 
 def test_daily_budget_status_today_cost_usd_description_has_paygo_equivalent() -> None:
@@ -477,7 +488,77 @@ def test_models_py_does_not_contain_partial_output_inline_comment() -> None:
         "CancelResponse.graceful. The Field description now carries "
         "the correct semantics."
     )
-    assert "hard cancel" not in src or "does NOT" in src or "not" in src.lower()
+    assert "hard cancel" not in src, (
+        "models.py must not contain the 'hard cancel' phrase. The "
+        "current code does not implement hard cancellation; the "
+        "CancelResponse.graceful Field description states the actual "
+        "persistence behavior only."
+    )
+
+
+# Forbidden legacy phrases that must not appear in any
+# public API documentation file (models.py, jobs_api.py, or
+# cost.py). These are the misleading claims that have been
+# corrected across the truth-patches.
+FORBIDDEN_LEGACY_PHRASES_IN_PUBLIC_DOCS = (
+    "hard cancel inmediato",
+    "cancela tras finalizar la phase actual",
+    "True si partial output guardado",
+    "partial_output_path si existía",
+    "lower bound on actual billed tokens",
+)
+
+
+def test_public_documentation_does_not_contain_forbidden_phrases() -> None:
+    """No public API documentation file contains any of the
+    forbidden legacy phrases that have been corrected across
+    the truth-patches.
+
+    This is a targeted regression test (the previous
+    ``assert "hard cancel" not in src or "does NOT" in src or
+    "not" in src.lower()`` assertion was vacuous because
+    ``"not" in src.lower()`` is always True). The new test
+    forbids each legacy phrase with a dedicated assertion.
+    """
+    # These are the files that constitute the public API
+    # documentation surface (DTOs + cancel endpoint + cost
+    # module).
+    doc_files = {
+        "models.py": models_module,
+        "jobs_api.py": None,  # loaded below
+        "cost.py": cost_module,
+    }
+
+    # Load the jobs_api module source for inspection. The
+    # module is not imported by the test directly to avoid
+    # side-effects (it imports the singleton getter), so we
+    # read the file from the repo path.
+    import os
+
+    jobs_api_path = os.path.join(
+        os.path.dirname(models_module.__file__ or ""),
+        os.pardir,
+        "receivers",
+        "jobs_api.py",
+    )
+    with open(jobs_api_path, encoding="utf-8") as f:
+        jobs_api_src = f.read()
+    doc_files["jobs_api.py"] = jobs_api_src
+
+    for filename, module_or_src in doc_files.items():
+        src = (
+            module_or_src
+            if isinstance(module_or_src, str)
+            else inspect.getsource(module_or_src)
+        )
+        for forbidden in FORBIDDEN_LEGACY_PHRASES_IN_PUBLIC_DOCS:
+            assert forbidden not in src, (
+                f"{filename} contains the forbidden legacy phrase "
+                f"{forbidden!r}. This phrase was removed in the "
+                f"truth-patches. If the phrase is required for "
+                f"historical reference, move it to a non-public "
+                f"location (e.g. a comment in a private file)."
+            )
 
 
 def test_cost_py_does_not_contain_the_misleading_exposure_phrase() -> None:

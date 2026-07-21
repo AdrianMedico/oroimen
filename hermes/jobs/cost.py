@@ -146,11 +146,16 @@ def calculate_cost(model: str, tokens_in: int, tokens_out: int) -> Decimal:
         using a subscription or quota-backed plan should treat this
         value as a relative cost proxy, not as a spend figure.
 
-        The result is the per-call estimate only. Calls that time out
-        without returning (no provider response) are not represented
-        in the token-usage table; the per-call estimate is therefore
-        a lower bound on actual billed tokens for any call that
-        completed in a way the client observed.
+        The result is the per-call estimate only, computed from
+        the tokens the client observed. The RECORDED token usage
+        may understate provider-billed usage when a dispatched call
+        times out without returning a response; in that case the
+        recorded usage row is missing and the corresponding
+        cost_usd contribution is also missing. The returned
+        Decimal may therefore understate the official
+        paygo-equivalent cost of dispatched calls. Actual provider
+        billing remains unknown and is not represented by this
+        function.
 
     Args:
         model: nombre del modelo (debe estar en PRICING_TABLE).

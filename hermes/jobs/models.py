@@ -117,11 +117,15 @@ class JobSummary(BaseModel):
             "derived from the recorded token_usage rows at the verified "
             "PRICING_TABLE rates (PRICING_BASIS = 'official_paygo_equivalent'). "
             "Not actual provider billing. The aggregate is the sum of "
-            "the per-call cost_usd entries in token_usage; calls that "
-            "timed out without returning are not represented in "
-            "token_usage, so this field is a lower bound on actual "
-            "billed tokens for any job that completed in a way the "
-            "client observed."
+            "the per-call cost_usd entries in token_usage. The "
+            "RECORDED token usage may understate provider-billed usage "
+            "when a dispatched call times out without returning a "
+            "response; in that case the recorded usage row is missing "
+            "and the corresponding cost_usd contribution is also "
+            "missing. The cost_usd field may therefore understate the "
+            "official paygo-equivalent cost of dispatched calls. Actual "
+            "provider billing remains unknown and is not represented "
+            "by cost_usd."
         ),
     )
     created_at: str
@@ -218,10 +222,13 @@ class TokenUsageEntry(BaseModel):
             "amount at the verified PRICING_TABLE rates "
             "(PRICING_BASIS = 'official_paygo_equivalent'). Computed "
             "from the tokens_in / tokens_out the client observed. "
-            "Calls that time out without returning a response are "
-            "NOT represented in this table: the per-call cost is a "
-            "lower bound on actual billed tokens for any call that "
-            "the client observed a response from."
+            "Calls that time out without returning a response are NOT "
+            "represented in this table: the corresponding RECORDED "
+            "token usage is missing, and the corresponding cost_usd "
+            "is therefore also missing. The cost_usd field may "
+            "understate the official paygo-equivalent cost of "
+            "dispatched calls. Actual provider billing remains "
+            "unknown and is not represented by cost_usd."
         ),
     )
     created_at: str
