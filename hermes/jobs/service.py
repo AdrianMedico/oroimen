@@ -53,6 +53,7 @@ from hermes.jobs.exceptions import (
     JobAlreadyTerminalError,
     JobNotFoundError,
     JobNotRetryableError,
+    JobStateInvalid,
     PhaseError,
     SchedulerUnavailableError,
 )
@@ -683,7 +684,26 @@ class DeepResearchService:
         DR-Q1A-PRE1B. The previous PRE1A behavior was DB-only: the
         endpoint set ``status='cancelling'`` and the running task
         was not signalled. PRE1B makes the cancellation real for
-        every state:
+        every state.
+
+        DR-Q1A-PRE1B remediation:
+          - the queued-vs-running classification is computed
+            INSIDE the per-job terminal seam from the canonical
+            row, not from a pre-lock variable;
+          - the active-task registry is inspected inside the
+            seam; an active task is signalled via ``task.cancel()``
+            even if the pre-lock read said ``pending``;
+          - the bounded wait for ``graceful=True`` uses
+            ``asyncio.wait({active}, timeout=wait_s)`` (not
+            ``asyncio.wait_for(asyncio.shield(active),
+            timeout=wait_s)``), so an outer cancel of the
+            cancel_job caller is NOT confused with an inner-task
+            acknowledgement;
+          - the conditional transitions are atomic: a failure
+            path cannot overwrite ``cancelling`` or ``cancelled``;
+          - the cancellation finaliser is wrapped in a shielded
+            task with a hard-join pattern, so a second cancel
+            does not abandon the finaliser.
 
           pending / scheduled:
             atomically transition pending|running -> cancelling;
@@ -753,16 +773,18 @@ class DeepResearchService:
         if job_row is None:
             raise JobNotFoundError(f"Job {job_id} not found")
 
-        current_status = JobStatus(job_row["status"])
-
         # 409 contract: complete and failed are terminal, cannot be
         # cancelled. The existing JobAlreadyTerminalError is reused.
-        if current_status in (JobStatus.COMPLETE, JobStatus.FAILED):
-            raise JobAlreadyTerminalError(current_status)
+        # This check is the only place we trust a pre-lock status
+        # (the row is terminal, so the value cannot race with a
+        # concurrent transition).
+        prelock_status = JobStatus(job_row["status"])
+        if prelock_status in (JobStatus.COMPLETE, JobStatus.FAILED):
+            raise JobAlreadyTerminalError(prelock_status)
 
         # Idempotent: already cancelled -> 200 with the existing
         # status. No work to do.
-        if current_status is JobStatus.CANCELLED:
+        if prelock_status is JobStatus.CANCELLED:
             return CancelResponse(
                 id=job_id,
                 status=JobStatus.CANCELLED,
@@ -780,42 +802,106 @@ class DeepResearchService:
         # do NOT hold this lock while waiting for the research
         # task to acknowledge (the task's finalizer needs the
         # same lock to flip the row to cancelled).
+        #
+        # DR-Q1A-PRE1B remediation: the queued-vs-running
+        # classification is computed INSIDE the terminal seam
+        # from the canonical row, NOT from the pre-lock
+        # ``prelock_status`` variable. The previous code
+        # re-used ``prelock_status`` after the lock released,
+        # which produced a stale-state race: between the
+        # pre-lock read and the CAS, the row could transition
+        # ``pending -> running``. The CAS would still succeed
+        # (its predicate is ``pending|running -> cancelling``)
+        # but the local variable still said ``pending``; the
+        # code followed the queued path, removed the scheduler
+        # entry, finalised the row as ``cancelled`` without
+        # ever signalling the registered active task. Inside
+        # the seam we re-read the canonical row, handle the
+        # terminal conflict / already-cancelled cases, perform
+        # the conditional transition, and inspect the active
+        # task registry regardless of the pre-lock value.
         term_lock = self._get_terminal_lock(job_id)
+        active_at_lock: asyncio.Task | None = None
+        was_idempotent_re_signal = False
         async with term_lock:
-            # pending|running -> cancelling. If the row is in
-            # another state (e.g. a parallel completion won the
-            # race and the row is already complete), the predicate
-            # does not match and the function returns the canonical
-            # 200 + status from the row.
+            # Re-read the canonical row INSIDE the seam.
+            sealed_row = await self._db.get_research_job(job_id)
+            sealed_status = (
+                JobStatus(sealed_row["status"]) if sealed_row is not None else prelock_status
+            )
+            # 409 inside the seam: a completion that won
+            # between the pre-lock read and the seam-acquired
+            # read.
+            if sealed_status in (JobStatus.COMPLETE, JobStatus.FAILED):
+                self._clear_user_cancel_intent(job_id)
+                raise JobAlreadyTerminalError(sealed_status)
+            # Already cancelled (an idempotent re-cancel
+            # arriving while a previous finaliser is mid-DB).
+            if sealed_status is JobStatus.CANCELLED:
+                self._clear_user_cancel_intent(job_id)
+                return CancelResponse(
+                    id=job_id,
+                    status=JobStatus.CANCELLED,
+                    graceful=graceful,
+                )
+            # pending|running -> cancelling. The CAS is the
+            # single linearization point.
             transitioned = await self._db.transition_research_job_status(
                 job_id,
                 from_states=(JobStatus.PENDING.value, JobStatus.RUNNING.value),
                 to_state=JobStatus.CANCELLING.value,
             )
             if not transitioned:
-                # Re-read the row to see the actual state.
-                job_row = await self._db.get_research_job(job_id)
-                actual = JobStatus(job_row["status"]) if job_row else JobStatus.PENDING
+                # Re-read after the failed CAS to handle the
+                # unlikely case where the row moved out of
+                # pending|running during the same seam.
+                reread = await self._db.get_research_job(job_id)
+                actual = (
+                    JobStatus(reread["status"]) if reread is not None else prelock_status
+                )
                 if actual in (JobStatus.COMPLETE, JobStatus.FAILED):
+                    self._clear_user_cancel_intent(job_id)
                     raise JobAlreadyTerminalError(actual)
                 if actual is JobStatus.CANCELLED:
+                    self._clear_user_cancel_intent(job_id)
                     return CancelResponse(
                         id=job_id,
                         status=JobStatus.CANCELLED,
                         graceful=graceful,
                     )
-                # cancelling: idempotent; fall through to wait.
-                current_status = actual
+                # Otherwise the row is in 'cancelling' (an
+                # idempotent re-signal scenario). The CAS
+                # above did NOT perform the transition. We
+                # record that this cancel is idempotent and
+                # MUST NOT re-signal the active task below —
+                # doing so would abandon the previously
+                # triggered finaliser.
+                was_idempotent_re_signal = True
+            # Inspect the active task registry REGARDLESS of
+            # the pre-lock status. A task that registered
+            # after the pre-lock read must still receive
+            # ``task.cancel()`` — otherwise the registered
+            # task would continue to run external work.
+            active_at_lock = self._peek_active_task(job_id)
 
-        # At this point: the row is in 'cancelling' (either because
-        # we just transitioned it, or it was already there and we
-        # re-marked user intent).
+        # At this point: the row is in 'cancelling' (the CAS
+        # succeeded or the row was already 'cancelling' on
+        # entry). The active-task registry has been inspected
+        # inside the seam. We now decide whether to
+        # synchronously finalise (no active task) or to
+        # signal the task and fall through to the wait path.
 
-        # pending: there is no active task. Remove the scheduler
-        # entry best-effort and finalize the row as cancelled
-        # immediately. The startup CAS will reject the (now-cancelled)
-        # row before any external call begins.
-        if current_status is JobStatus.PENDING:
+        if active_at_lock is None or active_at_lock.done():
+            # No active task registered (e.g. the row is in
+            # 'pending' and the scheduler has not yet started
+            # the coroutine, or a recovery re-run hasn't
+            # started yet, or the previous task has already
+            # finished and the registry has been cleared).
+            # Remove the scheduler entry best-effort and
+            # finalise the row as cancelled synchronously. A
+            # task that registers after this point will see a
+            # non-pending state in its startup CAS and exit
+            # without external work.
             try:
                 self._scheduler.cancel_scheduled(job_id)
             except Exception:
@@ -823,9 +909,6 @@ class DeepResearchService:
                     "cancel_scheduler_remove_failed",
                     extra={"job_id": job_id},
                 )
-            # Finalize as cancelled synchronously: the row never
-            # transitioned through 'running', so no provider
-            # work happened.
             await self._db.transition_research_job_status(
                 job_id,
                 from_states=(JobStatus.CANCELLING.value,),
@@ -841,21 +924,36 @@ class DeepResearchService:
                 graceful=graceful,
             )
 
-        # current_status is CANCELLING (either just transitioned
-        # from running, or already cancelling on entry).
-        # If a task is registered, signal it.
-        active = self._peek_active_task(job_id)
-        if active is not None and not active.done():
-            # The cancel handler must not be the research task
-            # itself (we do not call cancel on ourselves).
-            try:
-                if active is not asyncio.current_task():
-                    active.cancel()
-            except Exception:
-                logger.exception(
-                    "cancel_task_signal_failed",
-                    extra={"job_id": job_id},
-                )
+        # Active task present. Decide whether to signal it.
+        # If this cancel is an idempotent re-signal (the row
+        # was already 'cancelling' on entry), we MUST NOT
+        # call ``task.cancel()`` again — that would abandon
+        # the previously-triggered finaliser. The first
+        # cancel already did the work; this cancel is
+        # acknowledged without action.
+        if was_idempotent_re_signal:
+            logger.info(
+                "cancel_idempotent_no_resignal",
+                extra={"job_id": job_id},
+            )
+            return CancelResponse(
+                id=job_id,
+                status=JobStatus.CANCELLING,
+                graceful=graceful,
+            )
+
+        # This cancel is the FIRST to flip the row to
+        # 'cancelling'. Signal the active task. The cancel
+        # handler must not be the research task itself (we
+        # do not call cancel on ourselves).
+        try:
+            if active_at_lock is not asyncio.current_task():
+                active_at_lock.cancel()
+        except Exception:
+            logger.exception(
+                "cancel_task_signal_failed",
+                extra={"job_id": job_id},
+            )
 
         if not graceful:
             # Return immediately. The task's finalizer will flip
@@ -869,13 +967,34 @@ class DeepResearchService:
 
         # graceful=True: bounded wait for the task to acknowledge
         # cancellation. The wait is bounded by
-        # ``deep_research_cancel_wait_s`` and is implemented with
-        # ``asyncio.wait_for`` so a stuck finalizer cannot hang the
-        # HTTP handler.
+        # ``deep_research_cancel_wait_s``.
+        #
+        # DR-Q1A-PRE1B remediation: the previous implementation
+        # used ``asyncio.wait_for(asyncio.shield(active),
+        # timeout=wait_s)``. ``wait_for`` raises ``CancelledError``
+        # for BOTH inner-task cancellation AND outer cancel_job
+        # caller cancellation. The two are not the same signal
+        # and conflating them let an outer cancel silently
+        # surface as "task acknowledged" — which is wrong.
+        # We use ``asyncio.wait({active}, timeout=wait_s)``:
+        #
+        #   - ``active`` in ``done`` means the inner task
+        #     terminated; the row reflects the finalizer's
+        #     outcome (``cancelling`` or ``cancelled``);
+        #   - empty ``done`` means the bounded wait timed out;
+        #     surface ``cancelling``;
+        #   - a cancel of the cancel_job caller is NOT routed
+        #     through ``asyncio.wait``; the
+        #     ``asyncio.CancelledError`` propagates to the
+        #     caller as the outer cancellation signal, and the
+        #     research task continues to finalize in the
+        #     background;
+        #   - we never cancel ``active`` merely because the
+        #     wait timed out.
         wait_s = float(
             getattr(self._settings, "deep_research_cancel_wait_s", 5.0)
         )
-        active = self._peek_active_task(job_id)
+        active = active_at_lock
         if active is None or active.done():
             # No active task or already done — the finalizer has
             # either not yet run, or already finalized. Re-read the
@@ -894,38 +1013,24 @@ class DeepResearchService:
                 graceful=True,
             )
         try:
-            await asyncio.wait_for(asyncio.shield(active), timeout=wait_s)
-        except TimeoutError:
-            # Acknowledgement did not arrive inside the bounded
-            # wait. The task is still alive but the row is in
-            # 'cancelling' and the finalizer will complete the
-            # transition when propagation finishes.
-            logger.warning(
-                "cancel_graceful_timeout",
-                extra={"job_id": job_id, "wait_s": wait_s},
-            )
-            return CancelResponse(
-                id=job_id,
-                status=JobStatus.CANCELLING,
-                graceful=True,
-            )
+            done, _pending = await asyncio.wait({active}, timeout=wait_s)
         except asyncio.CancelledError:
-            # The research task raised CancelledError (the
-            # asyncio cancellation propagated through its
-            # awaits). The shield does not protect against the
-            # inner task raising CancelledError on its own;
-            # ``wait_for`` propagates the exception. The HTTP
-            # handler's own task is NOT cancelled here (the
-            # handler is awaiting ``wait_for``, not a direct
-            # cancel target). Treat this as success: the
-            # cancellation was acknowledged. Re-read the row
-            # for the final status. The finalizer has likely
-            # already run (or is about to) and the row may be
-            # ``cancelling`` or ``cancelled``.
-            logger.info(
-                "cancel_graceful_acknowledged",
-                extra={"job_id": job_id},
-            )
+            # The cancel_job caller was cancelled. The research
+            # task is NOT cancelled by us (we do not call
+            # ``active.cancel()`` here); the active task continues
+            # to run and the finalizer will eventually flip the
+            # row. Propagate the outer cancel.
+            raise
+        if done and active in done:
+            # Inner task terminated. Re-read the row for the
+            # final status. The finalizer has likely already
+            # run; the row may be ``cancelling`` or
+            # ``cancelled``. Strong acknowledgement: per the
+            # PRE1B remediation contract, if the finalizer
+            # already CAS'd the row to ``cancelled``, the
+            # response status is ``cancelled``. Otherwise we
+            # surface ``cancelling`` (the finalizer is still
+            # mid-DB).
             job_row = await self._db.get_research_job(job_id)
             actual = (
                 JobStatus(job_row["status"]) if job_row else JobStatus.CANCELLING
@@ -939,30 +1044,17 @@ class DeepResearchService:
                 ),
                 graceful=True,
             )
-        except Exception:
-            logger.exception(
-                "cancel_graceful_wait_failed",
-                extra={"job_id": job_id},
-            )
-            return CancelResponse(
-                id=job_id,
-                status=JobStatus.CANCELLING,
-                graceful=True,
-            )
-
-        # Acknowledgement received. Re-read the row for the final
-        # status. If the finalizer has already flipped to cancelled,
-        # we return cancelled; otherwise we surface cancelling
-        # (rare: the task ended but the finalizer is still mid-DB).
-        job_row = await self._db.get_research_job(job_id)
-        actual = JobStatus(job_row["status"]) if job_row else JobStatus.CANCELLING
+        # Bounded wait timed out. The active task is still
+        # alive; we do NOT cancel it here. The finalizer will
+        # complete the row transition when the asyncio
+        # cancellation propagates through the task's awaits.
+        logger.warning(
+            "cancel_graceful_timeout",
+            extra={"job_id": job_id, "wait_s": wait_s},
+        )
         return CancelResponse(
             id=job_id,
-            status=(
-                JobStatus.CANCELLED
-                if actual is JobStatus.CANCELLED
-                else JobStatus.CANCELLING
-            ),
+            status=JobStatus.CANCELLING,
             graceful=True,
         )
 
@@ -1266,13 +1358,39 @@ class DeepResearchService:
         except PhaseError as phase_err:
             duration = time.monotonic() - start_time
             total_cost = await self._db.get_research_job_cost(job_id)
-            await self._db.update_research_job_status(
+            # DR-Q1A-PRE1B remediation: conditional failure
+            # transition. The previous unconditional
+            # ``update_research_job_status(..., "failed", ...)``
+            # could overwrite ``cancelling`` or ``cancelled`` and
+            # emit a false failed notification. The conditional
+            # transition ``running -> failed`` fails if the row is
+            # not in 'running' — in that case we exit silently
+            # because the cancellation finaliser (or the recovery
+            # contract) owns the row. The proof of the
+            # invariant is in test_jobs_cancellation_races.py
+            # (test_cancelling_to_failed_impossible).
+            failed = await self._db.transition_research_job_status(
                 job_id,
-                "failed",
+                from_states=(JobStatus.RUNNING.value,),
+                to_state=JobStatus.FAILED.value,
+                completed_at=format_now(),
                 error_taxonomy=phase_err.taxonomy,
                 error_message=phase_err.message[:500],
-                completed_at=format_now(),
             )
+            if not failed:
+                # Row is no longer in 'running'. The most likely
+                # reason is a cancellation that won the race; the
+                # cancellation finaliser will run on the asyncio
+                # loop side. Do NOT emit failed metrics, do NOT
+                # notify failure, do NOT mark notified.
+                logger.info(
+                    "phase_error_noop_status_not_running",
+                    extra={
+                        "job_id": job_id,
+                        "error_taxonomy": phase_err.taxonomy,
+                    },
+                )
+                return
             logger.error(
                 "research_job_failed",
                 extra={
@@ -1296,7 +1414,10 @@ class DeepResearchService:
                     "total_cost_usd": total_cost,
                 },
             )
-            # Notifier: failed
+            # Notifier: failed. Sent only when the conditional
+            # transition succeeded — i.e., the row is in 'failed'
+            # and the cancellation finaliser cannot overwrite it
+            # (the row is terminal).
             if hasattr(self._notifier, "send_research_failed"):
                 try:
                     await self._notifier.send_research_failed(
@@ -1328,18 +1449,75 @@ class DeepResearchService:
             # was NOT user-initiated and the row is not in
             # ``cancelling``/``cancelled``, the running state is
             # preserved for the recovery contract.
-            await self._handle_cancellation(job_id, start_time)
+            #
+            # DR-Q1A-PRE1B remediation: second-cancel safety.
+            # The finalizer runs inside a dedicated asyncio.Task
+            # wrapped in ``asyncio.shield``. If the research task
+            # itself is cancelled a second time (e.g., outer
+            # ``cancel_job`` cancellation, or asyncio loop
+            # shutdown) while the finalizer is reconciling cost
+            # or updating SQLite, the shield ensures the
+            # finalizer runs to completion. The hard-join pattern
+            # (``await finalizer_task``) drains the finalizer
+            # before we re-raise. We do NOT clear the user-cancel
+            # intent here; it is cleared by the finalizer
+            # itself only after the row reaches a terminal state.
+            finalizer_task = asyncio.create_task(
+                self._handle_cancellation(job_id, start_time),
+                name=f"cancel-finalize:{job_id}",
+            )
+            try:
+                await asyncio.shield(finalizer_task)
+            except asyncio.CancelledError:
+                # Outer cancellation arrived while shielding the
+                # finalizer. Hard-join: drain the finalizer to
+                # completion before re-raising the original
+                # CancelledError. The finalizer is shielded from
+                # this outer cancel (the shield does not cancel
+                # the inner task), so the await below is the
+                # only point at which we propagate a second
+                # cancel to the finalizer.
+                try:
+                    await finalizer_task
+                except asyncio.CancelledError:
+                    # The finalizer itself was cancelled (most
+                    # likely by a different asyncio loop
+                    # shutdown signal that pre-empted even the
+                    # shielded task). Re-raise so the outer
+                    # re-raise carries the original meaning
+                    # rather than the inner cancellation
+                    # signal.
+                    logger.exception(
+                        "cancel_finalizer_interrupted",
+                        extra={"job_id": job_id},
+                    )
+                raise
             raise
         except Exception as exc:
             duration = time.monotonic() - start_time
             total_cost = await self._db.get_research_job_cost(job_id)
-            await self._db.update_research_job_status(
+            # DR-Q1A-PRE1B remediation: conditional failure
+            # transition (mirror of the PhaseError branch above).
+            # The unconditional update could overwrite
+            # ``cancelling``/``cancelled`` and send a false
+            # failed notification.
+            failed = await self._db.transition_research_job_status(
                 job_id,
-                "failed",
+                from_states=(JobStatus.RUNNING.value,),
+                to_state=JobStatus.FAILED.value,
+                completed_at=format_now(),
                 error_taxonomy="network",
                 error_message=f"unhandled:{exc!s}"[:500],
-                completed_at=format_now(),
             )
+            if not failed:
+                # Row is no longer in 'running'. Likely a
+                # cancellation that won. Exit silently — the
+                # cancellation finaliser owns the row.
+                logger.info(
+                    "unhandled_error_noop_status_not_running",
+                    extra={"job_id": job_id, "error": repr(exc)},
+                )
+                return
             logger.exception(
                 "research_job_unhandled_error",
                 extra={"job_id": job_id, "total_cost_usd": total_cost},
@@ -1494,20 +1672,34 @@ class DeepResearchService:
                     "total_cost_usd": total_cost,
                 },
             )
-        except asyncio.CancelledError:
-            # The finalizer itself was cancelled. Log and
-            # swallow so the outer ``except CancelledError`` can
-            # re-raise. The recovery contract will see the row
-            # in 'cancelling' and finalize it on the next
-            # startup.
-            logger.exception(
-                "cancel_finalizer_cancelled",
-                extra={"job_id": job_id},
-            )
+        # Note: there is intentionally NO inner
+        # ``except asyncio.CancelledError`` that swallows. The
+        # finalizer is invoked from the shielded task in
+        # ``_run_research_inner``'s ``except asyncio.CancelledError``
+        # branch. The shield prevents the outer cancel from
+        # cancelling the finalizer; the only way a
+        # ``CancelledError`` could reach the finalizer is via
+        # an asyncio loop shutdown signal that pre-empted the
+        # shielded task. In that case the outer hard-joins via
+        # ``await finalizer_task``; we re-raise here so the
+        # outer can carry the original cancel meaning rather
+        # than the inner interruption.
         finally:
-            # Clear the user-cancel intent for this job; the row
-            # is now terminal.
-            self._clear_user_cancel_intent(job_id)
+            # Clear the user-cancel intent ONLY when the row
+            # reached a terminal state inside this finalizer.
+            # ``cancel_already_finalized`` (the case where the
+            # CAS did not match because the row was already
+            # terminal) also counts as verified terminal state.
+            # We do NOT clear the intent when finalization is
+            # incomplete (e.g., a CancelledError interrupted the
+            # finalizer before the CAS committed).
+            row = await self._db.get_research_job(job_id)
+            if row is not None and row["status"] in (
+                JobStatus.CANCELLED.value,
+                JobStatus.COMPLETE.value,
+                JobStatus.FAILED.value,
+            ):
+                self._clear_user_cancel_intent(job_id)
 
     # =====================================================================
     # Internal: 5 phases
@@ -1809,27 +2001,49 @@ class DeepResearchService:
             phase_var.reset(t_phase)
 
     async def _phase_write(self, job_id: str, report: str) -> Path:
-        """Phase 5: atomic write data/jobs/{id}.md + DB update + notifier.
+        """Phase 5: publish-then-complete, single transaction.
 
-        Atomic write: tmp + fsync + os.replace (P0 mitigation de critique §4.2).
+        Atomic write: tmp + fsync + os.replace (P0 mitigation de
+        critique §4.2).
 
-        DR-Q1A-PRE1B: cancel-vs-complete linearization. The completion
-        path acquires the per-job terminal seam, verifies the row is
-        still in ``running`` via a conditional CAS, writes the
-        report atomically, reconciles cost, conditionally transitions
-        running -> complete, releases the seam, then sends the
-        completion notifier. If a cancellation won the race the
-        CAS fails and the function exits without publishing the
-        report and without sending the notifier; the temporary
-        ``.md.tmp`` draft is cleaned.
+        DR-Q1A-PRE1B remediation: the per-job terminal seam is
+        the linearization point for the cancel-vs-complete
+        decision AND for the publish-persist-transition commit
+        order. The required order inside the seam is:
+
+          1. verify status is still in 'running';
+          2. publish ``.md.tmp -> .md`` atomically;
+          3. persist ``output_path``;
+          4. CAS ``running -> complete`` (with ``progress=100``
+             and ``completed_at``) ONLY when both (2) and (3)
+             succeeded;
+          5. release the seam;
+          6. send the completion notifier only after all of the
+             above commit steps succeeded.
+
+        If publish or persist fails, the row is NOT advanced to
+        ``complete``, the notifier is NOT sent, the tmp/final
+        artifacts are cleaned consistently, and a ``PhaseError``
+        is raised so the caller (the inner loop) attempts a
+        conditional ``running -> failed`` transition.
+
+        DR-Q1A-PRE1B: cancel-vs-complete linearization. If a
+        cancellation won the race between phase boundaries, the
+        row is in ``cancelling`` and the seam-acquired CAS
+        fails; the function returns without publishing, without
+        persisting ``output_path``, and without sending the
+        notifier; the temporary ``.md.tmp`` draft is cleaned
+        and ``asyncio.CancelledError`` is raised so the
+        caller unwinds through its cancellation finaliser.
         """
         final_path = self._data_root / f"{job_id}.md"
         tmp_path = final_path.with_suffix(".md.tmp")
 
-        # Step 1: write the report to a temporary file. This is
-        # safe to do before the terminal CAS because the
-        # ``.md.tmp`` is local and is either atomically replaced
-        # to ``.md`` (commit) or unlinked (cancel won).
+        # Step 1: write the report to a temporary file OUTSIDE
+        # the terminal seam. This is safe because the ``.md.tmp``
+        # is local; the seam (below) is the only place that
+        # either atomically replaces it to ``.md`` (commit) or
+        # unlinks it (cancel won or publish failed).
         try:
             final_path.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -1839,25 +2053,106 @@ class DeepResearchService:
         except OSError as exc:
             raise PhaseError("oom", f"disk_write_failed:{exc!s}", retryable=False) from exc
 
-        # Step 2: acquire the per-job terminal seam and verify the
-        # row is still in 'running'. If a cancellation won the
-        # race the row is in 'cancelling' or 'cancelled' and the
-        # function returns without publishing the report or
-        # sending the notifier. The terminal seam is NOT held
-        # while waiting for the research task; it only serializes
-        # the cancel-vs-complete decision and the final DB write.
+        # Step 2: acquire the per-job terminal seam. The seam
+        # is the linearization point for cancel-vs-complete AND
+        # for the publish-persist-transition commit order. The
+        # seam is NOT held while waiting for the research task;
+        # it only serializes the final commit and the cancel
+        # finaliser's terminal CAS.
         term_lock = self._get_terminal_lock(job_id)
         async with term_lock:
-            # Conditional transition: running -> complete. If the
-            # predicate does not match, cancellation won the race
-            # and the function returns without publishing.
-            # progress_percent=100 is set atomically with the
-            # status transition so a subsequent reader always
-            # sees the same 100% / complete state (PRE1B bug fix:
-            # the previous conditional ``_update_phase(WRITE, 100)``
-            # would skip because the status had already flipped
-            # out of 'running').
+            # 2a. Verify the row is still in 'running'. The
+            # re-read is the canonical truth; any conditional
+            # CAS below that depends on it must come AFTER
+            # this verification.
+            row = await self._db.get_research_job(job_id)
+            current_status = (
+                JobStatus(row["status"]) if row is not None else JobStatus.PENDING
+            )
+            if current_status is not JobStatus.RUNNING:
+                # Cancellation won. Clean the temp file and
+                # unwind through the cancellation finaliser.
+                logger.info(
+                    "phase_write_cancel_won",
+                    extra={"job_id": job_id, "observed_status": current_status.value},
+                )
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
+                raise asyncio.CancelledError()
+
+            # 2b. Publish the report file atomically. ``os.replace``
+            # is atomic at the POSIX/NTFS level for the same
+            # filesystem. If this fails, the row stays in
+            # 'running' (no status change, no notifier, no
+                # final report), the tmp is cleaned, and a
+                # ``PhaseError`` is raised so the caller can
+                # attempt a conditional ``running -> failed``
+                # transition.
+            try:
+                os.replace(tmp_path, final_path)
+            except OSError as exc:
+                logger.exception(
+                    "phase_write_publish_failed",
+                    extra={"job_id": job_id, "error": str(exc)},
+                )
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
+                raise PhaseError(
+                    "oom",
+                    f"report_publish_failed:{exc!s}",
+                    retryable=False,
+                ) from exc
+
+            # 2c. Persist the output_path. If this fails, the
+            # final report file is already published; we leave
+            # the file in place (the next /report GET will
+            # still find it via the LocalReportStore path
+            # resolver, which derives the path from the job_id
+            # independently of the DB column) but we DO NOT
+            # transition the row to 'complete' and we DO NOT
+            # notify. The next /report GET serves the file
+            # regardless.
+            try:
+                await self._db.conn.execute(
+                    "UPDATE research_jobs SET output_path = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (str(final_path), format_now(), job_id),
+                )
+                await self._db.conn.commit()
+            except Exception as _db_write_exc:
+                logger.exception(
+                    "phase_write_output_path_failed",
+                    extra={"job_id": job_id},
+                )
+                # The file is published but the DB write
+                # failed. Do not transition. The recovery
+                # contract can re-derive the path on the next
+                # startup. We still raise PhaseError so the
+                # conditional ``running -> failed`` path
+                # runs.
+                raise PhaseError(
+                    "network",
+                    "output_path_db_write_failed",
+                    retryable=True,
+                ) from _db_write_exc
+
+            # 2d. Reconcile the cost (monotonic, atomic MAX) so
+            # the completion notifier's ``cost_usd`` argument
+            # and the post-completion ``JobDetail.cost_usd``
+            # expose the same persisted reconciled value.
             cost = await self.reconcile_cost(job_id)
+
+            # 2e. CAS running -> complete with progress_percent=100
+            # and completed_at set in the same statement. If a
+            # cancellation won the race during the publish /
+            # persist work, the predicate does not match and we
+            # clean up.
             transitioned = await self._db.transition_research_job_status(
                 job_id,
                 from_states=(JobStatus.RUNNING.value,),
@@ -1866,56 +2161,31 @@ class DeepResearchService:
                 progress_percent=100,
             )
             if not transitioned:
-                # Cancellation won the race. Clean the temp file
-                # and return without publishing.
+                # Cancellation won the race AFTER publish but
+                # BEFORE transition. The final report file is
+                # already on disk; we unlink it because the
+                # contract says a cancelled job must NOT leave
+                # a final report. The cancellation finaliser
+                # will run on the asyncio loop side.
                 logger.info(
-                    "phase_write_cancel_won",
+                    "phase_write_cancel_won_after_publish",
                     extra={"job_id": job_id},
                 )
+                try:
+                    if final_path.exists():
+                        final_path.unlink()
+                except OSError:
+                    pass
                 try:
                     if tmp_path.exists():
                         tmp_path.unlink()
                 except OSError:
                     pass
-                # Re-raise so the caller (the research task)
-                # unwinds through the CancelledError handler. The
-                # task has likely already been signalled by
-                # cancel_job; the finalizer will then run.
                 raise asyncio.CancelledError()
 
-            # CAS succeeded. The row is now 'complete'. We may
-            # now publish the report file and proceed.
-            # Mark the output_path on the row (separate update;
-            # the CAS already wrote status='complete').
-            try:
-                await self._db.conn.execute(
-                    "UPDATE research_jobs SET output_path = ?, updated_at = ? "
-                    "WHERE id = ?",
-                    (str(final_path), format_now(), job_id),
-                )
-                await self._db.conn.commit()
-            except Exception:
-                logger.exception(
-                    "phase_write_output_path_failed",
-                    extra={"job_id": job_id},
-                )
-            # Publish the report file atomically. tmp + os.replace
-            # is atomic at the POSIX/NTFS level for the same
-            # filesystem.
-            try:
-                os.replace(tmp_path, final_path)
-            except OSError as exc:
-                # The row is already 'complete' but the report
-                # file is not. The next /report GET will 500
-                # ``report_unavailable`` defensively.
-                logger.exception(
-                    "phase_write_publish_failed",
-                    extra={"job_id": job_id, "error": str(exc)},
-                )
-
-            # Notifier (best-effort). Sent only after the
-            # report is published; the notifier reads the row
-            # state, not the file.
+            # 2f. Commit complete. Notifier runs only AFTER the
+            # CAS succeeded; the notifier reads the row state
+            # and the persisted reconciled ``cost_usd`` value.
             if hasattr(self._notifier, "send_research_complete"):
                 job_row = await self._db.get_research_job(job_id)
                 notify_via_tg = (
@@ -2307,9 +2577,26 @@ class DeepResearchService:
         still being in 'running'. A cancellation that wins
         between phases flips the row to 'cancelling'; the next
         phase's ``_update_phase`` call then sees a non-running
-        status and refuses to write the phase. This is the
-        phase-guard invariant: a cancelled job cannot advance to
-        the next phase.
+        status and refuses to write the phase.
+
+        DR-Q1A-PRE1B remediation: the phase guard MUST stop the
+        research task from advancing into the next phase body.
+        When the conditional update does not apply, the function
+        re-reads the canonical row and:
+
+          - raises ``asyncio.CancelledError`` if the row is in
+            ``cancelling`` or ``cancelled`` (the cancellation
+            finaliser will run on the caller side);
+          - raises ``JobStateInvalid`` (a narrow internal exception)
+            for any other non-running state — an invariant
+            violation that the research task must NOT silently
+            ignore by continuing into the phase body.
+
+        The previous "log-only and return normally" behaviour
+        allowed a cancelled job to start a new search / scrape /
+        LLM call after cancellation had already won. This
+        function now refuses to return until the row is in
+        ``running``.
         """
         if progress is None:
             progress = 0
@@ -2318,11 +2605,46 @@ class DeepResearchService:
             phase.value,
             int(progress),
         )
-        if not applied:
-            logger.info(
-                "phase_update_skipped_status_changed",
-                extra={"job_id": job_id, "phase": phase.value, "progress": progress},
-            )
+        if applied:
+            return
+        # Guard failed: re-read the canonical row and decide
+        # whether the row is in a cancellation state (in which
+        # case the caller is on the cancellation path) or in
+        # an unexpected state (in which case we surface an
+        # internal exception). Either way, we do NOT return
+        # to the caller; the caller MUST not enter the phase
+        # body after a guard failure.
+        row = await self._db.get_research_job(job_id)
+        observed = (
+            row["status"] if row is not None else JobStatus.PENDING.value
+        )
+        logger.info(
+            "phase_update_skipped_status_changed",
+            extra={
+                "job_id": job_id,
+                "phase": phase.value,
+                "progress": progress,
+                "observed_status": observed,
+            },
+        )
+        if observed in (
+            JobStatus.CANCELLING.value,
+            JobStatus.CANCELLED.value,
+        ):
+            # The cancellation finaliser will finalize the row;
+            # the research task unwinds through its
+            # ``except asyncio.CancelledError`` branch.
+            raise asyncio.CancelledError()
+        # Any other non-running state is an invariant violation.
+        # Surface it as a narrow internal exception so the
+        # generic ``except Exception`` branch in
+        # ``_run_research_inner`` can attempt a conditional
+        # running -> failed transition (which will itself fail
+        # if the row is no longer in 'running'; the task simply
+        # exits in that case).
+        raise JobStateInvalid(
+            job_id=job_id, observed_status=observed, phase=phase.value
+        )
 
     def _sources_summary(self, sources: list[dict]) -> list[dict]:
         """Compact sources para checkpoint (sin clean_text por tamaño)."""
