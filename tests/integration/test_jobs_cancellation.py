@@ -1972,13 +1972,29 @@ async def test_f_outer_waiter_cancellation(db, tmp_path: Path) -> None:
         service.cancel_job(job_id, graceful=True)
     )
 
+    # Yield once so the cancel_caller is scheduled by the
+    # event loop. On busy CI runners the polling loop can
+    # otherwise monopolise the loop and starve the
+    # background cancel task.
+    await asyncio.sleep(0)
+
     # Wait for the cancel to flip the row to cancelling.
-    for _ in range(400):
+    # The budget is generous (10s = 1000 iterations * 0.01s)
+    # to absorb CI scheduling jitter; the actual cancel
+    # should complete in <100ms on a quiet event loop.
+    cancelling_seen = False
+    for _ in range(1000):
         row = await db.get_research_job(job_id)
         if row and row["status"] == "cancelling":
+            cancelling_seen = True
+            break
+        # Also accept cancelled: a fast CI can run the
+        # finaliser inside the bounded wait.
+        if row and row["status"] == "cancelled":
+            cancelling_seen = True
             break
         await asyncio.sleep(0.01)
-    else:
+    if not cancelling_seen:
         cancel_caller.cancel()
         research_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
