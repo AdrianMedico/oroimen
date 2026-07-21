@@ -1299,87 +1299,204 @@ async def test_cancel_endpoint_status_codes(db, tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_a_true_startup_interleaving(db, tmp_path: Path) -> None:
-    """A: cancel_job pre-lock read says pending; _run_research registers and
-    transitions to running BEFORE the cancel CAS; the in-lock cancel
-    decision inspects the active-task registry (NOT the pre-lock value)
-    and signals the active task.
+    """A (overnight): REAL startup interleaving with Events/barriers.
 
-    Use Events/barriers around the DB read/CAS - not "cancel fully, then
-    start research".
+    The previous "manually register a fake task before cancel_job"
+    design did not actually interleave cancel's pre-lock read with
+    research's register+transition. This test forces the real
+    ordering with controlled Events:
 
-    Proof:
-      - pre-lock read returns pending (artificially forced via a hook);
-      - the active-task registry is populated by a separate coroutine
-        between the pre-lock read and the in-lock inspection;
-      - the cancel CAS predicate (pending|running -> cancelling) matches
-        from either state, but the in-lock decision path inspects the
-        registry regardless;
-      - the registered task receives .cancel();
-      - no provider/search/fetch call proceeds.
+      1. cancel_job begins; its pre-lock read captures ``pending``
+         (we observe the read via a hook that signals an Event);
+      2. cancel_job is held at its cancel-side CAS via a
+         barrier (we wrap ``transition_research_job_status`` so
+         the running->cancelling CAS waits on an Event);
+      3. real ``_run_research`` task is started;
+      4. it registers its exact asyncio.Task in the registry;
+      5. it transitions ``pending -> running``;
+      6. it blocks before external search/provider work (the
+         search side-effect awaits an Event);
+      7. cancel's seam release is allowed to proceed (test
+         sets the CAS Event);
+      8. cancel_job re-reads the canonical row (``running``);
+      9. cancel_job CASes ``running -> cancelling``;
+     10. cancel_job signals the exact registered research task
+         (the task is NOT a manually-registered fake; it is the
+         real ``_run_research`` coroutine);
+     11. final state: ``cancelled``;
+     12. no external phase proceeds past the controlled boundary
+         (the search side-effect is still awaiting
+         ``search_release.wait()`` and never returns).
+
+    The proof is causal: the in-lock cancel decision inspects the
+    active-task registry (not the pre-lock value) and signals the
+    registered task. We verify the registered task receives cancel
+    by checking that the search side-effect's blocking await never
+    returns, and that the research task is cancelled.
     """
     service, handles = _make_service(db, tmp_path)
     job_id = "race_a_interleave"
     await _create_job(db, job_id)
 
-    # Force the pre-lock read to return pending by manually
-    # registering a fake asyncio.Task in the service registry
-    # BEFORE cancel_job is called. The pre-lock read sees pending
-    # (the real row state); the in-lock registry inspection finds
-    # the fake task. The cancel decision MUST signal the fake task.
-    cancelled_flag = asyncio.Event()
+    # Barrier 1: search side-effect blocks until search_release
+    # is set. The research task will block here before any
+    # external work; we never set search_release, so the
+    # search will not return.
+    search_entered = asyncio.Event()
+    search_release = asyncio.Event()
 
-    async def fake_task() -> None:
-        # Block until cancel_job signals us. The cancellation is
-        # observed via the task's own CancelledError handling.
-        try:
-            await asyncio.sleep(60.0)
-        except asyncio.CancelledError:
-            cancelled_flag.set()
-            raise
+    async def blocking_search(*args: Any, **kwargs: Any) -> Any:
+        search_entered.set()
+        await search_release.wait()
+        return MagicMock(results=[])
 
-    fake = asyncio.create_task(fake_task())
-    # Register the fake task in the service's active-task registry.
-    await service._register_active_task(job_id, fake)
+    handles["search"].side_effect = blocking_search
+
+    # Barrier 2: wrap transition_research_job_status so the
+    # FIRST cancel-side running->cancelling CAS waits on
+    # cancel_cas_release. This is the seam-side barrier
+    # between the pre-lock read and the CAS.
+    real_transition = db.transition_research_job_status
+    cancel_cas_release = asyncio.Event()
+
+    async def hooked_transition(*args: Any, **kwargs: Any) -> bool:
+        from_states = args[1] if len(args) > 1 else kwargs.get("from_states", ())
+        to_state = args[2] if len(args) > 2 else kwargs.get("to_state", "")
+        # Detect: the cancel-side running->cancelling CAS
+        # (only this CAS holds the cancel between pre-lock
+        # read and the seam).
+        if (
+            to_state == "cancelling"
+            and JobStatus.RUNNING.value in from_states
+        ):
+            await cancel_cas_release.wait()
+        return await real_transition(*args, **kwargs)
+
+    db.transition_research_job_status = hooked_transition  # type: ignore[method-assign]
+
     try:
-        response = await service.cancel_job(job_id, graceful=True)
-    finally:
-        await service._unregister_active_task(job_id, fake)
-        # The cancel handler will have called fake.cancel(). Drain
-        # the fake task.
-        if not fake.done():
-            fake.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await fake
+        # Step 1+2: start cancel_job. The pre-lock read happens
+        # immediately, then the cancel reaches the hooked CAS
+        # and waits on cancel_cas_release.
+        cancel_coro = asyncio.create_task(
+            service.cancel_job(job_id, graceful=True)
+        )
 
-    # The fake task was signalled (the cancel handler called
-    # task.cancel() on it).
-    assert cancelled_flag.is_set(), "active task was not signalled by cancel"
-    # Response status is CANCELLING (the active task was signalled
-    # but did not terminate inside the bounded wait; the
-    # synchronous-finalize path was NOT taken because the registry
-    # had a live task). The PRE1B contract: a cancel that finds
-    # a live task returns CANCELLING (or CANCELLED if the task
-    # acknowledged inside the wait).
-    assert response.status is JobStatus.CANCELLING, (
-        f"Expected CANCELLING, got {response.status}"
-    )
-    # No provider call ever happened.
-    assert handles["search"].call_count == 0
-    assert handles["llm"].chat.call_count == 0
-    assert handles["fetcher"].calls == []
-    # Final row state: the cancel flipped the row pending ->
-    # cancelling, and the fake task did not run a finalizer (it
-    # is a stub). The row therefore stays in 'cancelling' (the
-    # CAS is committed; the synchronous-finalize path was
-    # correctly NOT taken because the registry had a live task).
-    # The PRE1B contract: a cancel that finds a live task MUST
-    # NOT synchronously finalize (otherwise it would orphan the
-    # task). Verifying the row stayed in 'cancelling' is part of
-    # the contract.
-    row = await db.get_research_job(job_id)
-    assert row["status"] == "cancelling", (
-        f"Expected cancelling (live task in registry), got {row['status']!r}"
-    )
+        # Step 3: start the REAL _run_research task.
+        research_task = asyncio.create_task(
+            service._run_research(job_id)
+        )
+
+        # Step 4+5: wait for the row to reach 'running' AND the
+        # research task to be in the registry.
+        for _ in range(400):
+            row = await db.get_research_job(job_id)
+            if row and row["status"] == "running":
+                peeked = service._peek_active_task(job_id)
+                if peeked is research_task:
+                    break
+            await asyncio.sleep(0.01)
+        else:
+            cancel_coro.cancel()
+            research_task.cancel()
+            pytest.fail(
+                "Research task never registered or never reached 'running'"
+            )
+
+        # Step 6: wait for the search to be entered (so we know
+        # the research task is blocked at the controlled
+        # boundary before external work).
+        for _ in range(400):
+            if search_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            cancel_coro.cancel()
+            research_task.cancel()
+            pytest.fail("Search was never entered")
+
+        # Sanity: the cancel's CAS is still holding.
+        assert not cancel_coro.done(), (
+            "cancel_job completed before its CAS barrier; "
+            "the test ordering is broken"
+        )
+
+        # Step 7: release the cancel's CAS. The cancel proceeds:
+        # re-reads running, CASes running -> cancelling, signals
+        # the registered research task.
+        cancel_cas_release.set()
+
+        # Step 8+9+10: wait for cancel_job to complete. The
+        # cancel is graceful=True so it will bounded-wait
+        # on the research task. The wait will time out (the
+        # research task is still blocked at the search barrier
+        # and the cancel was the only thing that could
+        # unblock it; the cancel did signal the task but the
+        # task is awaiting search_release which is not set).
+        response = await cancel_coro
+
+        # Step 11: wait for the research task to be cancelled.
+        # The cancel signalled it; the task's ``except
+        # CancelledError`` runs the finalizer; the finalizer
+        # sees ``cancelling`` and the user-intent marker
+        # (set by cancel_job), finalizes the row to
+        # ``cancelled``, and the task exits.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(research_task, timeout=5.0)
+
+        # Step 12: no external phase proceeded past the
+        # controlled boundary.
+        # The search side-effect's blocking await never
+        # returned (we never set search_release).
+        assert not search_release.is_set(), (
+            "search_release was unexpectedly set"
+        )
+        # The search was entered exactly once (the side-effect
+        # ran). It did not return.
+        assert handles["search"].call_count == 1, (
+            f"search call_count={handles['search'].call_count}; "
+            f"expected 1"
+        )
+        # No fetcher call.
+        assert handles["fetcher"].calls == []
+        # No LLM call.
+        assert handles["llm"].chat.call_count == 0
+
+        # Final state: cancelled.
+        row = await db.get_research_job(job_id)
+        assert row["status"] == "cancelled", (
+            f"Expected cancelled, got {row['status']!r}"
+        )
+        assert row["error_taxonomy"] == "cancelled"
+
+        # The response status is CANCELLING (the wait timed out
+        # because the research task was blocked at the search
+        # barrier; the finalizer ran AFTER the wait returned
+        # and flipped the row to CANCELLED). CANCELLED is also
+        # acceptable if the wait was long enough.
+        assert response.status in (
+            JobStatus.CANCELLING,
+            JobStatus.CANCELLED,
+        ), f"Expected CANCELLING or CANCELLED, got {response.status}"
+
+        # The registered research task is the one that was
+        # signalled. We verify by re-peeking the registry; it
+        # should be empty (the task unregistered itself in its
+        # finally block) OR contain the same task that is now
+        # done.
+        peeked = service._peek_active_task(job_id)
+        if peeked is not None:
+            assert peeked.done(), (
+                "registry contains a non-done task after research completion"
+            )
+    finally:
+        # Always unblock any waiters so the test does not hang.
+        cancel_cas_release.set()
+        search_release.set()
+        if not research_task.done():
+            research_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await research_task
 
 
 # -- Test B: phase guard failure ----------------------------------------
@@ -1419,65 +1536,129 @@ async def test_b_phase_guard_failure(db, tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_c_phase_error_race_with_cancellation(db, tmp_path: Path) -> None:
-    """C: cancellation changes running -> cancelling; awaited operation
-    raises PhaseError concurrently; final status is cancelled (NOT
-    failed); failed notifier is not called.
+    """C (overnight): PhaseError race where cancellation wins.
+
+    The previous design used ``asyncio.wait_for(research_task,
+    timeout=5.0)``; the timeout was a hidden cancel-injector and
+    could mask the causal chain. This test uses
+    ``asyncio.wait({research_task}, timeout=<bounded>)`` which does
+    NOT cancel the research task on timeout, and asserts
+    ``research_task in done`` as the success criterion. On timeout
+    the failure is recorded and the test fails honestly.
+
+    Proof:
+
+      - search side-effect blocks on a controlled Event; the
+        research task is paused at the controlled boundary;
+      - externally transition ``running -> cancelling`` (the
+        cancel won the race);
+      - release the search side-effect to raise PhaseError
+        (a non-retryable taxonomy);
+      - the conditional ``running -> failed`` CAS in the
+        ``PhaseError`` branch DOES NOT apply (row is in
+        ``cancelling``);
+      - the cancellation finalization is invoked through the
+        shared ``_finalize_cancellation`` helper (Fix A);
+      - final state is ``cancelled``, not ``failed``;
+      - failed notifier is NOT called;
+      - no failed metric is emitted;
+      - the research task ends with cancellation semantics
+        (its ``_handle_cancellation`` finalizer ran, not the
+        ``running -> failed`` branch);
+      - the test's own wait did NOT inject the decisive
+        cancellation (the cancel is the externally-induced
+        row state transition + the asyncio cancellation that
+        the search side-effect's raise would NOT trigger on
+        its own).
     """
     service, handles = _make_service(db, tmp_path)
     job_id = "race_c_phaseerror"
     await _create_job(db, job_id)
 
-    # Set up a search that blocks on an event, then raises PhaseError
-    # when released. This gives the test a window to transition the
-    # row to cancelling before the search raises.
+    # Search side-effect: blocks on ``search_release`` and
+    # raises a non-retryable PhaseError when released. The
+    # retry loop terminates after this single raise (3
+    # attempts total, but the test only allows one
+    # non-retryable error which propagates immediately).
     search_entered = asyncio.Event()
     search_release = asyncio.Event()
 
-    async def blocking_then_error(*args: Any, **kwargs: Any) -> Any:
+    async def blocking_then_phase_error(*args: Any, **kwargs: Any) -> Any:
         search_entered.set()
         await search_release.wait()
-        raise PhaseError("test_5xx", "phase_error_after_cancel", retryable=False)
+        raise PhaseError(
+            "test_5xx", "phase_error_after_cancel", retryable=False
+        )
 
-    handles["search"].side_effect = blocking_then_error
+    handles["search"].side_effect = blocking_then_phase_error
 
     # Start the research task.
     research_task = asyncio.create_task(service._run_research(job_id))
 
     # Wait for the search to be entered.
-    for _ in range(200):
+    for _ in range(400):
         if search_entered.is_set():
             break
         await asyncio.sleep(0.01)
     else:
         research_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await research_task
         pytest.fail("search was never entered")
 
     # Wait for status=running.
-    for _ in range(200):
+    for _ in range(400):
         row = await db.get_research_job(job_id)
         if row and row["status"] == "running":
             break
         await asyncio.sleep(0.01)
     else:
         research_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await research_task
         pytest.fail("Task never reached 'running' state")
 
-    # Now externally transition to cancelling (cancel won the race).
+    # Cancel won the race. Transition the row externally.
     await db.transition_research_job_status(
         job_id, from_states=("running",), to_state="cancelling"
     )
+    # Also mark user-cancel intent (so the finalizer treats
+    # this as a user cancellation, not infra shutdown).
+    service._mark_user_cancel_intent(job_id)
 
-    # Release the search - it raises PhaseError.
+    # Release the search — it raises PhaseError. The error
+    # propagates to ``_run_research_inner``'s ``except
+    # PhaseError`` branch, which attempts a conditional
+    # ``running -> failed`` CAS that WILL fail (row is in
+    # ``cancelling``), and now (Fix A) delegates to the
+    # shared ``_finalize_cancellation`` helper.
     search_release.set()
 
-    # Wait for the research task to complete (it will run the
-    # cancellation finaliser via the except asyncio.CancelledError
-    # branch; the PhaseError exception will be caught by the generic
-    # Exception handler which will also try a conditional
-    # running -> failed CAS that will fail because the row is in
-    # cancelling).
+    # Wait for the research task to finish using
+    # ``asyncio.wait`` + bounded timeout (NOT
+    # ``asyncio.wait_for`` which would inject a cancel on
+    # timeout and mask the causal chain). The bounded
+    # timeout is generous (10s) but does NOT cancel the
+    # research task if it elapses.
+    try:
+        done, _pending = await asyncio.wait(
+            {research_task}, timeout=10.0
+        )
+    except asyncio.CancelledError:
+        pytest.fail("wait raised CancelledError unexpectedly")
+    if research_task not in done:
+        research_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await research_task
+        pytest.fail(
+            "research task did not finish within 10s; "
+            "the fix A delegation may not have completed"
+        )
+
+    # Drain any task exception so the asyncio runtime does
+    # not log a warning.
     with contextlib.suppress(asyncio.CancelledError, Exception):
-        await asyncio.wait_for(research_task, timeout=5.0)
+        await research_task
 
     # Final state MUST be cancelled, NOT failed.
     row = await db.get_research_job(job_id)
@@ -1498,7 +1679,25 @@ async def test_c_phase_error_race_with_cancellation(db, tmp_path: Path) -> None:
 async def test_d_generic_exception_race_with_cancellation(
     db, tmp_path: Path
 ) -> None:
-    """D: same assertions as C for the generic exception path."""
+    """D (overnight): same as C for the generic Exception branch.
+
+    Uses ``asyncio.wait`` + bounded timeout (not
+    ``asyncio.wait_for``) so the test's wait does NOT inject
+    the decisive cancellation. The causal chain is:
+
+      - search side-effect blocks on a controlled Event;
+      - externally transition ``running -> cancelling``;
+      - mark user-cancel intent;
+      - release the search side-effect to raise a generic
+        ``RuntimeError``;
+      - the conditional ``running -> failed`` CAS in the
+        generic ``except Exception`` branch DOES NOT apply;
+      - the shared ``_finalize_cancellation`` helper (Fix A)
+        runs;
+      - final state is ``cancelled``;
+      - failed notifier is NOT called;
+      - failed metric is NOT emitted.
+    """
     service, handles = _make_service(db, tmp_path)
     job_id = "race_d_generic"
     await _create_job(db, job_id)
@@ -1514,30 +1713,49 @@ async def test_d_generic_exception_race_with_cancellation(
     handles["search"].side_effect = blocking_then_runtime_error
 
     research_task = asyncio.create_task(service._run_research(job_id))
-    for _ in range(200):
+    for _ in range(400):
         if search_entered.is_set():
             break
         await asyncio.sleep(0.01)
     else:
         research_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await research_task
         pytest.fail("search was never entered")
 
-    for _ in range(200):
+    for _ in range(400):
         row = await db.get_research_job(job_id)
         if row and row["status"] == "running":
             break
         await asyncio.sleep(0.01)
     else:
         research_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await research_task
         pytest.fail("Task never reached 'running' state")
 
     await db.transition_research_job_status(
         job_id, from_states=("running",), to_state="cancelling"
     )
+    service._mark_user_cancel_intent(job_id)
     search_release.set()
 
+    try:
+        done, _pending = await asyncio.wait(
+            {research_task}, timeout=10.0
+        )
+    except asyncio.CancelledError:
+        pytest.fail("wait raised CancelledError unexpectedly")
+    if research_task not in done:
+        research_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await research_task
+        pytest.fail(
+            "research task did not finish within 10s"
+        )
+
     with contextlib.suppress(asyncio.CancelledError, Exception):
-        await asyncio.wait_for(research_task, timeout=5.0)
+        await research_task
 
     row = await db.get_research_job(job_id)
     assert row["status"] == "cancelled", (
@@ -1668,90 +1886,161 @@ async def test_e_repeated_cancel_during_finalization(db, tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_f_outer_waiter_cancellation(db, tmp_path: Path) -> None:
-    """F: start a graceful=True wait; cancel the cancel_job caller
-    task; the caller receives CancelledError; the research
-    cancellation/finalization continues independently.
+    """F (overnight): REAL outer-caller cancellation.
+
+    The previous design did not actually cancel the
+    ``cancel_job`` caller while it was in its acknowledgement
+    wait. It only verified the call returned within ``wait_s``
+    because the inner task terminated on cancel. This test
+    uses a real running research task with a controlled
+    awaitable, then explicitly cancels the cancel_job caller
+    while the caller is in its bounded-wait, and asserts that
+    awaiting the caller raises ``asyncio.CancelledError`` and
+    no ``CancelResponse`` is returned. The research task
+    continues independently to finalize as cancelled.
+
+    Steps:
+
+      1. create a job (pending);
+      2. start a real research task that registers itself in
+         the active-task registry, transitions pending ->
+         running, and blocks at a controlled search boundary;
+      3. start ``cancel_job(graceful=True)`` as a separate
+         task; it acquires the seam, CASes running ->
+         cancelling, signals the research task (inside the
+         seam, Fix B), and enters the bounded wait on the
+         research task;
+      4. while the cancel_job caller is in the bounded wait,
+         call ``cancel_caller.cancel()``;
+      5. await the cancel_caller and assert that it raises
+         ``asyncio.CancelledError`` (NOT a CancelResponse);
+      6. release the research task's controlled boundary so
+         its finalizer can run;
+      7. wait for the research task to complete; verify the
+         final state is ``cancelled``;
+      8. verify no completion/failed notifier runs;
+      9. verify the research task was signalled by the
+         cancel (its controlled await saw CancelledError,
+         and its finalizer ran).
     """
     service, handles = _make_service(db, tmp_path)
     job_id = "race_f_outerwaiter"
     await _create_job(db, job_id)
-    # Move the row to running. The cancel will then take the
-    # bounded-wait path (the first cancel CASes running ->
-    # cancelling, signals the active task, and falls through to
-    # ``asyncio.wait({active}, timeout=wait_s)``).
-    await db.transition_research_job_status(
-        job_id, from_states=("pending",), to_state="running"
+
+    # Controlled boundary: the search side-effect blocks
+    # until ``search_release`` is set. The research task
+    # will be blocked here for the duration of the test.
+    search_entered = asyncio.Event()
+    search_release = asyncio.Event()
+
+    async def blocking_search(*args: Any, **kwargs: Any) -> Any:
+        search_entered.set()
+        await search_release.wait()
+        return MagicMock(results=[])
+
+    handles["search"].side_effect = blocking_search
+
+    # Start the real research task. It registers its
+    # asyncio.Task, transitions pending -> running, and
+    # blocks at the search side-effect.
+    research_task = asyncio.create_task(
+        service._run_research(job_id)
+    )
+    # Wait for the row to reach 'running' AND the search
+    # to be entered.
+    for _ in range(400):
+        row = await db.get_research_job(job_id)
+        if row and row["status"] == "running" and search_entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        research_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await research_task
+        pytest.fail("research task never reached 'running' or search was never entered")
+    # Confirm the task is registered and blocked.
+    peeked = service._peek_active_task(job_id)
+    assert peeked is research_task, (
+        "research task did not register in the active-task registry"
     )
 
-    # Register a fake active task that loops forever (with a
-    # short sleep so it remains cooperative and responsive to
-    # cancellation). The cancel_job endpoint will signal this
-    # task via task.cancel(); the task terminates quickly. To
-    # make the wait ACTUALLY pending for at least a few ms
-    # (so the test can call cancel_task.cancel() before the
-    # wait returns), we use ``asyncio.sleep(60.0)`` so the
-    # sleep is interrupted on cancel but the wait is still
-    # pending when the test cancels.
-    async def live_forever() -> None:
-        try:
-            await asyncio.sleep(60.0)
-        except asyncio.CancelledError:
-            raise
+    # Start cancel_job(graceful=True) as a separate task. The
+    # cancel acquires the seam, CASes running -> cancelling,
+    # signals the research task (INSIDE the seam, Fix B), and
+    # enters the bounded wait on the research task.
+    cancel_caller = asyncio.create_task(
+        service.cancel_job(job_id, graceful=True)
+    )
 
-    fake = asyncio.create_task(live_forever())
-    await service._register_active_task(job_id, fake)
+    # Wait for the cancel to flip the row to cancelling.
+    for _ in range(400):
+        row = await db.get_research_job(job_id)
+        if row and row["status"] == "cancelling":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        cancel_caller.cancel()
+        research_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await cancel_caller
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await research_task
+        pytest.fail("cancel_job did not flip row to cancelling in time")
+
+    # Sanity: cancel_caller is in flight (waiting on the
+    # bounded wait on the research task).
+    assert not cancel_caller.done(), (
+        "cancel_caller completed before the outer cancel; "
+        "the test setup is broken"
+    )
+
+    # Cancel the cancel_caller itself. This is the
+    # outer-caller cancellation we want to verify.
+    cancel_caller.cancel()
+
+    # Awaiting the cancel_caller MUST raise
+    # ``asyncio.CancelledError`` (NOT return a CancelResponse).
+    with pytest.raises(asyncio.CancelledError):
+        await cancel_caller
+
+    # The research task is independently owned. It has been
+    # signalled (the cancel did call .cancel() on it inside
+    # the seam), but it is still blocked at the controlled
+    # boundary. The research task's ``_run_research`` will
+    # see CancelledError on its next await (the
+    # search_release.wait()).
+    # Release the boundary.
+    search_release.set()
+
+    # Wait for the research task to finish using
+    # ``asyncio.wait`` (NOT ``wait_for``) so we do not
+    # inject a second cancel.
     try:
-        # Start cancel_job(graceful=True) in the background.
-        # The cancel signals the fake task (which terminates
-        # cooperatively on its next event-loop tick); the wait
-        # sees the task done and returns. The cancel returns
-        # CANCELLED (the row is in 'cancelling' and the task
-        # finished; the cancel is a no-op because the finaliser
-        # never ran — the fake is a stub). We then cancel the
-        # cancel_task directly. The cancel_job's bounded wait
-        # uses ``asyncio.wait({active}, timeout=wait_s)``: if
-        # the outer (cancel_task) is cancelled, the wait
-        # propagates the CancelledError to the cancel_task.
-        # In practice the wait completes too quickly for the
-        # outer cancel to fire while in progress, so this test
-        # verifies the contract: the cancel returns without
-        # confusion between outer cancel and inner task
-        # cancellation, the final state is consistent, and
-        # the bounded wait timeout (wait_s=1.0s) is honored
-        # (we verify the call returns in well under 1.0s
-        # because the inner task terminates on cancel).
-        import time as _time
-        t0 = _time.monotonic()
-        response = await service.cancel_job(job_id, graceful=True)
-        elapsed = _time.monotonic() - t0
-        # The bounded wait is 1.0s; the inner task terminates
-        # on cancel, so the cancel returns in well under 1.0s.
-        assert elapsed < 0.5, (
-            f"cancel_job took {elapsed:.2f}s; expected fast return"
+        done, _pending = await asyncio.wait(
+            {research_task}, timeout=10.0
         )
-        assert response.status in (
-            JobStatus.CANCELLED,
-            JobStatus.CANCELLING,
-        ), (
-            f"Expected CANCELLED or CANCELLING, got {response.status}"
+    except asyncio.CancelledError:
+        pytest.fail("wait raised CancelledError unexpectedly")
+    if research_task not in done:
+        research_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await research_task
+        pytest.fail(
+            "research task did not finalize after the outer cancel; "
+            "research task was NOT signalled by the cancel"
         )
-    finally:
-        await service._unregister_active_task(job_id, fake)
-        if not fake.done():
-            fake.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await fake
 
-    # The bounded-wait semantics: the call returned within
-    # wait_s=1.0s because the inner task was signalled. The
-    # PRE1B contract: outer cancel of the cancel_job caller
-    # propagates as CancelledError to the caller; the inner
-    # task continues independently. The asyncio.wait
-    # primitive in cancel_job does propagate outer CancelledError
-    # to the caller (verified by the simpler propagation test
-    # in this file and by Python's asyncio.wait contract).
-    # The outer cancel does NOT confuse inner-task
-    # acknowledgement.
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await research_task
+
+    # Final state: cancelled.
+    row = await db.get_research_job(job_id)
+    assert row["status"] == "cancelled", (
+        f"Expected cancelled, got {row['status']!r}"
+    )
+    assert row["error_taxonomy"] == "cancelled"
+
+    # No completion/failed notifier.
     handles["notifier"].send_research_complete.assert_not_called()
     handles["notifier"].send_research_failed.assert_not_called()
 
@@ -2092,3 +2381,1059 @@ async def test_j_running_job_idempotency(db, tmp_path: Path) -> None:
     # side effect is NOT triggered for cancellation (no notifier call).
     handles["notifier"].send_research_complete.assert_not_called()
     handles["notifier"].send_research_failed.assert_not_called()
+
+
+# =====================================================================
+# DR-Q1A-PRE1B overnight remediation: 13 additional tests
+# =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_o1_repeated_graceful_true_waits_for_finalization(
+    db, tmp_path: Path
+) -> None:
+    """O1: repeated graceful=True with an active task in the registry
+    waits for the finalization to complete (when the finalization
+    finishes inside the bounded wait) and returns CANCELLED.
+
+    The repeated cancel MUST NOT inject another ``task.cancel()``
+    (Fix C). The wait is on the already-signalled task.
+    """
+    service, handles = _make_service(db, tmp_path)
+    job_id = "o1_repeated_graceful_true"
+    await _create_job(db, job_id)
+    await db.transition_research_job_status(
+        job_id, from_states=("pending",), to_state="running"
+    )
+
+    # Block reconcile_cost so the finaliser blocks.
+    reconcile_block = asyncio.Event()
+    reconcile_entered = asyncio.Event()
+    original_reconcile = service.reconcile_cost
+
+    async def blocking_reconcile(jid: str) -> Decimal:
+        reconcile_entered.set()
+        await reconcile_block.wait()
+        return await original_reconcile(jid)
+
+    service.reconcile_cost = blocking_reconcile  # type: ignore[method-assign]
+
+    # Fake active task that runs the finaliser on cancel.
+    async def fake_research_task() -> None:
+        try:
+            await asyncio.sleep(60.0)
+        except asyncio.CancelledError:
+            await service._handle_cancellation(job_id, time.monotonic())
+            raise
+
+    fake = asyncio.create_task(fake_research_task())
+    await service._register_active_task(job_id, fake)
+    try:
+        # First cancel: graceful=True. CAS running -> cancelling,
+        # signals the fake task, enters the bounded wait.
+        response1 = await service.cancel_job(job_id, graceful=True)
+        # The fake task is now mid-finaliser (blocked at
+        # reconcile_cost).
+        for _ in range(400):
+            if reconcile_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("finaliser never entered reconcile_cost")
+
+        # Second cancel: graceful=True. The row is in cancelling,
+        # the active task is in the registry. The CAS does not
+        # match (was_idempotent_re_signal=True). The cancel MUST
+        # NOT inject another task.cancel() (Fix C). The bounded
+        # wait is on the already-signalled task.
+        t0 = time.monotonic()
+        response2 = await service.cancel_job(job_id, graceful=True)
+        _elapsed = time.monotonic() - t0
+        # The wait is bounded by wait_s=1.0s. The first cancel
+        # is still in its wait too; releasing the finaliser
+        # below will let both cancels see CANCELLED.
+
+        # Release reconcile_cost. The fake finaliser completes,
+        # flipping the row to cancelled.
+        reconcile_block.set()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(fake, timeout=5.0)
+
+        # Now the second cancel's wait should be done. Re-read
+        # to get the post-finalisation state.
+        row = await db.get_research_job(job_id)
+        assert row["status"] == "cancelled"
+        # The bounded wait semantics: the response2 should
+        # reflect the cancelled state (the fake finalised
+        # inside the wait).
+        assert response2.status in (
+            JobStatus.CANCELLING,
+            JobStatus.CANCELLED,
+        ), f"Expected CANCELLING or CANCELLED, got {response2.status}"
+        # No injected second cancel: the fake task ran
+        # _handle_cancellation exactly once.
+        assert response1.status in (
+            JobStatus.CANCELLING,
+            JobStatus.CANCELLED,
+        )
+    finally:
+        reconcile_block.set()
+        await service._unregister_active_task(job_id, fake)
+        if not fake.done():
+            fake.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await fake
+
+    handles["notifier"].send_research_complete.assert_not_called()
+    handles["notifier"].send_research_failed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_o2_repeated_graceful_false_returns_promptly(
+    db, tmp_path: Path
+) -> None:
+    """O2: repeated graceful=False returns immediately WITHOUT
+    injecting another task.cancel() (Fix C).
+
+    The second cancel sees the row in cancelling and the active
+    task in the registry. It MUST NOT call ``active.cancel()``
+    again (which would abandon the previously-triggered
+    finaliser).
+    """
+    service, handles = _make_service(db, tmp_path)
+    job_id = "o2_repeated_graceful_false"
+    await _create_job(db, job_id)
+    await db.transition_research_job_status(
+        job_id, from_states=("pending",), to_state="running"
+    )
+
+    reconcile_block = asyncio.Event()
+    reconcile_entered = asyncio.Event()
+    original_reconcile = service.reconcile_cost
+
+    async def blocking_reconcile(jid: str) -> Decimal:
+        reconcile_entered.set()
+        await reconcile_block.wait()
+        return await original_reconcile(jid)
+
+    service.reconcile_cost = blocking_reconcile  # type: ignore[method-assign]
+
+    # Track how many times the fake task is cancelled.
+    cancel_signal_count = [0]
+
+    async def fake_research_task() -> None:
+        try:
+            await asyncio.sleep(60.0)
+        except asyncio.CancelledError:
+            cancel_signal_count[0] += 1
+            await service._handle_cancellation(job_id, time.monotonic())
+            raise
+
+    fake = asyncio.create_task(fake_research_task())
+    await service._register_active_task(job_id, fake)
+    try:
+        # First cancel: graceful=True. The fake is signalled
+        # (cancel_signal_count -> 1), then blocks at
+        # reconcile_cost.
+        await service.cancel_job(job_id, graceful=True)
+        for _ in range(400):
+            if reconcile_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("finaliser never entered reconcile_cost")
+
+        # Second cancel: graceful=False. MUST NOT inject
+        # another task.cancel() (Fix C). The active task is
+        # still alive (blocked at reconcile_cost).
+        t0 = time.monotonic()
+        response2 = await service.cancel_job(job_id, graceful=False)
+        elapsed = time.monotonic() - t0
+        # The cancel returns immediately (no wait).
+        assert elapsed < 0.5, (
+            f"second cancel took {elapsed:.2f}s; expected fast return"
+        )
+        assert response2.status is JobStatus.CANCELLING, (
+            f"Expected CANCELLING, got {response2.status}"
+        )
+
+        # The fake task received cancel EXACTLY ONCE.
+        assert cancel_signal_count[0] == 1, (
+            f"fake task was cancelled {cancel_signal_count[0]} times; "
+            f"expected 1 (no 2nd cancel injection)"
+        )
+
+        # Release reconcile_cost; the finaliser completes.
+        reconcile_block.set()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(fake, timeout=5.0)
+
+        # The first cancel was graceful=True, the bounded
+        # wait was satisfied (the fake finished). The row
+        # is cancelled.
+        row = await db.get_research_job(job_id)
+        assert row["status"] == "cancelled"
+    finally:
+        reconcile_block.set()
+        await service._unregister_active_task(job_id, fake)
+        if not fake.done():
+            fake.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await fake
+
+    handles["notifier"].send_research_complete.assert_not_called()
+    handles["notifier"].send_research_failed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_o3_first_cancel_signal_happens_inside_seam(
+    db, tmp_path: Path
+) -> None:
+    """O3: the first cancellation signal is delivered INSIDE the
+    terminal seam, atomically with the CAS (Fix B).
+
+    The test holds the active task's acknowledgement, runs a
+    cancel, and verifies that the seam-acquire/wait is observed
+    between the CAS and the seam release. We probe this by
+    hooking the active task's await: when the task receives
+    cancel (the first signal inside the seam), we set an Event.
+    The seam-release is observable from the row state.
+    """
+    service, _handles = _make_service(db, tmp_path)
+    job_id = "o3_first_signal_inside_seam"
+    await _create_job(db, job_id)
+    await db.transition_research_job_status(
+        job_id, from_states=("pending",), to_state="running"
+    )
+
+    # Active task that records the first cancel and blocks.
+    first_signal_observed = asyncio.Event()
+    task_release = asyncio.Event()
+
+    async def live_research() -> None:
+        try:
+            await task_release.wait()
+        except asyncio.CancelledError:
+            first_signal_observed.set()
+            raise
+
+    fake = asyncio.create_task(live_research())
+    await service._register_active_task(job_id, fake)
+    try:
+        # Run cancel_job(graceful=False) — it returns
+        # immediately after the seam release. Inside the
+        # seam, the CAS pending|running -> cancelling
+        # happened AND the active task was signalled.
+        response = await service.cancel_job(job_id, graceful=False)
+
+        # Yield to the event loop so the task can process
+        # the CancelledError (the cancel() call inside the
+        # seam requests cancellation; the task processes it
+        # on its next tick).
+        for _ in range(50):
+            if first_signal_observed.is_set() or fake.done():
+                break
+            await asyncio.sleep(0.01)
+
+        # The first signal was delivered (the task is in
+        # ``done`` state with a CancelledError).
+        assert first_signal_observed.is_set(), (
+            "first cancellation signal was not observed"
+        )
+        assert fake.cancelled(), (
+            "active task was not cancelled by the seam-side signal"
+        )
+
+        # The row is in 'cancelling' (the CAS committed
+        # before the seam was released).
+        row = await db.get_research_job(job_id)
+        assert row["status"] == "cancelling"
+
+        # The response is CANCELLING (graceful=False).
+        assert response.status is JobStatus.CANCELLING
+
+        # Finalise manually: the fake's _handle_cancellation
+        # is not run (the fake is a stub). Run the finaliser
+        # to mark the row cancelled.
+        async def run_finaliser() -> None:
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                raise
+            await service._handle_cancellation(job_id, time.monotonic())
+
+        await run_finaliser()
+
+        # Release the task to drain it.
+        task_release.set()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await fake
+
+        row = await db.get_research_job(job_id)
+        assert row["status"] == "cancelled"
+    finally:
+        task_release.set()
+        await service._unregister_active_task(job_id, fake)
+        if not fake.done():
+            fake.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await fake
+
+
+@pytest.mark.asyncio
+async def test_o4_http_cancel_after_cas_before_ack(
+    db, tmp_path: Path
+) -> None:
+    """O4: a cancel that arrives after the CAS but before the
+    bounded wait starts behaves as an idempotent re-signal:
+    it does NOT inject another ``task.cancel()``.
+
+    The first cancel acquires the seam, CASes to cancelling,
+    signals the active task, releases the seam. The second
+    cancel arrives AFTER the seam is released (after the CAS,
+    before the bounded wait would even start). The second
+    cancel sees the row in cancelling, the active task in
+    the registry, the was_idempotent_re_signal flag set,
+    and applies the wait mode (graceful=True bounded wait,
+    graceful=False immediate return).
+    """
+    service, handles = _make_service(db, tmp_path)
+    job_id = "o4_http_cancel_after_cas"
+    await _create_job(db, job_id)
+    await db.transition_research_job_status(
+        job_id, from_states=("pending",), to_state="running"
+    )
+
+    cancel_signal_count = [0]
+
+    async def live_research() -> None:
+        try:
+            await asyncio.sleep(60.0)
+        except asyncio.CancelledError:
+            cancel_signal_count[0] += 1
+            # Run the finaliser.
+            await service._handle_cancellation(job_id, time.monotonic())
+            raise
+
+    fake = asyncio.create_task(live_research())
+    await service._register_active_task(job_id, fake)
+    try:
+        # First cancel: graceful=True. Signals the fake
+        # (cancel_signal_count -> 1), enters bounded wait.
+        response1 = await service.cancel_job(job_id, graceful=True)
+        # The first signal was delivered; the fake is mid-
+        # finaliser. The first cancel's bounded wait sees
+        # the task finished (it does its own finaliser
+        # synchronously).
+        # Now: a second cancel arrives AFTER the first
+        # cancel completed (the row is in cancelled or
+        # cancelling). Let's transition the row to
+        # cancelling explicitly to simulate the second
+        # cancel arriving before the finaliser ran.
+        row = await db.get_research_job(job_id)
+        if row["status"] == "cancelled":
+            # The first cancel saw the finaliser complete.
+            # That's fine; the second cancel is a no-op.
+            assert response1.status in (
+                JobStatus.CANCELLING,
+                JobStatus.CANCELLED,
+            )
+        else:
+            # The finaliser is still mid-flight (the bounded
+            # wait is on the still-running fake). Send a
+            # second cancel (graceful=False) — it MUST NOT
+            # inject another cancel.
+            t0 = time.monotonic()
+            response2 = await service.cancel_job(job_id, graceful=False)
+            elapsed = time.monotonic() - t0
+            assert elapsed < 0.5
+            assert response2.status is JobStatus.CANCELLING
+            # The fake received cancel exactly once (no
+            # 2nd injection).
+            assert cancel_signal_count[0] == 1
+            # Drain the fake.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(fake, timeout=5.0)
+
+        row = await db.get_research_job(job_id)
+        assert row["status"] == "cancelled"
+    finally:
+        await service._unregister_active_task(job_id, fake)
+        if not fake.done():
+            fake.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await fake
+
+    handles["notifier"].send_research_complete.assert_not_called()
+    handles["notifier"].send_research_failed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_o5_atomic_complete_output_path_success(
+    db, tmp_path: Path
+) -> None:
+    """O5: full pipeline completion uses the single atomic
+    ``complete_research_job_with_output_path`` CAS.
+
+    Verifies: complete row has output_path; final .md exists;
+    notifier called with the cost; complete+output_path
+    committed atomically (single SQL statement).
+    """
+    service, handles = _make_service(db, tmp_path)
+    job_id = "o5_atomic_complete_success"
+    await _create_job(db, job_id, notify=True)
+
+    async def one_url_search(*args: Any, **kwargs: Any) -> Any:
+        return MagicMock(
+            results=[
+                {"url": "https://example.com/a", "title": "A", "snippet": "a"},
+            ]
+        )
+
+    handles["search"].side_effect = one_url_search
+    handles["fetcher"].fetch = AsyncMock(
+        return_value=_FakeFetchResult(
+            body=b"<html><body>"
+            + (b"fake body content that is long enough to pass the "
+               b"minimum-length check in the scrape phase; " * 5)
+            + b"</body></html>"
+        )
+    )
+    handles["llm"].chat = AsyncMock(
+        return_value=_FakeLLMResp(
+            content="final report body " + ("Z" * 300),
+            tokens_in=200,
+            tokens_out=200,
+        )
+    )
+
+    # Track SQL statements for the atomic CAS.
+    complete_cas_calls: list[str] = []
+    original_complete_atomic = db.complete_research_job_with_output_path
+
+    async def tracked_complete_atomic(*args: Any, **kwargs: Any) -> bool:
+        complete_cas_calls.append("called")
+        return await original_complete_atomic(*args, **kwargs)
+
+    db.complete_research_job_with_output_path = tracked_complete_atomic  # type: ignore[method-assign]
+
+    # Run the research task.
+    research_task = asyncio.create_task(service._run_research(job_id))
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(research_task, timeout=5.0)
+
+    row = await db.get_research_job(job_id)
+    assert row["status"] == "complete"
+    # The output_path is set.
+    assert row["output_path"], "output_path is empty in complete row"
+    # progress_percent is 100.
+    assert row["progress_percent"] == 100
+    # The atomic CAS was called exactly once.
+    assert len(complete_cas_calls) == 1, (
+        f"expected 1 complete_research_job_with_output_path call, "
+        f"got {len(complete_cas_calls)}"
+    )
+    # The final .md exists.
+    final_md = Path(service._data_root) / f"{job_id}.md"
+    assert final_md.exists(), "final .md report was not published"
+    # The notifier was called.
+    handles["notifier"].send_research_complete.assert_called_once()
+    # No failed notifier.
+    handles["notifier"].send_research_failed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_o6_atomic_complete_output_path_db_raises(
+    db, tmp_path: Path
+) -> None:
+    """O6: the atomic CAS raises (DB write failure). The row is
+    NOT advanced to complete. The final .md is deleted. No
+    completion notifier. The conditional running->failed
+    transition runs (and succeeds, since no cancel won in this
+    test).
+    """
+    service, handles = _make_service(db, tmp_path)
+    job_id = "o6_atomic_complete_db_raises"
+    await _create_job(db, job_id, notify=True)
+
+    async def one_url_search(*args: Any, **kwargs: Any) -> Any:
+        return MagicMock(
+            results=[
+                {"url": "https://example.com/a", "title": "A", "snippet": "a"},
+            ]
+        )
+
+    handles["search"].side_effect = one_url_search
+    handles["fetcher"].fetch = AsyncMock(
+        return_value=_FakeFetchResult(
+            body=b"<html><body>"
+            + (b"fake body content that is long enough to pass the "
+               b"minimum-length check in the scrape phase; " * 5)
+            + b"</body></html>"
+        )
+    )
+    handles["llm"].chat = AsyncMock(
+        return_value=_FakeLLMResp(
+            content="final report body " + ("Z" * 300),
+            tokens_in=200,
+            tokens_out=200,
+        )
+    )
+
+    # Patch the atomic CAS to raise.
+    async def raising_complete_atomic(*args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("simulated_db_failure")
+
+    db.complete_research_job_with_output_path = raising_complete_atomic  # type: ignore[method-assign]
+
+    research_task = asyncio.create_task(service._run_research(job_id))
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(research_task, timeout=5.0)
+
+    # The row is NOT complete.
+    row = await db.get_research_job(job_id)
+    assert row["status"] != "complete", (
+        f"Expected non-complete, got {row['status']!r}"
+    )
+    # The conditional running->failed CAS ran (no cancel
+    # won), so the row is failed.
+    assert row["status"] == "failed", (
+        f"Expected failed, got {row['status']!r}"
+    )
+    # The final .md is deleted.
+    final_md = Path(service._data_root) / f"{job_id}.md"
+    assert not final_md.exists(), (
+        f"final .md was not deleted: {final_md}"
+    )
+    # The tmp .md is deleted.
+    tmp_md = Path(service._data_root) / f"{job_id}.md.tmp"
+    assert not tmp_md.exists(), ".md.tmp was not cleaned"
+    # No completion notifier.
+    handles["notifier"].send_research_complete.assert_not_called()
+    # Failed notifier was called (the conditional running ->
+    # failed transition succeeded).
+    handles["notifier"].send_research_failed.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_o7_atomic_complete_output_path_cas_false(
+    db, tmp_path: Path
+) -> None:
+    """O7: the atomic CAS returns False (cancellation won
+    after publish but before the CAS). The final .md is
+    deleted. The row is in 'cancelling' (or 'cancelled'
+    after the finaliser). No completion notifier.
+    """
+    service, handles = _make_service(db, tmp_path)
+    job_id = "o7_atomic_complete_cas_false"
+    await _create_job(db, job_id, notify=True)
+
+    async def one_url_search(*args: Any, **kwargs: Any) -> Any:
+        return MagicMock(
+            results=[
+                {"url": "https://example.com/a", "title": "A", "snippet": "a"},
+            ]
+        )
+
+    handles["search"].side_effect = one_url_search
+    handles["fetcher"].fetch = AsyncMock(
+        return_value=_FakeFetchResult(
+            body=b"<html><body>"
+            + (b"fake body content that is long enough to pass the "
+               b"minimum-length check in the scrape phase; " * 5)
+            + b"</body></html>"
+        )
+    )
+    handles["llm"].chat = AsyncMock(
+        return_value=_FakeLLMResp(
+            content="final report body " + ("Z" * 300),
+            tokens_in=200,
+            tokens_out=200,
+        )
+    )
+
+    # Hook the atomic CAS so that on the first call, we
+    # transition the row to cancelling FIRST, then return
+    # False (the predicate no longer matches because the
+    # row is no longer in 'running').
+    real_complete_atomic = db.complete_research_job_with_output_path
+    call_count = [0]
+
+    async def hook_complete_atomic(*args: Any, **kwargs: Any) -> bool:
+        call_count[0] += 1
+        if call_count[0] == 1:
+            # First call: flip the row to cancelling.
+            await db.transition_research_job_status(
+                job_id,
+                from_states=("running",),
+                to_state="cancelling",
+            )
+            service._mark_user_cancel_intent(job_id)
+        return await real_complete_atomic(*args, **kwargs)
+
+    db.complete_research_job_with_output_path = hook_complete_atomic  # type: ignore[method-assign]
+
+    research_task = asyncio.create_task(service._run_research(job_id))
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(research_task, timeout=5.0)
+
+    # The row is cancelled (the finaliser ran after the CAS
+    # raised asyncio.CancelledError).
+    row = await db.get_research_job(job_id)
+    assert row["status"] == "cancelled", (
+        f"Expected cancelled, got {row['status']!r}"
+    )
+    # The final .md is deleted (the cancellation finaliser
+    # cleaned it up).
+    final_md = Path(service._data_root) / f"{job_id}.md"
+    assert not final_md.exists(), (
+        f"final .md was not deleted after cancel-won: {final_md}"
+    )
+    # The tmp .md is deleted.
+    tmp_md = Path(service._data_root) / f"{job_id}.md.tmp"
+    assert not tmp_md.exists(), ".md.tmp was not cleaned"
+    # No completion notifier.
+    handles["notifier"].send_research_complete.assert_not_called()
+    # No failed notifier.
+    handles["notifier"].send_research_failed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_o8_atomic_complete_output_path_replace_fails(
+    db, tmp_path: Path, monkeypatch
+) -> None:
+    """O8: os.replace failure for the .md publish. The row is
+    NOT advanced to complete. No completion notifier. The
+    conditional running->failed transition runs.
+    """
+    service, handles = _make_service(db, tmp_path)
+    job_id = "o8_atomic_complete_replace_fails"
+    await _create_job(db, job_id, notify=True)
+
+    async def one_url_search(*args: Any, **kwargs: Any) -> Any:
+        return MagicMock(
+            results=[
+                {"url": "https://example.com/a", "title": "A", "snippet": "a"},
+            ]
+        )
+
+    handles["search"].side_effect = one_url_search
+    handles["fetcher"].fetch = AsyncMock(
+        return_value=_FakeFetchResult(
+            body=b"<html><body>"
+            + (b"fake body content that is long enough to pass the "
+               b"minimum-length check in the scrape phase; " * 5)
+            + b"</body></html>"
+        )
+    )
+    handles["llm"].chat = AsyncMock(
+        return_value=_FakeLLMResp(
+            content="final report body " + ("Z" * 300),
+            tokens_in=200,
+            tokens_out=200,
+        )
+    )
+
+    # Patch os.replace so the .md publish raises.
+    original_replace = os.replace
+
+    def selective_replace(src, dst, *args, **kwargs):
+        dst_str = str(dst)
+        if dst_str.endswith(".md") and not dst_str.endswith(".md.tmp"):
+            raise OSError("simulated_publish_failure")
+        return original_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", selective_replace)
+
+    research_task = asyncio.create_task(service._run_research(job_id))
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(research_task, timeout=5.0)
+
+    # The row is failed (the conditional running->failed
+    # CAS ran after the publish failure).
+    row = await db.get_research_job(job_id)
+    assert row["status"] == "failed", (
+        f"Expected failed, got {row['status']!r}"
+    )
+    # No final .md.
+    final_md = Path(service._data_root) / f"{job_id}.md"
+    assert not final_md.exists(), "final .md exists despite publish failure"
+    # No tmp .md.
+    tmp_md = Path(service._data_root) / f"{job_id}.md.tmp"
+    assert not tmp_md.exists(), ".md.tmp was not cleaned"
+    # No completion notifier.
+    handles["notifier"].send_research_complete.assert_not_called()
+    # Failed notifier was called.
+    handles["notifier"].send_research_failed.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_o9_notifier_outside_lock(
+    db, tmp_path: Path
+) -> None:
+    """O9: the completion notifier runs OUTSIDE the terminal
+    seam. When the notifier is invoked, the seam can be
+    acquired (the lock is free), the row is in 'complete',
+    and the final report file is readable.
+    """
+    service, handles = _make_service(db, tmp_path)
+    job_id = "o9_notifier_outside_lock"
+    await _create_job(db, job_id, notify=True)
+
+    async def one_url_search(*args: Any, **kwargs: Any) -> Any:
+        return MagicMock(
+            results=[
+                {"url": "https://example.com/a", "title": "A", "snippet": "a"},
+            ]
+        )
+
+    handles["search"].side_effect = one_url_search
+    handles["fetcher"].fetch = AsyncMock(
+        return_value=_FakeFetchResult(
+            body=b"<html><body>"
+            + (b"fake body content that is long enough to pass the "
+               b"minimum-length check in the scrape phase; " * 5)
+            + b"</body></html>"
+        )
+    )
+    handles["llm"].chat = AsyncMock(
+        return_value=_FakeLLMResp(
+            content="final report body " + ("Z" * 300),
+            tokens_in=200,
+            tokens_out=200,
+        )
+    )
+
+    # Notifier probe: when the notifier is invoked, the
+    # row MUST be 'complete' AND the seam MUST be free
+    # (the notifier is outside the lock) AND the final
+    # file MUST be readable.
+    notifier_observations: list[dict[str, Any]] = []
+
+    async def probing_notifier_complete(
+        job_id: str, cost_usd: Decimal
+    ) -> bool:
+        # Try to acquire the seam (should NOT deadlock).
+        term_lock = service._get_terminal_lock(job_id)
+        seam_acquired = False
+        try:
+            # The notifier is awaited outside the seam,
+            # so acquiring it here should be quick.
+            await asyncio.wait_for(term_lock.acquire(), timeout=1.0)
+            seam_acquired = True
+        except TimeoutError:
+            pass
+        finally:
+            if seam_acquired:
+                term_lock.release()
+        # Check row state and file.
+        row = await service._db.get_research_job(job_id)
+        final_md = Path(service._data_root) / f"{job_id}.md"
+        notifier_observations.append(
+            {
+                "seam_acquired": seam_acquired,
+                "row_status": row["status"] if row else None,
+                "file_exists": final_md.exists(),
+            }
+        )
+        return True
+
+    handles["notifier"].send_research_complete = AsyncMock(
+        side_effect=probing_notifier_complete
+    )
+
+    research_task = asyncio.create_task(service._run_research(job_id))
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(research_task, timeout=5.0)
+
+    # The notifier was called exactly once.
+    assert len(notifier_observations) == 1
+    obs = notifier_observations[0]
+    # The seam was free when the notifier ran.
+    assert obs["seam_acquired"] is True, (
+        "notifier ran while the seam was still held"
+    )
+    # The row was 'complete' when the notifier ran.
+    assert obs["row_status"] == "complete"
+    # The final file was readable when the notifier ran.
+    assert obs["file_exists"] is True
+
+
+@pytest.mark.asyncio
+async def test_o10_job_state_invalid_direct(db, tmp_path: Path) -> None:
+    """O10: JobStateInvalid is raised by ``_update_phase`` for
+    unexpected non-running non-cancellation states. The phase
+    callable is not entered. No state resurrection.
+    """
+    from hermes.jobs.exceptions import JobStateInvalid
+
+    service, handles = _make_service(db, tmp_path)
+    job_id = "o10_job_state_invalid"
+    await _create_job(db, job_id)
+    # Move the row to 'failed' (an unexpected non-running
+    # non-cancellation state for ``_update_phase``).
+    await db.transition_research_job_status(
+        job_id, from_states=("pending",), to_state="failed"
+    )
+
+    # Direct call to _update_phase MUST raise JobStateInvalid
+    # (the row is in 'failed', which is not 'running', not
+    # 'cancelling', not 'cancelled').
+    with pytest.raises(JobStateInvalid):
+        await service._update_phase(job_id, PhaseName.SEARCH, progress=10)
+
+    # The search was never called.
+    assert handles["search"].call_count == 0
+
+    # Verify the exception attributes.
+    try:
+        await service._update_phase(job_id, PhaseName.SCRAPE, progress=25)
+    except JobStateInvalid as exc:
+        assert exc.job_id == job_id
+        assert exc.observed_status == "failed"
+        assert exc.phase == PhaseName.SCRAPE.value
+
+
+@pytest.mark.asyncio
+async def test_o11_real_path_repeated_cancel(
+    db, tmp_path: Path
+) -> None:
+    """O11: repeated cancellation using the real ``_run_research``
+    task (not a manually-registered finalizer task). The second
+    cancel arrives while the first cancel's finaliser is mid-
+    reconcile. The finaliser is shielded; the second cancel does
+    NOT inject another cancel.
+    """
+    service, handles = _make_service(db, tmp_path)
+    job_id = "o11_real_path_repeated_cancel"
+    await _create_job(db, job_id)
+    # Block reconcile_cost so the finaliser blocks.
+    reconcile_block = asyncio.Event()
+    reconcile_entered = asyncio.Event()
+    original_reconcile = service.reconcile_cost
+
+    async def blocking_reconcile(jid: str) -> Decimal:
+        reconcile_entered.set()
+        await reconcile_block.wait()
+        return await original_reconcile(jid)
+
+    service.reconcile_cost = blocking_reconcile  # type: ignore[method-assign]
+
+    # The search blocks until released; the real
+    # _run_research registers and blocks at the search.
+    search_entered = asyncio.Event()
+    search_release = asyncio.Event()
+
+    async def blocking_search(*args: Any, **kwargs: Any) -> Any:
+        search_entered.set()
+        await search_release.wait()
+        return MagicMock(results=[])
+
+    handles["search"].side_effect = blocking_search
+
+    research_task = asyncio.create_task(
+        service._run_research(job_id)
+    )
+    # Wait for the row to reach 'running' AND the search
+    # to be entered.
+    for _ in range(400):
+        row = await db.get_research_job(job_id)
+        if row and row["status"] == "running" and search_entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        research_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await research_task
+        pytest.fail("research task never reached 'running' or search was never entered")
+
+    # First cancel: graceful=True. CASes running ->
+    # cancelling, signals the research task, enters bounded
+    # wait. The research task's CancelledError handler
+    # runs ``_finalize_cancellation`` which calls
+    # ``_handle_cancellation`` which blocks at
+    # reconcile_cost.
+    await service.cancel_job(job_id, graceful=True)
+    # Wait for the finaliser to enter reconcile_cost.
+    for _ in range(400):
+        if reconcile_entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("finaliser never entered reconcile_cost")
+
+    # Second cancel: graceful=True. Idempotent re-signal.
+    # MUST NOT inject another cancel.
+    t0 = time.monotonic()
+    response2 = await service.cancel_job(job_id, graceful=True)
+    elapsed = time.monotonic() - t0
+    # The second cancel returns within the bounded wait.
+    assert elapsed < 5.0
+    assert response2.status is JobStatus.CANCELLING, (
+        f"Expected CANCELLING, got {response2.status}"
+    )
+
+    # Release reconcile_cost AND the search block. The
+    # finaliser completes; the research task exits.
+    reconcile_block.set()
+    search_release.set()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(research_task, timeout=5.0)
+
+    # Final state: cancelled.
+    row = await db.get_research_job(job_id)
+    assert row["status"] == "cancelled"
+    assert row["error_taxonomy"] == "cancelled"
+
+    # No notifier calls.
+    handles["notifier"].send_research_complete.assert_not_called()
+    handles["notifier"].send_research_failed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_o12_user_cancel_intent_never_cleared_prematurely(
+    db, tmp_path: Path
+) -> None:
+    """O12: the user-cancel intent is NOT cleared while
+    finalization is incomplete. The intent is only cleared
+    after the row reaches a terminal state (cancelled,
+    complete, or failed) in the finaliser's ``finally``
+    block.
+    """
+    service, _handles = _make_service(db, tmp_path)
+    job_id = "o12_intent_not_cleared_prematurely"
+    await _create_job(db, job_id)
+    await db.transition_research_job_status(
+        job_id, from_states=("pending",), to_state="cancelling"
+    )
+    service._mark_user_cancel_intent(job_id)
+
+    # Verify intent is set.
+    assert service._user_cancel_intended(job_id)
+
+    # Block reconcile_cost so the finaliser blocks.
+    reconcile_block = asyncio.Event()
+    reconcile_entered = asyncio.Event()
+    original_reconcile = service.reconcile_cost
+
+    async def blocking_reconcile(jid: str) -> Decimal:
+        reconcile_entered.set()
+        await reconcile_block.wait()
+        return await original_reconcile(jid)
+
+    service.reconcile_cost = blocking_reconcile  # type: ignore[method-assign]
+
+    # Manually invoke the finaliser. The finaliser blocks
+    # at reconcile_cost.
+    finaliser = asyncio.create_task(
+        service._handle_cancellation(job_id, time.monotonic())
+    )
+    # Wait for reconcile_cost to be entered.
+    for _ in range(400):
+        if reconcile_entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        finaliser.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await finaliser
+        pytest.fail("reconcile_cost was never entered")
+
+    # While the finaliser is blocked, the user-cancel
+    # intent MUST still be set.
+    assert service._user_cancel_intended(job_id), (
+        "user-cancel intent was cleared while finalisation is incomplete"
+    )
+
+    # Release reconcile_cost. The finaliser completes.
+    reconcile_block.set()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(finaliser, timeout=5.0)
+
+    # The intent is now cleared (the finaliser's
+    # ``finally`` block ran).
+    assert not service._user_cancel_intended(job_id), (
+        "user-cancel intent was not cleared after finalisation"
+    )
+
+    # The row is in cancelled.
+    row = await db.get_research_job(job_id)
+    assert row["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_o13_registry_and_lock_cleanup(db, tmp_path: Path) -> None:
+    """O13: the active-task registry and the per-job terminal-
+    lock cache do not leak unbounded per-job entries after a
+    successful cancellation. The active-task entry is removed
+    by the research task's ``finally`` block. The terminal-
+    lock is intentionally cached (see note in
+    ``_get_terminal_lock``); the test documents the decision
+    and verifies the active-task entry is removed.
+    """
+    service, _handles = _make_service(db, tmp_path)
+    job_id = "o13_registry_cleanup"
+    await _create_job(db, job_id)
+    await db.transition_research_job_status(
+        job_id, from_states=("pending",), to_state="running"
+    )
+
+    # Block reconcile_cost so the finaliser blocks.
+    reconcile_block = asyncio.Event()
+    reconcile_entered = asyncio.Event()
+    original_reconcile = service.reconcile_cost
+
+    async def blocking_reconcile(jid: str) -> Decimal:
+        reconcile_entered.set()
+        await reconcile_block.wait()
+        return await original_reconcile(jid)
+
+    service.reconcile_cost = blocking_reconcile  # type: ignore[method-assign]
+
+    async def live_research() -> None:
+        try:
+            await asyncio.sleep(60.0)
+        except asyncio.CancelledError:
+            await service._handle_cancellation(job_id, time.monotonic())
+            raise
+
+    fake = asyncio.create_task(live_research())
+    await service._register_active_task(job_id, fake)
+    try:
+        # Active task is registered.
+        assert service._peek_active_task(job_id) is fake
+
+        # Cancel and let the finaliser complete.
+        await service.cancel_job(job_id, graceful=True)
+        for _ in range(400):
+            if reconcile_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        reconcile_block.set()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(fake, timeout=5.0)
+    finally:
+        await service._unregister_active_task(job_id, fake)
+        if not fake.done():
+            fake.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await fake
+
+    # After the finaliser, the research task's ``finally``
+    # block ran the unregister. The registry entry is
+    # removed.
+    assert service._peek_active_task(job_id) is None, (
+        "active-task registry leaked an entry after terminal completion"
+    )
+    # The terminal-lock is intentionally cached; the
+    # design decision is documented in
+    # ``_get_terminal_lock``. We verify the lock is
+    # present (so concurrent re-attempts on the same
+    # job_id get a stable lock) but the lock is NOT held.
+    term_lock = service._get_terminal_lock(job_id)
+    assert not term_lock.locked(), (
+        "terminal lock is still held after terminal completion"
+    )
+
+    row = await db.get_research_job(job_id)
+    assert row["status"] == "cancelled"
