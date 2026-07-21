@@ -1207,6 +1207,25 @@ class Settings(BaseSettings):
         description="Max output de phase 3 (per-source synthesis).",
     )
 
+    # === DR-Q1A-PRE1B: real Deep Research cancellation contract ===
+    # How long the cancel endpoint (graceful=True) waits for the
+    # local asyncio task to acknowledge cancellation before returning.
+    # This is NOT a provider cancellation timeout, NOT a billing
+    # guarantee, NOT a phase-completion timeout, NOT a hard monetary
+    # boundary. It only bounds how long the HTTP caller waits.
+    deep_research_cancel_wait_s: float = Field(
+        default=5.0,
+        ge=0.1,
+        le=30.0,
+        validation_alias="HERMES_DEEP_RESEARCH_CANCEL_WAIT_S",
+        description=(
+            "Bounded wait (seconds) for cancel endpoint when "
+            "graceful=True. Controls how long the local asyncio "
+            "task has to acknowledge cancellation. Not a provider "
+            "or billing guarantee."
+        ),
+    )
+
     # Notification
     deep_research_notify_via_tg_default: bool = Field(
         default=True,

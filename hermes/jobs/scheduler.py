@@ -277,10 +277,16 @@ class DeepResearchScheduler:
 
         status_value = row[0] if not isinstance(row, dict) else row["status"]
         # Estado terminal: no re-enqueue.
+        # DR-Q1A-PRE1B: ``cancelling`` is now a non-enqueueable
+        # state. A job in ``cancelling`` is being finalized; a
+        # recovery re-enqueue would race the finalizer. Only
+        # ``pending`` is enqueueable; ``running``, ``complete``,
+        # ``failed`` and ``cancelling`` are rejected.
         if status_value in (
             JobStatus.RUNNING.value,
             JobStatus.COMPLETE.value,
             JobStatus.FAILED.value,
+            JobStatus.CANCELLING.value,
             JobStatus.CANCELLED.value,
         ):
             logger.info(
@@ -289,7 +295,7 @@ class DeepResearchScheduler:
             )
             return
 
-        # Estado pending (o cancelling → re-enqueue OK): add_job al scheduler.
+        # Estado pending: add_job al scheduler.
         try:
             self._scheduler.add_job(
                 self._service._run_research,
@@ -311,6 +317,12 @@ class DeepResearchScheduler:
 
     def cancel_scheduled(self, job_id: str) -> bool:
         """Quita job del scheduler si aún no ha corrido.
+
+        DR-Q1A-PRE1B: also handles the rare case where the
+        scheduler still has an entry for a job that is already
+        in ``cancelling`` (e.g. the cancel endpoint won the race
+        before the scheduler entry was removed). The check is
+        best-effort: a missing job returns False without raising.
 
         Returns:
             True si quitó, False si no estaba o ya corría.

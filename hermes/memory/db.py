@@ -3232,10 +3232,122 @@ class Database:
             row = await cur.fetchone()
         return float(row[0]) if row else float(reconciled_cost)
 
-    async def get_today_research_cost(self, user_id: int = 0) -> float:
-        """Suma cost_usd de jobs creados hoy (UTC) para un user. Cancelled excluded.
+    # =====================================================================
+    # DR-Q1A-PRE1B: linearizable status transitions
+    # =====================================================================
+    # The DR-Q1A-PRE1A ``update_research_job_status`` is unconditional
+    # on the row's existing status. PRE1B requires every status
+    # transition to be a single atomic CAS with a status predicate
+    # so that no parallel transition can resurrect a state.
+    # Specifically: a cancellation that wins the race must not be
+    # overwritten by a subsequent ``running -> complete``; a
+    # completion that wins must not be overwritten by a subsequent
+    # ``cancelling -> cancelled``. The atomic SQL UPDATE ... WHERE
+    # status IN (...) guarantees the linearization within the
+    # SQLite engine (single-writer per connection).
+    #
+    # Return value: ``True`` if the predicate matched and the
+    # transition was applied; ``False`` if the predicate did not
+    # match (the row is in a different state, e.g. cancel won
+    # first so the running -> complete transition is a no-op).
+    # Callers MUST check the return value to decide whether to
+    # proceed with downstream side effects (notifier, report,
+    # cleanup).
 
-        Usado por _check_daily_budget (TDD §8.2).
+    async def transition_research_job_status(
+        self,
+        job_id: str,
+        from_states: tuple[str, ...],
+        to_state: str,
+        *,
+        completed_at: str | None = None,
+        error_taxonomy: str | None = None,
+        error_message: str | None = None,
+        progress_percent: int | None = None,
+    ) -> bool:
+        """Atomic CAS transition: status IN from_states -> to_state.
+
+        DR-Q1A-PRE1B cancellation state-machine primitive. Returns
+        whether the transition actually occurred (predicate matched).
+
+        Side-effect column updates are merged into the same
+        statement. ``error_taxonomy='cancelled'`` is permitted and
+        is the documented finalization marker for user-cancelled
+        jobs. ``progress_percent`` is an optional terminal-progress
+        write used by the running -> complete transition to record
+        100% atomically; cancellation transitions leave the existing
+        progress_percent untouched (callers do not pass it).
+        """
+        from hermes.jobs.cost import format_now
+
+        if not from_states:
+            raise ValueError("from_states must be non-empty")
+        # Build the in-list with quoted strings; status column is
+        # a string. Tuple -> comma-separated quoted.
+        in_list = ", ".join("'" + s.replace("'", "''") + "'" for s in from_states)
+        sets = ["status = ?", "updated_at = ?"]
+        params: list = [to_state, format_now()]
+        if completed_at is not None:
+            sets.append("completed_at = ?")
+            params.append(completed_at)
+        if error_taxonomy is not None:
+            sets.append("error_taxonomy = ?")
+            params.append(error_taxonomy)
+        if error_message is not None:
+            sets.append("error_message = ?")
+            params.append(error_message)
+        if progress_percent is not None:
+            sets.append("progress_percent = ?")
+            params.append(int(progress_percent))
+        params.append(job_id)
+        # NB: the status predicate is the last WHERE-clause
+        # conjunct so SQLite's planner can use the
+        # idx_research_jobs_status_* indexes when feasible.
+        cur = await self.conn.execute(
+            f"UPDATE research_jobs SET {', '.join(sets)} "
+            f"WHERE id = ? AND status IN ({in_list})",
+            params,
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def update_research_job_phase(
+        self,
+        job_id: str,
+        current_phase: str,
+        progress_percent: int,
+    ) -> bool:
+        """Conditional phase/progress update: only when status is still ``running``.
+
+        PRE1B invariant: a cancellation that wins between phases
+        must prevent the next phase from beginning. The phase
+        updater refuses to write a phase update for a job that is
+        no longer in ``running`` (i.e. cancellation has won).
+        Returns whether the update was applied.
+        """
+        from hermes.jobs.cost import format_now
+
+        cur = await self.conn.execute(
+            "UPDATE research_jobs SET "
+            "current_phase = ?, progress_percent = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'running'",
+            (current_phase, progress_percent, format_now(), job_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def get_today_research_cost(self, user_id: int = 0) -> float:
+        """Suma cost_usd de jobs creados hoy (UTC) para un user.
+
+        DR-Q1A-PRE1B: cancelled jobs ARE included. ``cancelled execution
+        != zero resource usage`` — a job that was cancelled mid-phase
+        may already have spent real LLM/fetch tokens. Excluding cancelled
+        jobs from the daily sum would understate today's actual
+        paygo-equivalent spend and admit a job that should fail the
+        budget gate. This is estimated paygo-equivalent telemetry, not
+        actual provider billing.
+
+        Used by _check_daily_budget (TDD §8.2).
         """
         from datetime import UTC, datetime
 
@@ -3246,7 +3358,7 @@ class Database:
         )
         async with self.conn.execute(
             "SELECT COALESCE(SUM(cost_usd), 0) FROM research_jobs "
-            "WHERE user_id = ? AND created_at >= ? AND status != 'cancelled'",
+            "WHERE user_id = ? AND created_at >= ?",
             (user_id, today_start),
         ) as cur:
             row = await cur.fetchone()
