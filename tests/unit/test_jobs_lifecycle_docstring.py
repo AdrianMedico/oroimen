@@ -100,15 +100,18 @@ def service_with_db(db, tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_cancel_job_graceful_true_marks_cancelling_and_returns_immediately(
+async def test_cancel_job_graceful_true_pending_job_returns_cancelled(
     service_with_db, db
 ) -> None:
-    """``cancel_job(graceful=True)`` marks the job ``cancelling`` in the
-    DB and returns immediately with ``status=CANCELLING``.
+    """``cancel_job(graceful=True)`` for a pending job finalizes the
+    row as ``cancelled`` synchronously and returns
+    ``status=CANCELLED``.
 
-    The function does NOT wait. The function does NOT prove the
-    cancellation of the running asyncio task or any in-flight
-    provider request.
+    DR-Q1A-PRE1B real cancellation contract: a pending job has no
+    active asyncio task to signal. The endpoint removes the
+    scheduler entry best-effort, transitions the row to
+    ``cancelled`` synchronously, and returns. The function does
+    NOT need to wait.
     """
     service, _ = service_with_db
     job_id = "can01"
@@ -119,64 +122,52 @@ async def test_cancel_job_graceful_true_marks_cancelling_and_returns_immediately
         user_id=0,
     )
 
-    # Time the call: must be fast (no 10s wait).
+    # Time the call: must be fast (no bounded wait needed for a
+    # pending job — the synchronous finalize path is the contract).
     t0 = datetime.now(UTC)
     response = await service.cancel_job(job_id, graceful=True)
     elapsed = (datetime.now(UTC) - t0).total_seconds()
     assert elapsed < 1.0, (
-        f"cancel_job(graceful=True) took {elapsed:.2f}s; must return "
-        f"immediately (the previous docstring's 'await current phase "
-        f"finish (max 10s)' was incorrect)."
+        f"cancel_job(graceful=True) on a pending job took "
+        f"{elapsed:.2f}s; must finalize synchronously without a "
+        f"bounded wait."
     )
 
-    # Response is CANCELLING (transient), graceful=True.
-    assert response.status == JobStatus.CANCELLING
+    # Response is CANCELLED (terminal, terminal-state finalization
+    # for the pending path), graceful=True.
+    assert response.status == JobStatus.CANCELLED
     assert response.graceful is True
     assert response.id == job_id
 
-    # DB row is now 'cancelling'.
+    # DB row is now 'cancelled' (final terminal state).
     row = await db.get_research_job(job_id)
     assert row is not None
-    assert row["status"] == "cancelling", (
-        f"DB status must be 'cancelling' after graceful cancel; got "
-        f"{row['status']!r}"
+    assert row["status"] == "cancelled", (
+        f"DB status must be 'cancelled' after cancel of a pending "
+        f"job; got {row['status']!r}"
+    )
+    assert row["error_taxonomy"] == "cancelled", (
+        "DB row must record error_taxonomy='cancelled' after "
+        "finalization"
+    )
+    assert row["completed_at"] is not None, (
+        "DB row must have completed_at set after finalization"
     )
 
 
-@pytest.mark.asyncio
-async def test_cancel_job_graceful_true_does_not_prove_task_cancellation(
-    service_with_db, db
-) -> None:
-    """``cancel_job(graceful=True)`` does NOT prove the cancellation
-    of the running asyncio task. The current code only updates the
-    DB; the running task, if any, continues until it next polls
-    the status.
-    """
-    service, _ = service_with_db
-    job_id = "can02"
-    await db.create_research_job(
-        job_id=job_id,
-        query="x",
-        notify_via_tg=0,
-        user_id=0,
-    )
+# PRE1A-era test removed by PRE1B: the previous "does NOT prove
+# task cancellation" caveat no longer holds -- PRE1B makes the
+# cancellation real for every state (active task is signalled via
+# ``task.cancel()`` and the row is finalised through the same
+# CAS as the rest of the state machine). See
+# ``tests/integration/test_jobs_cancellation.py`` for the runtime
+# proof (D-K cover the active-task race outcomes; L covers
+# idempotency).
 
-    # Patch any possible sleep/wait helpers to detect if cancel_job
-    # tries to wait. We patch asyncio.sleep and time.sleep to record
-    # any sleep calls.
-    with patch("hermes.jobs.service.asyncio.sleep", new=AsyncMock()) as mock_sleep:
-        await service.cancel_job(job_id, graceful=True)
 
-    # If the docstring's "await current phase finish (max 10s)" had
-    # been implemented, asyncio.sleep would have been called with
-    # a value > 0. It must NOT be called in the current
-    # implementation.
-    mock_sleep.assert_not_called(), (
-        "cancel_job(graceful=True) must NOT call asyncio.sleep. "
-        "The previous docstring claimed it awaited the current "
-        "phase (max 10s); the current implementation only updates "
-        "the DB and returns."
-    )
+# ---------------------------------------------------------------------------
+# cancel_job: graceful=False
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------

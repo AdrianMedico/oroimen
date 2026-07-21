@@ -43,6 +43,32 @@ class SchedulerUnavailableError(Exception):
     """Raised when DeepResearchScheduler.start() hasn't completed yet. HTTP 503."""
 
 
+class JobStateInvalid(Exception):
+    """Internal exception: a phase guard observed a row in an unexpected
+    non-terminal state that prevents the phase from continuing safely.
+
+    DR-Q1A-PRE1B remediation. Raised by ``_update_phase`` when the
+    conditional ``update_research_job_phase`` returns False AND the row
+    is in neither ``cancelling`` nor ``cancelled``. The research task
+    treats this as an internal invariant violation: a recovery re-run
+    can reset the row to ``pending`` on the next startup, but the
+    current run must NOT continue into the phase body. The exception
+    is caught by the generic ``except Exception`` branch in
+    ``_run_research_inner`` and a conditional ``running -> failed``
+    transition is attempted (which will fail if the row is not in
+    ``running``; the task simply exits in that case).
+    """
+
+    def __init__(self, job_id: str, observed_status: str, phase: str) -> None:
+        self.job_id = job_id
+        self.observed_status = observed_status
+        self.phase = phase
+        super().__init__(
+            f"job {job_id} phase {phase!r} guard failed; "
+            f"row is in unexpected state {observed_status!r}"
+        )
+
+
 class PhaseError(Exception):
     """Internal error durante ejecución de una phase.
 

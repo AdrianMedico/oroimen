@@ -291,25 +291,42 @@ async def cancel_job(
     graceful: bool = Query(
         True,
         description=(
-            "``True`` (default): marks persistence as ``cancelling`` and "
-            "returns immediately. ``False``: moves persistence directly to "
-            "``cancelled`` and returns immediately. Neither option proves "
-            "cancellation of the running asyncio task or any in-flight "
-            "provider request; neither option waits for the current phase "
-            "to finish."
+            "True (default): bounded-wait for the local asyncio task "
+            "to acknowledge cancellation, up to "
+            "``deep_research_cancel_wait_s`` seconds, then return. "
+            "False: signal the cancellation and return immediately; "
+            "the task's finalizer completes the row transition. Both "
+            "values request real local cancellation. ``graceful`` "
+            "controls bounded waiting only, not cancellation strength. "
+            "An already-received provider request may still be "
+            "processed or counted by the provider; cancellation does "
+            "NOT claim quota reversal, refund, or reversal of billed "
+            "tokens."
         ),
     ),
 ) -> CancelResponse:
-    """POST /v1/jobs/{job_id}/cancel — cancela un job.
+    """POST /v1/jobs/{job_id}/cancel — cancela un job (DR-Q1A-PRE1B).
 
-    200 con CancelResponse describiendo la transición de persistencia que
-    se aplicó (``status='cancelling' | 'cancelled'`` y ``graceful`` reflejando
-    si se usó la transición cancelling o la transición directa a cancelled).
-    La respuesta expone únicamente los campos públicos de ``CancelResponse``
+    200 con ``CancelResponse`` describiendo la transición aplicada.
+    La respuesta expone únicamente los campos públicos
     (``id``, ``status``, ``graceful``).
-    404 si no existe o pertenece a otro user.
-    409 si ya está en estado terminal (complete/failed/cancelled).
-    503 si el service no está inicializado.
+
+    Estados:
+      - 200 + status=cancelled: no queda ejecución local activa.
+      - 200 + status=cancelling: cancelación solicitada; la tarea
+        asyncio está siendo señalada o el timeout de wait expiró.
+      - 200 idempotente: cancelar un job ya ``cancelled`` devuelve
+        200 con status=cancelled.
+      - 404 si no existe o pertenece a otro user.
+      - 409 si ya está en ``complete`` o ``failed`` (terminal real).
+      - 503 si el service no está inicializado.
+
+    Contrato:
+      Cuando el owner cancela un job de Deep Research, Oroimen deja
+      de ejecutar ese job localmente. La cancelación se propaga por
+      la coroutine del cliente (search, fetch, LLM) mediante
+      ``asyncio``; un request ya recibido por el provider puede
+      seguir siendo procesado o contado.
     """
     try:
         await _assert_owner_id(job_id, user_id, service)

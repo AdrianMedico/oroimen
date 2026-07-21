@@ -167,43 +167,63 @@ class JobDetail(JobSummary):
 class CancelResponse(BaseModel):
     """POST /v1/jobs/{id}/cancel response.
 
-    Slice 1C2: ``partial_output_path`` REMOVED. The DB column stays (no
-    migration in 1C2) but the field was always ``None`` in the wire
-    response because every service path hardcoded it. The
-    ``graceful`` / ``status`` semantics are preserved unchanged.
+    DR-Q1A-PRE1B real cancellation contract. ``status`` reports
+    the persisted state at the time the response is produced:
 
-    DR-Q1A-PRE1A truth: ``graceful`` describes the persistence
-    transition requested, not what was actually stored or whether
-    any task or provider request was cancelled. Neither value proves
-    running-task cancellation. Neither value implies that a partial
-    output was stored. See ``hermes/jobs/service.py::cancel_job`` for
-    the actual current behavior.
+      - ``cancelling``: local cancellation was requested and
+        acknowledged in persistence; the asyncio task is being
+        signalled but the row is not yet ``cancelled``. The
+        task's finalizer will produce the row transition when
+        the asyncio cancellation propagates.
+      - ``cancelled``: no active local execution remains for the
+        job. The row has reached the terminal state, either
+        synchronously (the job was pending/scheduled) or after
+        the task acknowledged cancellation inside the bounded
+        wait (graceful=True) or after the task's finalizer ran
+        (graceful=False).
+
+    ``graceful`` is a WAIT MODE, not a cancellation-strength
+    mode. Both values request real local cancellation. The
+    ``graceful`` parameter controls only how long the cancel
+    endpoint waits for the local asyncio task to acknowledge
+    cancellation, bounded by ``deep_research_cancel_wait_s``.
+
+    Provider-side truth: ``Oroimen requests immediate local
+    cancellation and propagates asyncio cancellation through
+    the awaited client coroutine``. An already-received
+    provider request may still be processed or counted by the
+    provider. Cancellation does NOT claim quota reversal,
+    refund, or reversal of billed tokens.
     """
 
     id: str
     status: JobStatus = Field(
         ...,
         description=(
-            "``cancelling`` when graceful=True (the cancelling "
-            "transition was applied; the persistence will be moved "
-            "to ``cancelled`` the next time the running task polls). "
-            "``cancelled`` when graceful=False (the persistence was "
-            "moved directly to ``cancelled``). In both cases the "
-            "current code does not prove cancellation of the running "
-            "asyncio task or any in-flight provider request."
+            "``cancelling``: local cancellation requested but not "
+            "yet acknowledged by the asyncio task; the row will "
+            "transition to ``cancelled`` when the task's finalizer "
+            "completes. ``cancelled``: no active local execution "
+            "remains for the job. The endpoint may return "
+            "``cancelling`` for an active task that has not yet "
+            "acknowledged the cancellation; this is truthful, the "
+            "asyncio cancellation has been signalled but not yet "
+            "propagated."
         ),
     )
     graceful: bool = Field(
         ...,
         description=(
-            "``True``: the cancelling transition was applied "
-            "(persistence marked 'cancelling'); the response returns "
-            "immediately without waiting. ``False``: the persistence "
-            "was moved directly to 'cancelled'. Neither value proves "
-            "that the running asyncio task was cancelled. Neither "
-            "value proves that any in-flight provider request was "
-            "cancelled. Neither value implies anything about whether "
-            "an intermediate run result was stored."
+            "True (default): the cancel endpoint bounded-waits up to "
+            "``deep_research_cancel_wait_s`` for the local asyncio "
+            "task to acknowledge cancellation, then returns. If the "
+            "task acknowledged inside the wait the response status "
+            "is ``cancelling`` or ``cancelled`` accordingly. False: "
+            "the cancel endpoint returns immediately after signalling "
+            "the task; the row is left in ``cancelling`` and the "
+            "task's finalizer completes the transition. Both values "
+            "request real local cancellation; ``graceful`` controls "
+            "bounded waiting only, not cancellation strength."
         ),
     )
 
