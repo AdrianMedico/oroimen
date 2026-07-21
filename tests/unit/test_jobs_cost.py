@@ -105,39 +105,51 @@ def test_pricing_table_has_mini_max_and_deepseek() -> None:
 
 
 def test_pricing_table_mini_max_m3_matches_verified_official_rate() -> None:
-    """MiniMax-M3: $0.30/M in, $1.20/M out (verified 2026-07-21).
+    """MiniMax-M3: $0.30/M in, $1.20/M out (as-of 2026-07-21).
 
-    Verified against https://platform.minimax.io/docs/guides/pricing-paygo
-    (standard tier, "Permanent 50% off" promotional, <=512k input
-    tokens). The PRICING_TABLE must reflect the official rate; if
-    the official page changes, this assertion will fail and the
-    cost module must be re-verified (see PRICING_AS_OF).
+    This is an as-of regression test. The values asserted here are
+    the rates that the operator verified against the official
+    MiniMax pricing page on 2026-07-21 (see PRICING_AS_OF). The
+    test itself performs NO network access and cannot prove that
+    the official page has not changed since then. A future slice
+    must re-verify the rates against the official page and update
+    BOTH PRICING_AS_OF and PRICING_TABLE together; this test will
+    then be updated to the new pinned values.
     """
     in_rate, out_rate = PRICING_TABLE["MiniMax-M3"]
     assert in_rate == Decimal("0.30"), (
-        f"MiniMax-M3 input rate must be $0.30/M (verified 2026-07-21); "
-        f"got {in_rate}. Re-verify at {PRICING_SOURCE}."
+        f"MiniMax-M3 input rate pinned at $0.30/M as of PRICING_AS_OF "
+        f"({PRICING_AS_OF}); got {in_rate}. If the official page has "
+        f"genuinely changed, re-verify the rate, update PRICING_TABLE "
+        f"AND PRICING_AS_OF, and update this assertion in the same "
+        f"commit. See {PRICING_SOURCE} for the official source."
     )
     assert out_rate == Decimal("1.20"), (
-        f"MiniMax-M3 output rate must be $1.20/M (verified 2026-07-21); "
-        f"got {out_rate}. Re-verify at {PRICING_SOURCE}."
+        f"MiniMax-M3 output rate pinned at $1.20/M as of PRICING_AS_OF "
+        f"({PRICING_AS_OF}); got {out_rate}. If the official page has "
+        f"genuinely changed, re-verify the rate, update PRICING_TABLE "
+        f"AND PRICING_AS_OF, and update this assertion in the same "
+        f"commit. See {PRICING_SOURCE} for the official source."
     )
 
 
 def test_pricing_table_mini_max_m2_7_highspeed_matches_verified_official_rate() -> None:
-    """MiniMax-M2.7-highspeed: $0.60/M in, $2.40/M out (verified 2026-07-21).
+    """MiniMax-M2.7-highspeed: $0.60/M in, $2.40/M out (as-of 2026-07-21).
 
-    Verified against https://platform.minimax.io/docs/guides/pricing-paygo
-    (standard tier).
+    Same as-of regression semantics as
+    ``test_pricing_table_mini_max_m3_matches_verified_official_rate``.
+    The test performs no network access.
     """
     in_rate, out_rate = PRICING_TABLE["MiniMax-M2.7-highspeed"]
     assert in_rate == Decimal("0.60"), (
-        f"MiniMax-M2.7-highspeed input rate must be $0.60/M (verified 2026-07-21); "
-        f"got {in_rate}. Re-verify at {PRICING_SOURCE}."
+        f"MiniMax-M2.7-highspeed input rate pinned at $0.60/M as of "
+        f"PRICING_AS_OF ({PRICING_AS_OF}); got {in_rate}. See "
+        f"{PRICING_SOURCE} for the official source."
     )
     assert out_rate == Decimal("2.40"), (
-        f"MiniMax-M2.7-highspeed output rate must be $2.40/M (verified 2026-07-21); "
-        f"got {out_rate}. Re-verify at {PRICING_SOURCE}."
+        f"MiniMax-M2.7-highspeed output rate pinned at $2.40/M as of "
+        f"PRICING_AS_OF ({PRICING_AS_OF}); got {out_rate}. See "
+        f"{PRICING_SOURCE} for the official source."
     )
 
 

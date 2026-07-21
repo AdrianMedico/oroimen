@@ -83,7 +83,23 @@ class JobResponse(BaseModel):
     id: str = Field(..., description="UUID 12-char hex")
     status: JobStatus
     created_at: str  # formato 'YYYY-MM-DD HH:MM:SS.sss'
-    estimated_cost_usd: float = Field(..., description="Heurística previa, NO garantía")
+    estimated_cost_usd: float = Field(
+        ...,
+        description=(
+            "Estimated official pay-as-you-go-equivalent amount at the "
+            "verified PRICING_TABLE rates (PRICING_BASIS = "
+            "'official_paygo_equivalent'); not actual provider billing, "
+            "not actual subscription or quota-plan spend, not remaining "
+            "account balance, not invoice truth. Operators using a "
+            "subscription or quota-backed plan should treat this value "
+            "as a relative cost proxy, not as a spend figure. The "
+            "estimate is a pre-submit heuristic (per-source + final "
+            "synth + 1.30 safety margin) at the official standard tier; "
+            "actual billed tokens may differ if the operator's plan "
+            "uses a different rate or if a provider call times out "
+            "without returning."
+        ),
+    )
 
 
 class JobSummary(BaseModel):
@@ -94,7 +110,20 @@ class JobSummary(BaseModel):
     status: JobStatus
     current_phase: PhaseName | None = None
     progress_percent: int
-    cost_usd: float
+    cost_usd: float = Field(
+        ...,
+        description=(
+            "Accumulated estimated pay-as-you-go-equivalent amount "
+            "derived from the recorded token_usage rows at the verified "
+            "PRICING_TABLE rates (PRICING_BASIS = 'official_paygo_equivalent'). "
+            "Not actual provider billing. The aggregate is the sum of "
+            "the per-call cost_usd entries in token_usage; calls that "
+            "timed out without returning are not represented in "
+            "token_usage, so this field is a lower bound on actual "
+            "billed tokens for any job that completed in a way the "
+            "client observed."
+        ),
+    )
     created_at: str
     started_at: str | None = None
     completed_at: str | None = None
@@ -112,6 +141,12 @@ class JobDetail(JobSummary):
 
     NO ``report_available`` flag is added. The status field is the
     source of truth for "is the report ready".
+
+    NOTE (DR-Q1A-PRE1A): ``cost_usd`` is the estimated
+    pay-as-you-go-equivalent amount (see ``cost_usd`` description on
+    ``JobSummary``). It is NOT automatically embedded in the final
+    Markdown report returned by ``GET /v1/jobs/{id}/report``; the
+    report body is the LLM-generated content only.
     """
 
     job_type: JobType
@@ -132,11 +167,41 @@ class CancelResponse(BaseModel):
     migration in 1C2) but the field was always ``None`` in the wire
     response because every service path hardcoded it. The
     ``graceful`` / ``status`` semantics are preserved unchanged.
+
+    DR-Q1A-PRE1A truth: ``graceful`` describes the persistence
+    transition requested, not what was actually stored or whether
+    any task or provider request was cancelled. Neither value proves
+    running-task cancellation. Neither value implies that a partial
+    output was stored. See ``hermes/jobs/service.py::cancel_job`` for
+    the actual current behavior.
     """
 
     id: str
-    status: JobStatus  # 'cancelling' o 'cancelled' si ya estaba finished
-    graceful: bool  # True si partial output guardado, False si hard cancel
+    status: JobStatus = Field(
+        ...,
+        description=(
+            "``cancelling`` when graceful=True (the cancelling "
+            "transition was applied; the persistence will be moved "
+            "to ``cancelled`` the next time the running task polls). "
+            "``cancelled`` when graceful=False (the persistence was "
+            "moved directly to ``cancelled``). In both cases the "
+            "current code does not prove cancellation of the running "
+            "asyncio task or any in-flight provider request."
+        ),
+    )
+    graceful: bool = Field(
+        ...,
+        description=(
+            "``True``: the cancelling transition was applied "
+            "(persistence marked 'cancelling'); the response returns "
+            "immediately without waiting. ``False``: the persistence "
+            "was moved directly to 'cancelled'. Neither value proves "
+            "that the running asyncio task was cancelled. Neither "
+            "value proves that any in-flight provider request was "
+            "cancelled. Neither value implies anything about whether "
+            "an intermediate run result was stored."
+        ),
+    )
 
 
 class TokenUsageEntry(BaseModel):
@@ -146,16 +211,53 @@ class TokenUsageEntry(BaseModel):
     model: str
     tokens_in: int
     tokens_out: int
-    cost_usd: float
+    cost_usd: float = Field(
+        ...,
+        description=(
+            "Per-returned-call estimated pay-as-you-go-equivalent "
+            "amount at the verified PRICING_TABLE rates "
+            "(PRICING_BASIS = 'official_paygo_equivalent'). Computed "
+            "from the tokens_in / tokens_out the client observed. "
+            "Calls that time out without returning a response are "
+            "NOT represented in this table: the per-call cost is a "
+            "lower bound on actual billed tokens for any call that "
+            "the client observed a response from."
+        ),
+    )
     created_at: str
 
 
 class DailyBudgetStatus(BaseModel):
     """GET /v1/jobs/budget (helper endpoint, no en §10 HTTP API pero útil)."""
 
-    today_cost_usd: float
-    daily_cap_usd: float
-    remaining_usd: float
+    today_cost_usd: float = Field(
+        ...,
+        description=(
+            "Sum of estimated pay-as-you-go-equivalent cost_usd across "
+            "all jobs created today (UTC), at the verified PRICING_TABLE "
+            "rates (PRICING_BASIS = 'official_paygo_equivalent'). "
+            "Internal admission-control value, NOT the operator's "
+            "actual account balance."
+        ),
+    )
+    daily_cap_usd: float = Field(
+        ...,
+        description=(
+            "Configured daily spend cap (settings.deep_research_daily_budget_usd). "
+            "Internal admission-control value, NOT a hard provider-side "
+            "monetary limit; the per-job cap is a soft warning and the "
+            "daily cap is a pre-submit check (the cap is re-checked at "
+            "job start, but the service does not cancel running jobs)."
+        ),
+    )
+    remaining_usd: float = Field(
+        ...,
+        description=(
+            "``daily_cap_usd - today_cost_usd`` at admission time. "
+            "Internal admission-control value, NOT a hard provider-side "
+            "monetary limit."
+        ),
+    )
     jobs_today: int
     resets_at: str  # ISO8601, próximo 00:00 UTC
 

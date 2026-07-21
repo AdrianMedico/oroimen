@@ -9,18 +9,37 @@ Punto único de decisión:
 - calculate_cost(): Decimal con 4 decimales, quantize ROUND_HALF_UP.
 - PRICING_TABLE: input/output USD per 1M tokens por modelo.
 
-Cost-truth semantics (DR-Q1A-PRE1A):
+Cost-truth semantics (DR-Q1A-PRE1A, truth-patch 2):
 
-    cost_usd exposed by the API, the notifier, and the report is an
-    **estimated pay-as-you-go-equivalent amount** (see PRICING_BASIS).
+    ``cost_usd`` is exposed through:
+      - the Deep Research job API DTOs (``JobResponse.estimated_cost_usd``,
+        ``JobSummary.cost_usd`` / ``JobDetail.cost_usd``);
+      - ``TokenUsageEntry.cost_usd`` rows embedded in
+        ``JobDetail.token_usage``;
+      - the daily-budget admission-control DTO
+        (``DailyBudgetStatus.today_cost_usd``, ``daily_cap_usd``,
+        ``remaining_usd``);
+      - InfluxDB / metrics writes from ``_record_token_usage`` and the
+        end-of-run reconciliation;
+      - the Telegram notifier call on completion / failure.
 
-    It is NOT:
+    ``cost_usd`` is an **estimated pay-as-you-go-equivalent amount**
+    (see PRICING_BASIS). It is NOT:
       - actual provider billing (the operator may use a subscription
         or quota-backed plan, in which case the operator's invoice
         is governed by the plan, not by this estimate);
       - actual marginal spend on a pay-as-you-go account;
       - remaining subscription balance or quota consumption;
       - invoice truth.
+
+    ``cost_usd`` is NOT automatically embedded in the final Markdown
+    report returned by ``GET /v1/jobs/{job_id}/report``. The report
+    contains only the LLM-generated content; the cost telemetry is
+    surfaced through the DTOs above, not through the report body. The
+    pilot runbook persists ``report.md``, ``job_detail.json``, and
+    ``token_usage.json`` as separate artifacts; cost is in
+    ``job_detail.json`` and ``token_usage.json``, never in
+    ``report.md``.
 
     The estimate is computed from the public per-million-token rates
     listed in PRICING_TABLE and the recorded token_usage rows. Token
@@ -127,6 +146,12 @@ def calculate_cost(model: str, tokens_in: int, tokens_out: int) -> Decimal:
         using a subscription or quota-backed plan should treat this
         value as a relative cost proxy, not as a spend figure.
 
+        The result is the per-call estimate only. Calls that time out
+        without returning (no provider response) are not represented
+        in the token-usage table; the per-call estimate is therefore
+        a lower bound on actual billed tokens for any call that
+        completed in a way the client observed.
+
     Args:
         model: nombre del modelo (debe estar en PRICING_TABLE).
         tokens_in: tokens de input del LLM call.
@@ -167,7 +192,8 @@ def estimate_research_cost(
     ``PRICING_BASIS`` and ``PRICING_AS_OF`` at module level). It is NOT
     actual provider billing; it is the pre-submit estimate used by the
     daily budget admission control and surfaced in the submit response
-    and the notifier call as ``estimated_cost_usd``.
+    (``JobResponse.estimated_cost_usd``) and the notifier call. It
+    is NOT embedded in the final Markdown report.
 
     Asume:
     - Per-source synth: ``per_source_max_tokens`` x output_rate del modelo primario.

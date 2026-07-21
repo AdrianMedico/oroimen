@@ -71,42 +71,50 @@ def test_pricing_source_is_official_minimax_url() -> None:
 
 
 def test_pricing_table_mini_max_m3_input_rate() -> None:
-    """MiniMax-M3 input rate = $0.30/M tokens (verified 2026-07-21)."""
+    """MiniMax-M3 input rate = $0.30/M tokens (as-of PRICING_AS_OF).
+
+    As-of regression test. The values asserted here are the rates
+    that the operator verified against the official MiniMax pricing
+    page on PRICING_AS_OF. The test performs NO network access and
+    cannot prove that the official page has not changed since then.
+    """
     in_rate, _ = PRICING_TABLE["MiniMax-M3"]
     assert in_rate == Decimal("0.30"), (
         f"MiniMax-M3 input rate is now ${in_rate}/M; expected $0.30/M "
         f"per the official standard tier, <=512k input, 'Permanent 50% "
-        f"off' promo (verified 2026-07-21 from {PRICING_SOURCE})."
+        f"off' promo (as-of PRICING_AS_OF={PRICING_AS_OF}, source: "
+        f"{PRICING_SOURCE})."
     )
 
 
 def test_pricing_table_mini_max_m3_output_rate() -> None:
-    """MiniMax-M3 output rate = $1.20/M tokens (verified 2026-07-21)."""
+    """MiniMax-M3 output rate = $1.20/M tokens (as-of PRICING_AS_OF)."""
     _in_rate, out_rate = PRICING_TABLE["MiniMax-M3"]
     assert out_rate == Decimal("1.20"), (
         f"MiniMax-M3 output rate is now ${out_rate}/M; expected $1.20/M "
         f"per the official standard tier, <=512k input, 'Permanent 50% "
-        f"off' promo (verified 2026-07-21 from {PRICING_SOURCE})."
+        f"off' promo (as-of PRICING_AS_OF={PRICING_AS_OF}, source: "
+        f"{PRICING_SOURCE})."
     )
 
 
 def test_pricing_table_mini_max_m2_7_highspeed_input_rate() -> None:
-    """MiniMax-M2.7-highspeed input rate = $0.60/M tokens (verified 2026-07-21)."""
+    """MiniMax-M2.7-highspeed input rate = $0.60/M tokens (as-of PRICING_AS_OF)."""
     in_rate, _ = PRICING_TABLE["MiniMax-M2.7-highspeed"]
     assert in_rate == Decimal("0.60"), (
         f"MiniMax-M2.7-highspeed input rate is now ${in_rate}/M; expected "
-        f"$0.60/M per the official standard tier (verified 2026-07-21 "
-        f"from {PRICING_SOURCE})."
+        f"$0.60/M per the official standard tier (as-of "
+        f"PRICING_AS_OF={PRICING_AS_OF}, source: {PRICING_SOURCE})."
     )
 
 
 def test_pricing_table_mini_max_m2_7_highspeed_output_rate() -> None:
-    """MiniMax-M2.7-highspeed output rate = $2.40/M tokens (verified 2026-07-21)."""
+    """MiniMax-M2.7-highspeed output rate = $2.40/M tokens (as-of PRICING_AS_OF)."""
     _in_rate, out_rate = PRICING_TABLE["MiniMax-M2.7-highspeed"]
     assert out_rate == Decimal("2.40"), (
         f"MiniMax-M2.7-highspeed output rate is now ${out_rate}/M; "
-        f"expected $2.40/M per the official standard tier (verified "
-        f"2026-07-21 from {PRICING_SOURCE})."
+        f"expected $2.40/M per the official standard tier (as-of "
+        f"PRICING_AS_OF={PRICING_AS_OF}, source: {PRICING_SOURCE})."
     )
 
 
