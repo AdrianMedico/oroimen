@@ -290,15 +290,38 @@ def test_cancel_response_graceful_description_does_not_claim_hard_cancel() -> No
 
 def test_cancel_response_status_description_documents_actual_behavior() -> None:
     """CancelResponse.status description documents the actual
-    persistence behavior, not partial-output storage.
+    PRE1B real-cancellation persistence behavior, not partial-output
+    storage.
+
+    PRE1B contract: ``cancelling`` means local cancellation was
+    requested and acknowledged in persistence but the asyncio
+    task's finalizer has not yet committed the ``cancelled``
+    transition. ``cancelled`` means no active local execution
+    remains. The description MUST reflect this and MUST NOT
+    contain the PRE1A-era "DB state does not prove cancellation
+    of the running asyncio task" caveat (that caveat is no longer
+    true — the cancellation is real).
     """
     desc = _field_description(CancelResponse, "status")
-    assert "cancelling" in desc.lower()
-    assert "cancelled" in desc.lower() or "canceled" in desc.lower()
-    # The description should NOT claim that the status proves
-    # in-flight cancellation.
-    assert "running" in desc.lower() and "task" in desc.lower()
-    assert "not prove" in desc.lower() or "does not prove" in desc.lower()
+    lower = desc.lower()
+    assert "cancelling" in lower
+    assert "cancelled" in lower or "canceled" in lower
+    # The description must reference the asyncio task — the
+    # acknowledgement / finalizer concept is the new contract.
+    assert "asyncio" in lower or "task" in lower
+    # The description must NOT contain the PRE1A-era
+    # "does not prove" / "not prove" caveat.
+    assert "not prove" not in lower, (
+        f"CancelResponse.status description must NOT contain the "
+        f"PRE1A 'does not prove' caveat — PRE1B makes cancellation "
+        f"real. Got: {desc!r}"
+    )
+    assert "does not prove" not in lower
+    # The description must NOT claim partial_output_path.
+    assert "partial_output" not in lower, (
+        f"CancelResponse.status description must not claim a "
+        f"partial_output_path. Got: {desc!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
