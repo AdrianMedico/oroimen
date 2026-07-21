@@ -572,12 +572,44 @@ class DeepResearchService:
         ]
 
     async def cancel_job(self, job_id: str, graceful: bool = True) -> CancelResponse:
-        """Marca cancelling/cancelled.
+        """Marca el job como cancelling / cancelled en persistencia.
 
-        Si graceful, await current phase finish (max 10s). Si no, hard cancel.
+        Comportamiento actual (DR-Q1A-PRE1A, no implementado en este slice):
+          - ``graceful=True`` (default): marca el job como
+            ``cancelling`` en la base de datos y retorna
+            ``CancelResponse(status=CANCELLING, graceful=True)``
+            INMEDIATAMENTE. NO espera a la fase actual. NO prueba la
+            cancelación de la tarea asyncio en curso. NO prueba la
+            cancelación de un request al proveedor en vuelo. La
+            próxima vez que ``_run_research`` poll-ee el estado,
+            verá ``cancelling`` y marcará ``cancelled``.
+          - ``graceful=False``: marca el job como ``cancelled`` en la
+            base de datos y retorna
+            ``CancelResponse(status=CANCELLED, graceful=False)``
+            INMEDIATAMENTE. NO cancela la tarea asyncio en curso. NO
+            cancela un request al proveedor en vuelo.
+
+        Consecuencias:
+          - La cancelación es BEST-EFFORT desde la perspectiva del
+            proceso. La tarea puede seguir ejecutándose hasta que
+            complete la fase actual o termine por sí misma.
+          - La cancelación NO es una frontera monetaria dura. Un
+            provider que ya haya recibido un request puede haber
+            facturado tokens aunque el cliente no haya visto la
+            respuesta.
+          - Un job de Deep Research con un provider de pago no
+            puede usar ``cancel_job`` como sustituto de un hard cap.
+
+        Esta función NO cambia su comportamiento en este slice.
+        El docstring anterior ("await current phase finish, max 10s")
+        era incorrecto: el código actual NO espera, NO garantiza la
+        terminación del request al proveedor, y NO tiene un timeout
+        de 10 segundos. El cambio es de documentación únicamente.
+
         Raises:
-            JobNotFoundError: si id no existe.
-            JobAlreadyTerminalError: si ya está en complete/failed/cancelled.
+            JobNotFoundError: si el id no existe.
+            JobAlreadyTerminalError: si el job ya está en
+                ``complete``, ``failed`` o ``cancelled``.
         """
         job_row = await self._db.get_research_job(job_id)
         if job_row is None:
@@ -1280,10 +1312,30 @@ class DeepResearchService:
         phase_name: PhaseName,
         phase_fn,
     ) -> Any:
-        """Wrapper: ejecuta phase_fn con retry exp backoff (1s, 4s, 16s), max 3 attempts.
+        """Wrapper: ejecuta phase_fn con retry de 3 intentos totales.
 
-        Backoff: 1s, 4s, 16s. Si el job total excede ~30min, recovery hook lo detecta
-        y re-enqueua (con checkpoint de última phase exitosa).
+        Comportamiento actual (DR-Q1A-PRE1A, sin cambios de comportamiento):
+          - Máximo de 3 intentos totales para errores retryables
+            (``RETRYABLE_ERRORS``: search_5xx, llm_5xx, timeout, network).
+          - Backoff efectivo: 1 segundo después del primer fallo,
+            4 segundos después del segundo fallo.
+          - El tercer fallo TERMINA la fase (no se reintenta);
+            el ``PhaseError`` se relanza.
+          - El valor 16 en ``_RETRY_BACKOFF_SCHEDULE = (1, 4, 16)``
+            EXISTE en la tupla pero NO se consume en el bucle actual
+            (el bucle itera ``for attempt in range(3)`` y solo lee
+            ``_RETRY_BACKOFF_SCHEDULE[attempt]`` cuando
+            ``attempt < 2``). El valor 16 es un residuo histórico y
+            no afecta el comportamiento observable.
+
+        El docstring anterior ("exp backoff 1s, 4s, 16s, max 3
+        attempts") era incorrecto: las esperas efectivas son 1 y 4
+        segundos, no 1, 4 y 16. El cambio es de documentación
+        únicamente.
+
+        Si el job total excede ~30 minutos, el recovery hook lo
+        detecta y re-enqueua (con el checkpoint de la última fase
+        exitosa).
         """
         last_error: PhaseError | None = None
         for attempt in range(3):
