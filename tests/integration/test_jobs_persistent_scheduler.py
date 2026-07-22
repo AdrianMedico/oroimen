@@ -1029,6 +1029,7 @@ async def test_pa_post_add_lookup_raises_calls_best_effort_remove(
             remove_called_with.append(jid)
             return None
 
+        original_get_job = real_scheduler.get_job
         real_scheduler.add_job = fake_add_job  # type: ignore[method-assign]
         real_scheduler.get_job = fake_get_job  # type: ignore[method-assign]
         real_scheduler.remove_job = fake_remove_job  # type: ignore[method-assign]
@@ -1038,7 +1039,7 @@ async def test_pa_post_add_lookup_raises_calls_best_effort_remove(
             assert "post-add lookup failed" in str(excinfo.value)
         finally:
             real_scheduler.add_job = original_add_job  # type: ignore[method-assign]
-            real_scheduler.get_job = real_scheduler.get_job  # type: ignore[method-assign]
+            real_scheduler.get_job = original_get_job  # type: ignore[method-assign]
 
         # The best-effort remove was called with the job_id.
         assert job_id in remove_called_with, (
@@ -1268,12 +1269,13 @@ async def test_pe_post_add_cleanup_makes_no_provider_call(
         def fake_get_job(jid, *a, **kw):
             raise RuntimeError("simulated_lookup_failure")
 
+        original_get_job = real_scheduler.get_job
         real_scheduler.get_job = fake_get_job  # type: ignore[method-assign]
         try:
             with pytest.raises(SchedulerEnqueueError):
                 await scheduler.enqueue(job_id, run_date=datetime.now(UTC))
         finally:
-            real_scheduler.get_job = real_scheduler.get_job  # type: ignore[method-assign]
+            real_scheduler.get_job = original_get_job  # type: ignore[method-assign]
 
         # The stub was never called.
         assert stub.calls == [], (
