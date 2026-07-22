@@ -177,6 +177,23 @@ async def _run_cleanup_steps(
                 )
             except Exception:
                 logger.exception("deep_research_cleanup_singleton_clear_failed")
+            # Also clear the process-local research service
+            # registry. The dispatcher reads from this registry at
+            # scheduler firing time. A clear here guarantees that
+            # a persisted job that fires after shutdown will
+            # transition the row to terminal ``failed``
+            # (``registry absent``) rather than attempt to use a
+            # service whose database connection has already been
+            # closed. The clear is best-effort: a failure here
+            # cannot prevent the remaining cleanup from running.
+            try:
+                from hermes.jobs.service_registry import clear_research_service
+                clear_research_service()
+                logger.info("deep_research_cleanup_registry_cleared")
+            except Exception:
+                logger.exception(
+                    "deep_research_cleanup_registry_clear_failed",
+                )
 
 
 async def _deep_research_cleanup(
@@ -466,6 +483,34 @@ async def _compose_deep_research_runtime(
         # reached — the singleton stays cleared and the 503
         # dependency behavior is preserved.
         set_deep_research_service(service)
+        # Also register in the new process-local registry. The
+        # APScheduler jobstore holds a reference to
+        # ``execute_research_job`` (a module-level async
+        # function), not to the service. The dispatcher resolves
+        # the live service at firing time via this registry.
+        # Without the registry entry, a persisted job that
+        # fires after a service restart would transition the
+        # row to terminal ``failed`` (registry absent). The
+        # ``set_deep_research_service`` legacy shim still
+        # forwards to the registry, so a single call is
+        # sufficient.
+        try:
+            from hermes.jobs.service_registry import (
+                get_research_service,
+                set_research_service,
+            )
+            set_research_service(service)
+            # Sanity check: confirm the registry actually holds
+            # the same instance. A mismatch is a programming
+            # error and would silently break the dispatcher.
+            assert get_research_service() is service, (
+                "research service registry write/read mismatch"
+            )
+        except Exception:
+            logger.exception(
+                "deep_research_registry_register_failed",
+            )
+            raise
     except asyncio.CancelledError:
         await rollback()
         raise

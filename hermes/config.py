@@ -1248,6 +1248,24 @@ class Settings(BaseSettings):
         validation_alias="HERMES_DEEP_RESEARCH_RECOVERY_RUNNING_STUCK_HOURS",
         description="Running sin output > N horas → reset pending + re-enqueue (caso 2).",
     )
+    # DR-Q1A scheduler remediation: Case 6 grace window. A
+    # ``pending`` row whose ``updated_at`` is older than this and
+    # has no scheduler entry is re-enqueued. A fresh in-flight
+    # enqueue lands in well under 60s, so the grace never catches
+    # a healthy queue; a real gap (e.g. crash between DB create
+    # and scheduler add_job) is caught within one startup cycle.
+    deep_research_recovery_pending_gap_grace_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=600,
+        validation_alias="HERMES_DEEP_RESEARCH_RECOVERY_PENDING_GAP_GRACE_SECONDS",
+        description=(
+            "Pending-without-scheduler-entry grace in seconds "
+            "(Case 6 recovery). 60s default balances a healthy "
+            "in-flight enqueue (lands in well under 60s) against "
+            "a real gap (caught within one startup cycle)."
+        ),
+    )
 
     # Slice 1C2: report content retrieval settings. The read path is
     # ``<data_root>/<job_id>.md`` derived from the validated 12-char
