@@ -664,10 +664,7 @@ async def test_k_submit_job_enqueue_failure_compensates_row(
     or the WHERE clause (``AND status = 'pending'``), this test
     catches it.
     """
-    from hermes.jobs.exceptions import (
-        SchedulerEnqueueError,
-        SchedulerUnavailableError,
-    )
+    from hermes.jobs.exceptions import SchedulerUnavailableError
     from hermes.jobs.models import CreateJobRequest
     from hermes.jobs.service import DeepResearchService
 
@@ -677,7 +674,7 @@ async def test_k_submit_job_enqueue_failure_compensates_row(
     try:
         # Force add_job to raise so the next enqueue fails
         # through to the compensation path.
-        real_scheduler = scheduler._scheduler  # noqa: SLF001
+        real_scheduler = scheduler._scheduler  # test fixture needs the inner APScheduler to monkey-patch add_job
 
         def boom(*a, **kw):
             raise TypeError("simulated_add_job_failure")
@@ -734,7 +731,7 @@ async def test_k_submit_job_enqueue_failure_compensates_row(
         )
 
         # The jobstore has no entry for the compensated row.
-        jobstore = SQLAlchemyJobStore(url=scheduler._jobstore_url)  # noqa: SLF001
+        jobstore = SQLAlchemyJobStore(url=scheduler._jobstore_url)  # test fixture needs the same file URL
         try:
             apscheduler_row = jobstore.lookup_job(row["id"])
             assert apscheduler_row is None, (
