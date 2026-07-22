@@ -22,6 +22,7 @@ import os
 import pickle
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -665,7 +666,6 @@ async def _invoke_dispatch_with_empty_registry(
     Returns the ``RegistryMissingTransition`` enum value the
     dispatcher applied (or determined as a no-op).
     """
-    import os as _os
     from hermes.jobs import dispatcher as dispatcher_mod
 
     clear_research_service()
@@ -749,7 +749,6 @@ async def test_h3_registry_absent_cancelling_to_cancelled(
     A row that was ``cancelling`` must reach ``cancelled``;
     it must never become ``failed``.
     """
-    from hermes.jobs.cost import format_now
 
     job_id = uuid.uuid4().hex[:12]
     await _seed_research_job_in_state(
@@ -1337,7 +1336,7 @@ async def test_recovery_lookup_error_does_not_reenqueue(
         DeepResearchScheduler.enqueue = counting_enqueue  # type: ignore[method-assign]
         try:
             settings_short = _settings_with_short_grace(settings)
-            recovered = await recover_research_jobs(
+            await recover_research_jobs(
                 db=db,
                 notifier=AsyncMock(),
                 settings=settings_short,
