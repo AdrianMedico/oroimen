@@ -268,24 +268,36 @@ async def recover_research_jobs(
         if (job.get("status") or "").lower() != "pending":
             continue
         # If the scheduler still has the entry, leave it alone:
-        # this is a healthy queued job, not a gap.
+        # this is a healthy queued job, not a gap. We use the
+        # truthful ``inspect_job`` API so a LOOKUP_FAILED (e.g.
+        # SQL engine disposed) is treated as unknown and the
+        # job is NOT re-enqueued. Re-enqueueing on unknown
+        # membership would risk creating a duplicate scheduler
+        # entry if the actual row exists.
         if scheduler is not None:
-            try:
-                if scheduler.get_job(job_id) is not None:
-                    logger.info(
-                        "recovery_pending_gap_skipped_healthy",
-                        extra={"job_id": job_id},
-                    )
-                    continue
-            except Exception:
-                logger.exception(
-                    "recovery_pending_gap_lookup_failed",
+            from hermes.jobs.scheduler import JobLookupState
+
+            membership = scheduler.inspect_job(job_id)
+            if membership is JobLookupState.PRESENT:
+                logger.info(
+                    "recovery_pending_gap_skipped_healthy",
                     extra={"job_id": job_id},
                 )
-                # If we cannot determine the scheduler state,
-                # be conservative: do NOT re-enqueue (avoid
-                # duplicates if the entry actually exists).
                 continue
+            if membership is JobLookupState.LOOKUP_FAILED:
+                logger.warning(
+                    "recovery_pending_gap_lookup_unknown_skipped",
+                    extra={"job_id": job_id},
+                )
+                # Unknown membership: be conservative. Do NOT
+                # re-enqueue (avoid duplicates if the entry
+                # actually exists but is currently unreadable).
+                # The next recovery sweep will retry; if the
+                # lookup keeps failing the operator will see
+                # the log lines and investigate.
+                continue
+            # membership is JobLookupState.ABSENT → fall through
+            # to the re-enqueue path below.
         # No scheduler entry → re-enqueue. The persisted callable
         # is now the module-level dispatcher, so add_job will
         # not fail on pickling.

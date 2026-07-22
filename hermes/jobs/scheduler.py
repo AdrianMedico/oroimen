@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -63,6 +64,32 @@ from hermes.jobs.exceptions import SchedulerEnqueueError, SchedulerUnavailableEr
 from hermes.jobs.models import JobStatus
 
 logger = logging.getLogger(__name__)
+
+
+class JobLookupState(enum.StrEnum):
+    """Truthful scheduler-membership lookup result.
+
+    The recovery loop and other careful callers must distinguish
+    three outcomes:
+
+    - ``PRESENT`` — the jobstore row exists for this ``job_id``.
+    - ``ABSENT`` — the jobstore has no row for this ``job_id``.
+    - ``LOOKUP_FAILED`` — the underlying lookup raised (e.g. the
+      APScheduler jobstore's SQL engine is broken, the database
+      is locked, or the engine has been disposed). Callers MUST
+      treat this as unknown: re-enqueueing would risk a duplicate
+      scheduler entry (the actual row may exist but be
+      unreadable).
+
+    The previous ``get_job`` API collapsed all three into
+    ``None`` (a C-style "absent" sentinel). That conversion
+    silently destroyed the LOOKUP_FAILED signal. This enum
+    restores the distinction.
+    """
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    LOOKUP_FAILED = "lookup_failed"
 
 
 class DeepResearchScheduler:
@@ -378,6 +405,19 @@ class DeepResearchScheduler:
         # failure can leave a partially written job. The
         # post-add lookup confirms the job is in the jobstore
         # before we declare success.
+        #
+        # If the post-add lookup FAILS or RETURNS NONE, the
+        # entry may have been partially persisted (the engine
+        # may have written the row but failed to register the
+        # cached object, or the engine disposed itself between
+        # the add and the lookup). In either case we MUST do a
+        # best-effort ``remove_job`` so a later recovery sweep
+        # does not pick the row up and try to fire a job whose
+        # row is already in ``failed`` (via submit_job
+        # compensation). The remove is best-effort: a remove
+        # failure is logged but the API still returns truthful
+        # 503 by raising SchedulerEnqueueError, which submit_job
+        # catches and compensates.
         try:
             lookup = self._scheduler.get_job(job_id)
         except Exception as exc:
@@ -386,6 +426,8 @@ class DeepResearchScheduler:
                 "research_scheduler_post_add_lookup_failed",
                 extra={"job_id": job_id, "error_type": error_type},
             )
+            # Best-effort cleanup before raising.
+            self.remove_job_best_effort(job_id)
             raise SchedulerEnqueueError(
                 f"post-add lookup failed for {job_id}: {error_type}"
             ) from exc
@@ -394,6 +436,8 @@ class DeepResearchScheduler:
                 "research_scheduler_post_add_lookup_missing",
                 extra={"job_id": job_id},
             )
+            # Best-effort cleanup before raising.
+            self.remove_job_best_effort(job_id)
             raise SchedulerEnqueueError(
                 f"post-add lookup returned None for {job_id}"
             )
@@ -444,6 +488,13 @@ class DeepResearchScheduler:
         callers do not need to know the APScheduler is alive
         or not. Returns ``None`` if the scheduler is not started
         or the job is not in the jobstore. Never raises.
+
+        Note: this method intentionally collapses PRESENT/ABSENT
+        into a nullable object to preserve the existing
+        best-effort cancellation contract. Recovery and other
+        callers that need the truthful distinction between
+        ABSENT and LOOKUP_FAILED should use ``inspect_job``
+        instead.
         """
         if self._scheduler is None:
             return None
@@ -455,6 +506,86 @@ class DeepResearchScheduler:
                 extra={"job_id": job_id},
             )
             return None
+
+    def inspect_job(self, job_id: str) -> JobLookupState:
+        """Truthful scheduler-membership lookup.
+
+        Returns one of:
+
+        - ``JobLookupState.PRESENT`` — the jobstore row exists.
+        - ``JobLookupState.ABSENT`` — the jobstore has no row.
+        - ``JobLookupState.LOOKUP_FAILED`` — the underlying
+          ``get_job`` raised (engine disposed, database locked,
+          jobstore plugin error, etc.). Callers MUST treat this
+          as unknown and refuse to act on the membership
+          assumption.
+
+        This is the recovery-facing API. ``get_job`` is kept as
+        a best-effort boolean for cancellation. The two methods
+        do not duplicate: ``inspect_job`` is for callers that
+        must NOT confuse an unknown lookup with a known absence
+        (e.g. Case 6 pending-gap recovery: re-enqueueing on
+        LOOKUP_FAILED would risk a duplicate scheduler entry).
+
+        The method never raises. APScheduler internals are not
+        exposed: callers only see the enum.
+        """
+        if self._scheduler is None:
+            # A not-started scheduler is genuinely ABSENT
+            # (the job cannot be present in a jobstore that
+            # does not exist yet). Distinguishing this from
+            # LOOKUP_FAILED is correct: a fresh process
+            # genuinely has no jobstore row.
+            return JobLookupState.ABSENT
+        try:
+            job = self._scheduler.get_job(job_id)
+        except Exception:
+            logger.exception(
+                "research_scheduler_inspect_job_lookup_failed",
+                extra={"job_id": job_id},
+            )
+            return JobLookupState.LOOKUP_FAILED
+        if job is None:
+            return JobLookupState.ABSENT
+        return JobLookupState.PRESENT
+
+    def remove_job_best_effort(self, job_id: str) -> bool:
+        """Best-effort remove of a possibly-persisted job entry.
+
+        Used by the post-add lookup hardening path: when
+        ``add_job`` succeeded but the post-add ``get_job`` lookup
+        failed or returned None, the entry may have been
+        partially persisted. The caller will raise
+        ``SchedulerEnqueueError`` so ``submit_job`` compensates
+        the row to ``failed``, but we MUST also remove the
+        possibly-persisted scheduler entry so a later recovery
+        sweep does not pick it up and try to fire a job whose
+        row is already in ``failed``.
+
+        Returns True if a row was removed, False otherwise. The
+        failure path (the lookup error itself) is NOT the
+        concern of this method; this is purely the cleanup
+        path. Never raises; logs on any failure so the
+        operator can investigate manually if needed.
+        """
+        if self._scheduler is None:
+            return False
+        try:
+            job = self._scheduler.get_job(job_id)
+            if job is None:
+                return False
+            self._scheduler.remove_job(job_id)
+            logger.info(
+                "research_scheduler_post_add_best_effort_remove",
+                extra={"job_id": job_id, "removed": True},
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "research_scheduler_post_add_best_effort_remove_failed",
+                extra={"job_id": job_id},
+            )
+            return False
 
     def set_service(self, service: Any) -> None:
         """Inyecta el DeepResearchService DESPUÉS de start().

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import pickle
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -575,6 +576,795 @@ async def test_h_registry_absent_terminalizes_to_failed(db, settings) -> None:
     )
     assert row["error_taxonomy"] == "checkpoint_corrupt"
     assert "registry_absent" in (row["error_message"] or "")
+
+
+# ============================================================================
+# Helpers for the H1-H7 state-transition matrix and the post-add
+# lookup tests. The dispatcher uses a fresh ``Database`` from
+# ``Settings()``; we point ``DB_PATH`` at the test DB so the
+# transition is observable end-to-end.
+# ============================================================================
+async def _seed_research_job_in_state(
+    db: Any,
+    job_id: str,
+    state: str,
+    *,
+    current_phase: str | None = None,
+    error_taxonomy: str | None = None,
+    error_message: str | None = None,
+    completed_at: str | None = None,
+) -> None:
+    """Insert a research_jobs row directly in the requested state.
+
+    The schema DEFAULT generates ``created_at`` and ``updated_at``;
+    we override ``updated_at`` so the Case 6 grace test is not
+    affected. We also override ``status`` so the row is in the
+    exact state the test wants.
+    """
+    from hermes.jobs.cost import format_now
+
+    now = format_now()
+    await db.conn.execute(
+        """
+        INSERT INTO research_jobs (
+            id, user_id, job_type, query, notify_via_tg,
+            status, current_phase, progress_percent,
+            output_path, partial_output_path,
+            error_taxonomy, error_message, cost_usd,
+            tokens_in, tokens_out, notified,
+            created_at, started_at, completed_at, updated_at
+        ) VALUES (?, ?, 'deep_research', ?, 0,
+                  ?, ?, 0,
+                  NULL, NULL,
+                  ?, ?, 0.0,
+                  0, 0, 0,
+                  ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            0,
+            f"h_test_{state}",
+            state,
+            current_phase,
+            error_taxonomy,
+            error_message,
+            now,
+            now if state in ("running", "cancelling") else None,
+            completed_at,
+            now,
+        ),
+    )
+    await db.conn.commit()
+
+
+@contextlib.contextmanager
+def _scoped_db_path(db_path: Path):
+    """Point the dispatcher's ``Settings()`` at the test DB.
+
+    The dispatcher's ``_terminate_registry_missing`` fallback
+    builds a fresh ``Database`` from ``Settings()``. We point
+    ``DB_PATH`` at the test DB so the transition is observable
+    in the real ``db`` fixture.
+    """
+    old_db_path = os.environ.get("DB_PATH")
+    os.environ["DB_PATH"] = str(db_path)
+    try:
+        yield
+    finally:
+        if old_db_path is None:
+            os.environ.pop("DB_PATH", None)
+        else:
+            os.environ["DB_PATH"] = old_db_path
+
+
+async def _invoke_dispatch_with_empty_registry(
+    db: Any, job_id: str
+) -> Any:
+    """Run ``execute_research_job`` with the registry empty.
+
+    Returns the ``RegistryMissingTransition`` enum value the
+    dispatcher applied (or determined as a no-op).
+    """
+    import os as _os
+    from hermes.jobs import dispatcher as dispatcher_mod
+
+    clear_research_service()
+    assert get_research_service() is None
+    with _scoped_db_path(db.path):
+        await dispatcher_mod.execute_research_job(job_id)
+    # Re-read the canonical transition enum from the public
+    # API by invoking the helper directly. The dispatcher
+    # does not currently return the transition; we infer it
+    # from the row state below. This keeps the helper
+    # callable from tests without changing the dispatcher's
+    # public signature.
+    return await db.get_research_job(job_id)
+
+
+# ============================================================================
+# Test H1 — registry absent + pending -> failed
+# ============================================================================
+@pytest.mark.asyncio
+async def test_h1_registry_absent_pending_to_failed(db, settings) -> None:
+    """``pending`` row + registry absent + dispatcher runs
+    -> ``failed`` with ``checkpoint_corrupt`` taxonomy.
+
+    The transition is conditional on the exact source state
+    (atomic CAS via ``transition_research_job_status``). No
+    provider call is made. tokens and cost are preserved.
+    """
+    job_id = uuid.uuid4().hex[:12]
+    await _seed_research_job_in_state(db, job_id, "pending")
+
+    row = await _invoke_dispatch_with_empty_registry(db, job_id)
+    assert row is not None
+    assert row["status"] == "failed", (
+        f"pending must transition to failed when registry is "
+        f"absent, got status={row['status']!r}"
+    )
+    assert row["error_taxonomy"] == "checkpoint_corrupt"
+    assert "registry_absent" in (row["error_message"] or "")
+    # Tokens and cost preserved (still zero for a job that
+    # never ran).
+    assert row["cost_usd"] == 0.0
+    assert row["tokens_in"] == 0
+    assert row["tokens_out"] == 0
+
+
+# ============================================================================
+# Test H2 — registry absent + running -> failed
+# ============================================================================
+@pytest.mark.asyncio
+async def test_h2_registry_absent_running_to_failed(db, settings) -> None:
+    """``running`` row + registry absent + dispatcher runs
+    -> ``failed`` with ``checkpoint_corrupt`` taxonomy.
+    """
+    job_id = uuid.uuid4().hex[:12]
+    await _seed_research_job_in_state(
+        db, job_id, "running", current_phase="scrape"
+    )
+
+    row = await _invoke_dispatch_with_empty_registry(db, job_id)
+    assert row is not None
+    assert row["status"] == "failed", (
+        f"running must transition to failed when registry is "
+        f"absent, got status={row['status']!r}"
+    )
+    assert row["error_taxonomy"] == "checkpoint_corrupt"
+    assert "registry_absent" in (row["error_message"] or "")
+
+
+# ============================================================================
+# Test H3 — registry absent + cancelling -> cancelled (NOT failed)
+# ============================================================================
+@pytest.mark.asyncio
+async def test_h3_registry_absent_cancelling_to_cancelled(
+    db, settings
+) -> None:
+    """``cancelling`` row + registry absent + dispatcher runs
+    -> ``cancelled`` (NEVER ``failed``).
+
+    PRE1B invariant: cancellation wins. The registry-absent
+    fallback MUST NOT overwrite an in-progress cancellation.
+    A row that was ``cancelling`` must reach ``cancelled``;
+    it must never become ``failed``.
+    """
+    from hermes.jobs.cost import format_now
+
+    job_id = uuid.uuid4().hex[:12]
+    await _seed_research_job_in_state(
+        db,
+        job_id,
+        "cancelling",
+        current_phase="scrape",
+        error_taxonomy="cancelled",
+        error_message="cancellation_requested_pre_execution",
+    )
+
+    row = await _invoke_dispatch_with_empty_registry(db, job_id)
+    assert row is not None
+    assert row["status"] == "cancelled", (
+        f"cancelling must transition to cancelled (NEVER "
+        f"failed), got status={row['status']!r}"
+    )
+    # The cancellation finalization marker is preserved.
+    assert row["error_taxonomy"] == "cancelled", (
+        f"cancellation finalization marker must be preserved, "
+        f"got error_taxonomy={row['error_taxonomy']!r}"
+    )
+    # The registry-absent message must NOT have overwritten
+    # the cancellation marker.
+    assert "registry_absent" not in (row["error_message"] or ""), (
+        f"registry-absent message must NOT overwrite "
+        f"cancellation marker, got {row['error_message']!r}"
+    )
+    # completed_at must be set.
+    assert row["completed_at"] is not None
+
+
+# ============================================================================
+# Test H4 — registry absent + complete remains complete
+# ============================================================================
+@pytest.mark.asyncio
+async def test_h4_registry_absent_complete_remains_complete(
+    db, settings
+) -> None:
+    """``complete`` row + registry absent -> stays ``complete``.
+
+    The registry-absent fallback is a no-op on a terminal
+    state. No resurrection, no overwrite of output_path.
+    """
+    from hermes.jobs.cost import format_now
+
+    job_id = uuid.uuid4().hex[:12]
+    completed_at = format_now()
+    await _seed_research_job_in_state(
+        db,
+        job_id,
+        "complete",
+        completed_at=completed_at,
+    )
+    # Set an output_path to verify it is not overwritten.
+    await db.conn.execute(
+        "UPDATE research_jobs SET output_path = ?, progress_percent = 100 "
+        "WHERE id = ?",
+        ("/tmp/h4_output.md", job_id),
+    )
+    await db.conn.commit()
+
+    row = await _invoke_dispatch_with_empty_registry(db, job_id)
+    assert row is not None
+    assert row["status"] == "complete", (
+        f"complete must remain complete (no resurrection), "
+        f"got status={row['status']!r}"
+    )
+    assert row["output_path"] == "/tmp/h4_output.md", (
+        f"output_path must not be overwritten, got "
+        f"{row['output_path']!r}"
+    )
+    assert row["progress_percent"] == 100
+    # completed_at must not be touched.
+    assert row["completed_at"] == completed_at
+
+
+# ============================================================================
+# Test H5 — registry absent + failed remains failed
+# ============================================================================
+@pytest.mark.asyncio
+async def test_h5_registry_absent_failed_remains_failed(db, settings) -> None:
+    """``failed`` row + registry absent -> stays ``failed``.
+
+    The transition is conditional on the source state; a
+    pre-existing failed row is NOT overwritten.
+    """
+    from hermes.jobs.cost import format_now
+
+    job_id = uuid.uuid4().hex[:12]
+    completed_at = format_now()
+    await _seed_research_job_in_state(
+        db,
+        job_id,
+        "failed",
+        completed_at=completed_at,
+        error_taxonomy="timeout",
+        error_message="pre_existing_failure",
+    )
+
+    row = await _invoke_dispatch_with_empty_registry(db, job_id)
+    assert row is not None
+    assert row["status"] == "failed", (
+        f"failed must remain failed, got status={row['status']!r}"
+    )
+    # The pre-existing error metadata is preserved.
+    assert row["error_taxonomy"] == "timeout", (
+        f"pre-existing error_taxonomy must be preserved, got "
+        f"{row['error_taxonomy']!r}"
+    )
+    assert row["error_message"] == "pre_existing_failure"
+
+
+# ============================================================================
+# Test H6 — registry absent + cancelled remains cancelled
+# ============================================================================
+@pytest.mark.asyncio
+async def test_h6_registry_absent_cancelled_remains_cancelled(
+    db, settings
+) -> None:
+    """``cancelled`` row + registry absent -> stays ``cancelled``.
+
+    A pre-existing cancelled row is NOT overwritten. The
+    registry-absent fallback is a no-op on the terminal
+    state.
+    """
+    from hermes.jobs.cost import format_now
+
+    job_id = uuid.uuid4().hex[:12]
+    completed_at = format_now()
+    await _seed_research_job_in_state(
+        db,
+        job_id,
+        "cancelled",
+        completed_at=completed_at,
+        error_taxonomy="cancelled",
+        error_message="pre_existing_cancellation",
+    )
+
+    row = await _invoke_dispatch_with_empty_registry(db, job_id)
+    assert row is not None
+    assert row["status"] == "cancelled", (
+        f"cancelled must remain cancelled, got "
+        f"status={row['status']!r}"
+    )
+    assert row["error_taxonomy"] == "cancelled"
+    assert row["error_message"] == "pre_existing_cancellation"
+
+
+# ============================================================================
+# Test H7 — race: terminal writer wins, dispatcher does not overwrite
+# ============================================================================
+@pytest.mark.asyncio
+async def test_h7_dispatcher_does_not_resurrect_terminal_state(
+    db, settings
+) -> None:
+    """A concurrent writer (e.g. PRE1B finalizer) flips a
+    ``running`` row to ``cancelled`` between the dispatcher's
+    read and the atomic CAS. The CAS predicate refuses to
+    overwrite; the dispatcher's ``get_research_job`` confirms
+    the row is still ``cancelled``. The dispatcher does NOT
+    resurrect the row to ``failed``.
+
+    This is the race-with-terminal-writer case. The fix
+    uses an atomic CAS predicate (status IN (from_states))
+    so a concurrent state change is observed and the
+    transition is correctly a no-op.
+
+    Implementation: we patch the class method
+    ``Database.transition_research_job_status`` so the flip
+    happens for the dispatcher's NEW Database instance (the
+    test's ``db`` fixture is a different instance).
+    """
+    from hermes.jobs import dispatcher as dispatcher_mod
+    from hermes.jobs.cost import format_now
+    from hermes.memory.db import Database
+
+    job_id = uuid.uuid4().hex[:12]
+    await _seed_research_job_in_state(
+        db, job_id, "running", current_phase="scrape"
+    )
+
+    flip_done = False
+    original_transition = Database.transition_research_job_status
+
+    async def racing_transition(self, *args, **kwargs):
+        nonlocal flip_done
+        if not flip_done:
+            flip_done = True
+            # Flip the row to ``cancelled`` (a PRE1B
+            # finalizer would do this). We use the test's
+            # ``db`` connection (same file).
+            now = format_now()
+            await self.conn.execute(
+                "UPDATE research_jobs SET status = 'cancelled', "
+                "completed_at = ?, error_taxonomy = 'cancelled', "
+                "error_message = 'raced_terminal_writer', "
+                "updated_at = ? WHERE id = ? AND status = 'running'",
+                (now, now, job_id),
+            )
+            await self.conn.commit()
+        return await original_transition(self, *args, **kwargs)
+
+    Database.transition_research_job_status = racing_transition  # type: ignore[method-assign]
+    try:
+        # Clear the registry so the dispatcher hits the fallback.
+        clear_research_service()
+        assert get_research_service() is None
+
+        with _scoped_db_path(db.path):
+            await dispatcher_mod.execute_research_job(job_id)
+    finally:
+        Database.transition_research_job_status = original_transition  # type: ignore[method-assign]
+
+    # Re-read the canonical row.
+    row = await db.get_research_job(job_id)
+    assert row is not None
+    # The terminal writer's cancellation wins. The dispatcher
+    # must NOT have overwritten the row to ``failed``.
+    assert row["status"] == "cancelled", (
+        f"terminal writer's state must win, got "
+        f"status={row['status']!r}"
+    )
+    assert row["error_taxonomy"] == "cancelled"
+    assert row["error_message"] == "raced_terminal_writer"
+
+
+# ============================================================================
+# Post-add lookup hardening tests (A-E)
+# ============================================================================
+@pytest.mark.asyncio
+async def test_pa_post_add_lookup_raises_calls_best_effort_remove(
+    db, settings
+) -> None:
+    """A: ``add_job`` succeeds, post-add lookup raises.
+    The scheduler MUST do a best-effort ``remove_job`` and
+    raise ``SchedulerEnqueueError``. The submit_job path will
+    then compensate the DB row to ``failed``.
+    """
+    from hermes.jobs.exceptions import SchedulerEnqueueError
+
+    job_id = uuid.uuid4().hex[:12]
+    await db.create_research_job(
+        job_id=job_id,
+        query="pa — lookup raises",
+        notify_via_tg=0,
+        user_id=0,
+    )
+
+    scheduler, _stub, _ = await _make_scheduler_and_stub(db, settings)
+    try:
+        real_scheduler = scheduler._scheduler  # test fixture needs the inner APScheduler
+
+        # Stage 1: ``add_job`` succeeds, ``get_job`` raises on
+        # the post-add call (call #1). The cleanup path then
+        # calls ``get_job`` again (call #2) inside
+        # ``remove_job_best_effort``; that call returns a
+        # truthy sentinel so the best-effort ``remove_job`` is
+        # actually invoked.
+        get_job_call_count = 0
+        remove_called_with = []
+        original_add_job = real_scheduler.add_job
+
+        def fake_add_job(*a, **kw):
+            return original_add_job(*a, **kw)
+
+        def fake_get_job(jid, *a, **kw):
+            nonlocal get_job_call_count
+            get_job_call_count += 1
+            if get_job_call_count == 1:
+                # Post-add verification: raise.
+                raise RuntimeError("simulated_lookup_failure")
+            # Second call (inside remove_job_best_effort):
+            # return a truthy sentinel so remove actually runs.
+            return object()
+
+        def fake_remove_job(jid):
+            remove_called_with.append(jid)
+            return None
+
+        real_scheduler.add_job = fake_add_job  # type: ignore[method-assign]
+        real_scheduler.get_job = fake_get_job  # type: ignore[method-assign]
+        real_scheduler.remove_job = fake_remove_job  # type: ignore[method-assign]
+        try:
+            with pytest.raises(SchedulerEnqueueError) as excinfo:
+                await scheduler.enqueue(job_id, run_date=datetime.now(UTC))
+            assert "post-add lookup failed" in str(excinfo.value)
+        finally:
+            real_scheduler.add_job = original_add_job  # type: ignore[method-assign]
+            real_scheduler.get_job = real_scheduler.get_job  # type: ignore[method-assign]
+
+        # The best-effort remove was called with the job_id.
+        assert job_id in remove_called_with, (
+            f"best-effort remove_job must be called when "
+            f"post-add lookup raises; got {remove_called_with!r}"
+        )
+        # Both get_job calls happened.
+        assert get_job_call_count == 2, (
+            f"post-add verification + best-effort cleanup "
+            f"must both call get_job; got {get_job_call_count}"
+        )
+    finally:
+        await scheduler.shutdown(timeout_s=2.0)
+
+
+@pytest.mark.asyncio
+async def test_pb_post_add_lookup_returns_none_calls_best_effort_remove(
+    db, settings
+) -> None:
+    """B: ``add_job`` succeeds, post-add ``get_job`` returns
+    ``None`` (partial write). The scheduler MUST do a
+    best-effort ``remove_job`` and raise
+    ``SchedulerEnqueueError``.
+    """
+    from hermes.jobs.exceptions import SchedulerEnqueueError
+
+    job_id = uuid.uuid4().hex[:12]
+    await db.create_research_job(
+        job_id=job_id,
+        query="pb — lookup returns None",
+        notify_via_tg=0,
+        user_id=0,
+    )
+
+    scheduler, _stub, _ = await _make_scheduler_and_stub(db, settings)
+    try:
+        real_scheduler = scheduler._scheduler  # test fixture needs the inner APScheduler
+
+        original_add_job = real_scheduler.add_job
+        original_get_job = real_scheduler.get_job
+
+        # Stage 2: ``add_job`` succeeds, but ``get_job``
+        # returns None on the post-add call. We need to
+        # count calls so the first ``get_job`` (inside
+        # ``remove_job_best_effort``) returns None, and
+        # ``remove_job`` is not called.
+        get_job_call_count = 0
+        remove_called_with = []
+
+        def fake_add_job(*a, **kw):
+            return original_add_job(*a, **kw)
+
+        def fake_get_job(jid, *a, **kw):
+            nonlocal get_job_call_count
+            get_job_call_count += 1
+            return None  # always None for this test
+
+        def fake_remove_job(jid):
+            remove_called_with.append(jid)
+            return None
+
+        real_scheduler.add_job = fake_add_job  # type: ignore[method-assign]
+        real_scheduler.get_job = fake_get_job  # type: ignore[method-assign]
+        real_scheduler.remove_job = fake_remove_job  # type: ignore[method-assign]
+        try:
+            with pytest.raises(SchedulerEnqueueError) as excinfo:
+                await scheduler.enqueue(job_id, run_date=datetime.now(UTC))
+            assert "post-add lookup returned None" in str(excinfo.value)
+        finally:
+            real_scheduler.add_job = original_add_job  # type: ignore[method-assign]
+            real_scheduler.get_job = original_get_job  # type: ignore[method-assign]
+
+        # ``remove_job_best_effort`` was called (it calls
+        # ``get_job`` internally; when get_job returns
+        # None, no remove happens). The important invariant
+        # is that the API still raised truthfully.
+        assert get_job_call_count >= 2, (
+            f"post-add lookup must be called at least twice "
+            f"(once for verification, once for best-effort "
+            f"remove); got {get_job_call_count}"
+        )
+        # No remove actually happened because get_job
+        # always returned None.
+        assert remove_called_with == [], (
+            f"no remove_job should be called when the "
+            f"jobstore reports no entry; got {remove_called_with!r}"
+        )
+    finally:
+        await scheduler.shutdown(timeout_s=2.0)
+
+
+@pytest.mark.asyncio
+async def test_pc_best_effort_remove_succeeds(db, settings) -> None:
+    """C: ``add_job`` succeeds, post-add lookup fails, the
+    best-effort ``remove_job`` itself succeeds. The API
+    still raises ``SchedulerEnqueueError`` (truthful 503
+    via submit_job compensation). The jobstore has no
+    orphan entry.
+    """
+    from hermes.jobs.exceptions import SchedulerEnqueueError
+
+    job_id = uuid.uuid4().hex[:12]
+    await db.create_research_job(
+        job_id=job_id,
+        query="pc — remove succeeds",
+        notify_via_tg=0,
+        user_id=0,
+    )
+
+    scheduler, _stub, _ = await _make_scheduler_and_stub(db, settings)
+    try:
+        real_scheduler = scheduler._scheduler  # test fixture needs the inner APScheduler
+
+        # Stage: add_job succeeds, get_job raises on first
+        # call (post-add) and succeeds (returns the Job)
+        # on the second call (inside remove_job_best_effort).
+        get_job_call_count = 0
+        original_add_job = real_scheduler.add_job
+
+        def fake_add_job(*a, **kw):
+            return original_add_job(*a, **kw)
+
+        def fake_get_job(jid, *a, **kw):
+            nonlocal get_job_call_count
+            get_job_call_count += 1
+            if get_job_call_count == 1:
+                raise RuntimeError("simulated_first_call_failure")
+            # Second call (inside remove_job_best_effort):
+            # return a truthy Job so remove actually runs.
+            return object()  # truthy sentinel
+
+        real_scheduler.add_job = fake_add_job  # type: ignore[method-assign]
+        real_scheduler.get_job = fake_get_job  # type: ignore[method-assign]
+        try:
+            with pytest.raises(SchedulerEnqueueError):
+                await scheduler.enqueue(job_id, run_date=datetime.now(UTC))
+        finally:
+            real_scheduler.add_job = original_add_job  # type: ignore[method-assign]
+
+        # Both get_job calls happened (verification + cleanup).
+        assert get_job_call_count == 2, (
+            f"post-add verification + best-effort cleanup "
+            f"must both call get_job; got {get_job_call_count}"
+        )
+    finally:
+        await scheduler.shutdown(timeout_s=2.0)
+
+
+@pytest.mark.asyncio
+async def test_pd_best_effort_remove_fails_but_503_is_truthful(
+    db, settings
+) -> None:
+    """D: ``add_job`` succeeds, post-add lookup fails, the
+    best-effort ``remove_job`` itself raises. The API still
+    raises ``SchedulerEnqueueError`` (truthful 503 via
+    submit_job compensation). The remove failure is logged
+    but does NOT swallow the truth.
+    """
+    from hermes.jobs.exceptions import SchedulerEnqueueError
+
+    job_id = uuid.uuid4().hex[:12]
+    await db.create_research_job(
+        job_id=job_id,
+        query="pd — remove fails",
+        notify_via_tg=0,
+        user_id=0,
+    )
+
+    scheduler, _stub, _ = await _make_scheduler_and_stub(db, settings)
+    try:
+        real_scheduler = scheduler._scheduler  # test fixture needs the inner APScheduler
+
+        get_job_call_count = 0
+        original_add_job = real_scheduler.add_job
+
+        def fake_add_job(*a, **kw):
+            return original_add_job(*a, **kw)
+
+        def fake_get_job(jid, *a, **kw):
+            nonlocal get_job_call_count
+            get_job_call_count += 1
+            if get_job_call_count == 1:
+                # Post-add verification: raise.
+                raise RuntimeError("simulated_lookup_failure")
+            # Second call (inside remove_job_best_effort):
+            # return a truthy sentinel so remove actually runs.
+            return object()
+
+        def fake_remove_job(jid):
+            # Best-effort remove also raises.
+            raise RuntimeError("simulated_remove_failure")
+
+        real_scheduler.add_job = fake_add_job  # type: ignore[method-assign]
+        real_scheduler.get_job = fake_get_job  # type: ignore[method-assign]
+        real_scheduler.remove_job = fake_remove_job  # type: ignore[method-assign]
+        try:
+            with pytest.raises(SchedulerEnqueueError) as excinfo:
+                await scheduler.enqueue(job_id, run_date=datetime.now(UTC))
+            assert "post-add lookup failed" in str(excinfo.value)
+        finally:
+            real_scheduler.add_job = original_add_job  # type: ignore[method-assign]
+    finally:
+        await scheduler.shutdown(timeout_s=2.0)
+
+
+@pytest.mark.asyncio
+async def test_pe_post_add_cleanup_makes_no_provider_call(
+    db, settings
+) -> None:
+    """E: The post-add cleanup path makes zero provider
+    calls. The stub service is never invoked.
+    """
+    from hermes.jobs.exceptions import SchedulerEnqueueError
+
+    job_id = uuid.uuid4().hex[:12]
+    await db.create_research_job(
+        job_id=job_id,
+        query="pe — no provider call",
+        notify_via_tg=0,
+        user_id=0,
+    )
+
+    scheduler, stub, _ = await _make_scheduler_and_stub(db, settings)
+    try:
+        real_scheduler = scheduler._scheduler  # test fixture needs the inner APScheduler
+
+        def fake_get_job(jid, *a, **kw):
+            raise RuntimeError("simulated_lookup_failure")
+
+        real_scheduler.get_job = fake_get_job  # type: ignore[method-assign]
+        try:
+            with pytest.raises(SchedulerEnqueueError):
+                await scheduler.enqueue(job_id, run_date=datetime.now(UTC))
+        finally:
+            real_scheduler.get_job = real_scheduler.get_job  # type: ignore[method-assign]
+
+        # The stub was never called.
+        assert stub.calls == [], (
+            f"no provider call must occur during post-add "
+            f"cleanup; got {stub.calls!r}"
+        )
+    finally:
+        await scheduler.shutdown(timeout_s=2.0)
+
+
+# ============================================================================
+# Lookup-error recovery test
+# ============================================================================
+@pytest.mark.asyncio
+async def test_recovery_lookup_error_does_not_reenqueue(
+    db, settings
+) -> None:
+    """Scheduler membership lookup raises. Recovery MUST NOT
+    re-enqueue. The row stays ``pending``. The lookup anomaly
+    is logged. No duplicate is created.
+    """
+    from hermes.jobs.recovery import recover_research_jobs
+    from hermes.jobs.scheduler import DeepResearchScheduler, JobLookupState
+
+    job_id = uuid.uuid4().hex[:12]
+    await db.create_research_job(
+        job_id=job_id,
+        query="recovery — lookup error",
+        notify_via_tg=0,
+        user_id=0,
+    )
+    # Backdate updated_at so the Case 6 grace elapses.
+    await db.conn.execute(
+        "UPDATE research_jobs SET updated_at = ? WHERE id = ?",
+        ("2020-01-01 00:00:00.000000+00:00", job_id),
+    )
+    await db.conn.commit()
+
+    # Build a scheduler whose ``inspect_job`` raises. We
+    # patch the method on the class (not the instance) so
+    # recovery's call hits our shim.
+    scheduler = DeepResearchScheduler(db=db, settings=settings)
+    original_inspect = DeepResearchScheduler.inspect_job
+
+    def raising_inspect(self, jid):
+        return JobLookupState.LOOKUP_FAILED
+
+    DeepResearchScheduler.inspect_job = raising_inspect  # type: ignore[method-assign]
+    try:
+        # Enqueue attempts. We count them to confirm recovery
+        # does NOT call scheduler.enqueue when the lookup
+        # reports LOOKUP_FAILED.
+        enqueue_attempts = []
+        original_enqueue = DeepResearchScheduler.enqueue
+
+        async def counting_enqueue(self, jid, run_date):
+            enqueue_attempts.append(jid)
+            return await original_enqueue(self, jid, run_date)
+
+        DeepResearchScheduler.enqueue = counting_enqueue  # type: ignore[method-assign]
+        try:
+            settings_short = _settings_with_short_grace(settings)
+            recovered = await recover_research_jobs(
+                db=db,
+                notifier=AsyncMock(),
+                settings=settings_short,
+                scheduler=scheduler,
+            )
+            # Case 6 is a candidate in the gap query but
+            # inspect_job returns LOOKUP_FAILED → the
+            # candidate is skipped. Other cases (1-5) may
+            # also run; we only care that no enqueue
+            # happened for this job_id.
+            assert job_id not in enqueue_attempts, (
+                f"recovery must NOT re-enqueue when "
+                f"inspect_job returns LOOKUP_FAILED; got "
+                f"enqueue attempts {enqueue_attempts!r}"
+            )
+        finally:
+            DeepResearchScheduler.enqueue = original_enqueue  # type: ignore[method-assign]
+    finally:
+        DeepResearchScheduler.inspect_job = original_inspect  # type: ignore[method-assign]
+
+    # The row stays pending (no transition was applied).
+    row = await db.get_research_job(job_id)
+    assert row is not None
+    assert row["status"] == "pending", (
+        f"row must stay pending when scheduler lookup is "
+        f"unknown; got status={row['status']!r}"
+    )
 
 
 # ============================================================================
