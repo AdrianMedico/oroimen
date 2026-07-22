@@ -642,3 +642,105 @@ async def test_j_no_provider_calls_in_persistence_path(db, settings) -> None:
         assert stub.calls == []
     finally:
         await scheduler.shutdown(timeout_s=2.0)
+
+
+# ============================================================================
+# Test K — Service-level compensation path
+# ============================================================================
+@pytest.mark.asyncio
+async def test_k_submit_job_enqueue_failure_compensates_row(
+    db, settings
+) -> None:
+    """When ``scheduler.enqueue`` raises ``SchedulerEnqueueError``,
+    the service-level ``submit_job`` MUST compensate the row to
+    ``failed`` with ``checkpoint_corrupt`` taxonomy, and then
+    raise ``SchedulerUnavailableError`` (HTTP 503 mapping). The
+    caller must NOT see a 201; the row must NOT stay in
+    ``pending`` indefinitely.
+
+    This test exercises the FULL compensation path that test_e
+    only verifies at the scheduler level. If a future refactor
+    breaks the order-of-operations (compensation before re-raise)
+    or the WHERE clause (``AND status = 'pending'``), this test
+    catches it.
+    """
+    from hermes.jobs.exceptions import (
+        SchedulerEnqueueError,
+        SchedulerUnavailableError,
+    )
+    from hermes.jobs.models import CreateJobRequest
+    from hermes.jobs.service import DeepResearchService
+
+    # Build a real scheduler + a stub service. We will then
+    # monkey-patch the inner scheduler's add_job to raise.
+    scheduler, _stub, _ = await _make_scheduler_and_stub(db, settings)
+    try:
+        # Force add_job to raise so the next enqueue fails
+        # through to the compensation path.
+        real_scheduler = scheduler._scheduler  # noqa: SLF001
+
+        def boom(*a, **kw):
+            raise TypeError("simulated_add_job_failure")
+
+        real_scheduler.add_job = boom
+
+        # Build a minimal DeepResearchService. submit_job only
+        # touches: _db, _settings, _scheduler, _check_daily_budget,
+        # _now_dt. The other deps (notifier, llm, search, fetcher,
+        # report_store) are not exercised by submit_job, so
+        # MagicMocks are safe.
+        service = DeepResearchService(
+            db=db,
+            notifier=AsyncMock(),
+            llm_router=AsyncMock(),
+            web_search=AsyncMock(),
+            fetcher=AsyncMock(),
+            settings=settings,
+            scheduler=scheduler,
+            report_store=None,
+        )
+
+        request = CreateJobRequest(
+            query="test k — service compensation",
+            notify_via_tg=False,
+        )
+
+        # The submit_job MUST raise SchedulerUnavailableError.
+        with pytest.raises(SchedulerUnavailableError) as excinfo:
+            await service.submit_job(request, user_id=0)
+        # The error message references the inner enqueue error.
+        assert "Enqueue refused by jobstore" in str(excinfo.value)
+
+        # The row is compensated to failed / checkpoint_corrupt.
+        # Find the row by querying the latest failed job.
+        async with db.conn.execute(
+            "SELECT id, status, error_taxonomy, error_message "
+            "FROM research_jobs WHERE error_taxonomy = 'checkpoint_corrupt' "
+            "ORDER BY updated_at DESC LIMIT 1"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row is not None, (
+            "compensation must have transitioned a row to "
+            "failed with checkpoint_corrupt taxonomy"
+        )
+        assert row["status"] == "failed"
+        assert row["error_taxonomy"] == "checkpoint_corrupt"
+        assert (
+            "enqueue_serialization_or_persistence_failed"
+            in (row["error_message"] or "")
+        ), (
+            f"error_message must contain the canonical prefix, "
+            f"got {row['error_message']!r}"
+        )
+
+        # The jobstore has no entry for the compensated row.
+        jobstore = SQLAlchemyJobStore(url=scheduler._jobstore_url)  # noqa: SLF001
+        try:
+            apscheduler_row = jobstore.lookup_job(row["id"])
+            assert apscheduler_row is None, (
+                "compensated row must NOT have a jobstore entry"
+            )
+        finally:
+            jobstore.shutdown()
+    finally:
+        await scheduler.shutdown(timeout_s=2.0)

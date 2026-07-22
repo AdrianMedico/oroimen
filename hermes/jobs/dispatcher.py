@@ -76,7 +76,9 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from datetime import UTC, datetime
+from pathlib import Path
+
+from hermes.jobs.cost import format_now
 
 logger = logging.getLogger(__name__)
 
@@ -99,9 +101,10 @@ async def execute_research_job(job_id: str) -> None:
     resolved at call time via the process-local registry.
     """
     # Local imports to keep this module import-cheap and to avoid
-    # a circular import: service_registry imports nothing from
-    # service; service imports service_registry in its
-    # constructor. The dispatcher imports both lazily.
+    # a circular import. The service depends on the registry
+    # only through the dispatcher's call into
+    # service._run_research(job_id); neither service nor
+    # service_registry imports the other at module load time.
     from hermes.jobs.service_registry import get_research_service
 
     service = get_research_service()
@@ -144,12 +147,10 @@ async def _terminate_registry_missing(job_id: str) -> None:
     from hermes.memory.db import Database
 
     settings = Settings()
-    from pathlib import Path as _Path
-
-    db = Database(_Path(str(settings.db_path)))
+    db = Database(Path(str(settings.db_path)))
     await db.initialize()
 
-    now = datetime.now(UTC).isoformat()
+    now = format_now()
     try:
         error_message = (
             "registry_absent_pre_execution: research service was not "
