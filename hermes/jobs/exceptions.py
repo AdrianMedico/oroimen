@@ -43,6 +43,21 @@ class SchedulerUnavailableError(Exception):
     """Raised when DeepResearchScheduler.start() hasn't completed yet. HTTP 503."""
 
 
+class SchedulerEnqueueError(Exception):
+    """Raised when ``enqueue`` could not persist the job to the jobstore.
+
+    Distinct from ``SchedulerUnavailableError`` (which is a
+    transient "try later" condition). ``SchedulerEnqueueError`` is
+    a "this enqueue will not succeed unless the operator
+    intervenes" condition: the jobstore refused the row, the
+    serialization failed, or the post-add lookup returned ``None``.
+
+    The HTTP layer maps this to a 503 (NOT a 201). The submit
+    path compensates the row in the DB to a terminal ``failed``
+    state so the row does not stay in ``pending`` indefinitely.
+    """
+
+
 class JobStateInvalid(Exception):
     """Internal exception: a phase guard observed a row in an unexpected
     non-terminal state that prevents the phase from continuing safely.

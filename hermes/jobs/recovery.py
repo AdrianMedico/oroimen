@@ -220,6 +220,91 @@ async def recover_research_jobs(
         except Exception:
             logger.exception("recovery_cancelling_failed", extra={"job_id": job_id})
 
+    # === Caso 6: pending-without-scheduler-entry (recoverable enqueue gap) ===
+    #
+    # The pickle-error bug left rows in ``pending`` with no
+    # scheduler entry. After the fix, fresh enqueues persist the
+    # row and the scheduler entry in the same atomic-like step, so
+    # a row in ``pending + no scheduler entry`` indicates a real
+    # enqueue gap (a crash between DB create and scheduler
+    # add_job, or a serialisation failure that we did not
+    # compensate correctly).
+    #
+    # To avoid racing with an in-flight healthy enqueue, we
+    # require a small grace period (default 60 seconds) since
+    # the row was last updated. A row that is in ``pending`` and
+    # has no scheduler entry AND was last updated more than
+    # ``recovery_pending_gap_grace_seconds`` ago is a recoverable
+    # gap and is re-enqueued.
+    #
+    # The 2 aborted jobs (19d4ed181ac3, 18014f2cc834) were
+    # intentionally terminalized to ``failed`` in a previous
+    # mission; they are not in ``pending`` and are therefore not
+    # touched by this case.
+    try:
+        gap_grace_s = int(
+            getattr(
+                settings,
+                "deep_research_recovery_pending_gap_grace_seconds",
+                60,
+            )
+        )
+    except (AttributeError, TypeError):
+        gap_grace_s = 60
+    gap_cutoff = datetime.now(UTC) - timedelta(seconds=gap_grace_s)
+    gap_cutoff_str = format_now_at(gap_cutoff)
+    gap_candidates = []
+    try:
+        gap_candidates = await db.list_research_jobs_pending_updated_before(
+            cutoff_str=gap_cutoff_str, limit=100
+        )
+    except Exception:
+        logger.exception("recovery_pending_gap_query_failed")
+    for job in gap_candidates:
+        job_id = job["id"]
+        # Belt-and-braces: skip terminal states (the query should
+        # already filter to pending, but the schema is the source
+        # of truth).
+        if (job.get("status") or "").lower() != "pending":
+            continue
+        # If the scheduler still has the entry, leave it alone:
+        # this is a healthy queued job, not a gap.
+        if scheduler is not None:
+            try:
+                if scheduler.get_job(job_id) is not None:
+                    logger.info(
+                        "recovery_pending_gap_skipped_healthy",
+                        extra={"job_id": job_id},
+                    )
+                    continue
+            except Exception:
+                logger.exception(
+                    "recovery_pending_gap_lookup_failed",
+                    extra={"job_id": job_id},
+                )
+                # If we cannot determine the scheduler state,
+                # be conservative: do NOT re-enqueue (avoid
+                # duplicates if the entry actually exists).
+                continue
+        # No scheduler entry → re-enqueue. The persisted callable
+        # is now the module-level dispatcher, so add_job will
+        # not fail on pickling.
+        if scheduler is not None:
+            try:
+                await scheduler.enqueue(
+                    job_id, run_date=datetime.now(UTC)
+                )
+                logger.warning(
+                    "recovery_pending_gap_reenqueued",
+                    extra={"job_id": job_id, "grace_seconds": gap_grace_s},
+                )
+                recovered += 1
+            except Exception:
+                logger.exception(
+                    "recovery_pending_gap_reenqueue_failed",
+                    extra={"job_id": job_id},
+                )
+
     if recovered:
         logger.info("recovery_summary", extra={"total_recovered": recovered})
     return recovered

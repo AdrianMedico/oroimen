@@ -55,6 +55,7 @@ from hermes.jobs.exceptions import (
     JobNotRetryableError,
     JobStateInvalid,
     PhaseError,
+    SchedulerEnqueueError,
     SchedulerUnavailableError,
 )
 from hermes.jobs.models import (
@@ -565,6 +566,53 @@ class DeepResearchService:
             raise SchedulerUnavailableError("Scheduler not initialized")
         try:
             await self._scheduler.enqueue(job_id, run_date=self._now_dt())
+        except SchedulerEnqueueError as exc:
+            # The jobstore refused the row or the post-add lookup
+            # returned None. We MUST transition the row to a
+            # terminal ``failed`` state so it does not stay in
+            # ``pending`` indefinitely. We also MUST NOT return a
+            # 201 — the row was created but never scheduled.
+            # The caller will see a 503 (the chain
+            # ``SchedulerEnqueueError -> SchedulerUnavailableError``
+            # below preserves the existing HTTP 503 mapping).
+            #
+            # Tokens=0, cost=0 are preserved: no provider call
+            # was made, no token-usage row exists, and the
+            # transition is a DB-only update.
+            error_message = (
+                f"enqueue_serialization_or_persistence_failed: {exc}"
+            )
+            try:
+                await self._db.conn.execute(
+                    """
+                    UPDATE research_jobs
+                    SET status = 'failed',
+                        completed_at = ?,
+                        error_taxonomy = 'checkpoint_corrupt',
+                        error_message = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND status = 'pending'
+                    """,
+                    (format_now(), error_message, format_now(), job_id),
+                )
+                await self._db.conn.commit()
+                logger.error(
+                    "submit_job_enqueue_compensated",
+                    extra={"job_id": job_id, "error_type": type(exc).__name__},
+                )
+            except Exception:
+                logger.exception(
+                    "submit_job_enqueue_compensation_failed",
+                    extra={"job_id": job_id},
+                )
+                # Fall through and raise; the row will be
+                # cleaned up by the next recovery sweep (which
+                # now handles the ``pending + no scheduler
+                # entry`` case) or by the operator.
+            raise SchedulerUnavailableError(
+                f"Enqueue refused by jobstore: {exc}"
+            ) from exc
         except Exception as exc:
             logger.exception("submit_job_enqueue_failed", extra={"job_id": job_id})
             raise SchedulerUnavailableError(f"Enqueue failed: {exc}") from exc

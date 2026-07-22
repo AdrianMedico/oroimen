@@ -3476,6 +3476,34 @@ class Database:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    async def list_research_jobs_pending_updated_before(
+        self, cutoff_str: str, limit: int = 100
+    ) -> list[dict]:
+        """Lista pending jobs con updated_at < cutoff (caso 6 recovery).
+
+        Caso 6 del recovery: ``pending + no scheduler entry`` (recoverable
+        enqueue gap). A pending row that has not been updated in the
+        last ``cutoff`` seconds is a candidate for re-enqueue. The
+        caller (recovery) MUST also verify via the scheduler's
+        public ``get_job`` wrapper that the row is not in the
+        jobstore before re-enqueuing (a healthy fresh enqueue
+        appears here because the row was just persisted; the
+        scheduler entry is added microseconds later).
+        """
+        limit = min(max(limit, 1), 100)
+        async with self.conn.execute(
+            "SELECT id, query, status, current_phase, progress_percent, "
+            "       error_taxonomy, error_message, cost_usd, tokens_in, "
+            "       tokens_out, notified, created_at, started_at, "
+            "       completed_at, updated_at "
+            "FROM research_jobs "
+            "WHERE status = 'pending' AND updated_at < ? "
+            "ORDER BY updated_at ASC LIMIT ?",
+            (cutoff_str, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     async def list_research_jobs_running_with_output(self, limit: int = 100) -> list[dict]:
         """Lista running jobs con output_path != NULL (caso 3 recovery).
 
