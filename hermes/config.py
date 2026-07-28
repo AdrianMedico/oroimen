@@ -480,6 +480,31 @@ class Settings(BaseSettings):
     )
 
     db_path: Path = Path("/app/data/conversations.db")
+    # DR-Q1A scheduler-storage repair: dedicated filesystem path for
+    # the Deep Research APScheduler persistent jobstore. This file is
+    # for the APScheduler ``apscheduler_jobs`` table only and MUST be
+    # different from ``db_path`` (the application database). When unset,
+    # the scheduler derives a sibling file named
+    # ``deep_research_scheduler.db`` next to ``db_path``. An explicit
+    # ``jobstore_url`` argument to ``DeepResearchScheduler`` remains a
+    # lower-level constructor seam and is unaffected by this setting.
+    # The same-path configuration is rejected at scheduler construction
+    # time so the two databases cannot silently collapse onto one
+    # file (which would re-introduce the ``database is locked``
+    # contention observed in the v3.0.0 PREFREEZE first-wave aborts).
+    deep_research_jobstore_path: Path | None = Field(
+        default=None,
+        validation_alias="HERMES_DEEP_RESEARCH_JOBSTORE_PATH",
+        description=(
+            "Dedicated filesystem path for the Deep Research APScheduler "
+            "SQLite jobstore (the file that holds the apscheduler_jobs "
+            "table). Must be different from db_path. When unset, the "
+            "scheduler derives a sibling file named "
+            "deep_research_scheduler.db next to db_path. The explicit "
+            "DeepResearchScheduler(jobstore_url=...) constructor argument "
+            "is a lower-level seam that remains unaffected by this setting."
+        ),
+    )
 
     health_host: str = "0.0.0.0"
     health_port: int = 8000
@@ -1481,6 +1506,32 @@ class Settings(BaseSettings):
         # Aquí era un side effect que fallaba en el container (uid 1000
         # no puede crear /app/data/).
         return Path(str(v))
+
+    @field_validator("deep_research_jobstore_path", mode="before")
+    @classmethod
+    def _parse_deep_research_jobstore_path(cls, v: object) -> Path | None:
+        # Accept None, empty string, and string paths. pydantic v2
+        # already coerces a string to Path for an Optional[Path] field,
+        # but we are explicit so an empty string is treated the same as
+        # "unset" (None) — the default is "derive a sibling file next
+        # to db_path". The string-to-Path conversion preserves the
+        # "Path is a string subtype" pydantic contract.
+        if v is None:
+            return None
+        if isinstance(v, str):
+            stripped = v.strip()
+            if not stripped:
+                return None
+            return Path(stripped)
+        if isinstance(v, Path):
+            return v
+        # Anything else (int, list, etc.) is rejected at parse time
+        # so a typo in the .env becomes a startup error rather than
+        # a silent midnight crash.
+        raise ValueError(
+            f"HERMES_DEEP_RESEARCH_JOBSTORE_PATH must be a filesystem "
+            f"path string or unset, got {type(v).__name__}={v!r}"
+        )
 
     @field_validator("backup_dir", mode="before")
     @classmethod

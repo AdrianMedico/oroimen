@@ -557,3 +557,106 @@ def test_llm_model_overrides_rejects_empty_chain(
     )
     with pytest.raises(ValidationError, match="requires a non-empty chain"):
         Settings(_env_file=None)
+
+
+# ============================================================================
+# DR-Q1A scheduler-storage repair: dedicated
+# ``deep_research_jobstore_path`` setting. The Deep Research
+# APScheduler persistent jobstore MUST live in a different SQLite
+# file from the application database. These tests pin the
+# configuration surface:
+# 1. Default is None (derive a sibling file at scheduler construction).
+# 2. ``HERMES_DEEP_RESEARCH_JOBSTORE_PATH`` env var is parsed into a
+#    ``Path`` instance.
+# 3. Setting the field does not mutate or replace ``db_path``
+#    (the two are independent filesystem settings).
+# ============================================================================
+
+
+def test_deep_research_jobstore_path_defaults_to_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default value of ``deep_research_jobstore_path`` is ``None``;
+    the scheduler derives a sibling file next to ``db_path`` at
+    construction time. No real filesystem write is performed here.
+    """
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token-12345")
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "test-key-67890")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-1234567890")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.delenv("HERMES_DEEP_RESEARCH_JOBSTORE_PATH", raising=False)
+
+    s = Settings(_env_file=None)
+    assert s.deep_research_jobstore_path is None
+    # The application database is the configured ``db_path``; the
+    # scheduler file is derived later, not stored here.
+    assert s.db_path == tmp_path / "test.db"
+
+
+def test_deep_research_jobstore_path_parses_env_to_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``HERMES_DEEP_RESEARCH_JOBSTORE_PATH`` is parsed into a
+    ``pathlib.Path``. An empty value is treated as ``None`` (i.e.
+    "unset"); a real path is preserved verbatim.
+
+    No real filesystem write is performed here: the test only
+    validates Settings parsing.
+    """
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token-12345")
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "test-key-67890")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-1234567890")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv(
+        "HERMES_DEEP_RESEARCH_JOBSTORE_PATH", str(tmp_path / "scheduler.db")
+    )
+
+    s = Settings(_env_file=None)
+    assert isinstance(s.deep_research_jobstore_path, Path)
+    assert s.deep_research_jobstore_path == tmp_path / "scheduler.db"
+
+
+def test_deep_research_jobstore_path_empty_env_is_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty ``HERMES_DEEP_RESEARCH_JOBSTORE_PATH`` value is
+    treated the same as "unset" (i.e. ``None``). Whitespace-only
+    values are also treated as unset. This mirrors the
+    trim-or-None pattern used elsewhere in Settings (e.g.
+    ``http_api_api_key``).
+    """
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token-12345")
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "test-key-67890")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-1234567890")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("HERMES_DEEP_RESEARCH_JOBSTORE_PATH", "   ")
+
+    s = Settings(_env_file=None)
+    assert s.deep_research_jobstore_path is None
+
+
+def test_deep_research_jobstore_path_does_not_mutate_db_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Setting ``HERMES_DEEP_RESEARCH_JOBSTORE_PATH`` MUST NOT
+    mutate or replace ``db_path``. The two settings are
+    independent filesystem paths; the application database
+    keeps its configured location regardless of the jobstore
+    override.
+    """
+    db_path_value = tmp_path / "conversations.db"
+    jobstore_path_value = tmp_path / "custom-scheduler.db"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token-12345")
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "test-key-67890")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-1234567890")
+    monkeypatch.setenv("DB_PATH", str(db_path_value))
+    monkeypatch.setenv("HERMES_DEEP_RESEARCH_JOBSTORE_PATH", str(jobstore_path_value))
+
+    s = Settings(_env_file=None)
+    # The two paths are independent and stored as distinct
+    # ``Path`` objects. The application database location is
+    # preserved; the jobstore override does not overwrite it.
+    assert s.db_path == db_path_value
+    assert s.deep_research_jobstore_path == jobstore_path_value
+    # And the two paths are not the same file.
+    assert s.db_path != s.deep_research_jobstore_path
