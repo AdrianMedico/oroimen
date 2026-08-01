@@ -103,6 +103,17 @@ class DeepResearchScheduler:
         await scheduler.shutdown()
     """
 
+    # ``_jobstore_path`` is populated when the constructor
+    # derives the dedicated scheduler SQLite file from
+    # ``settings.deep_research_jobstore_path`` (or from a
+    # sibling file next to ``settings.db_path``). It is
+    # ``None`` when the caller passes an explicit
+    # ``jobstore_url`` argument; the lower-level seam does
+    # not know which file the URL refers to (in-memory SQLite,
+    # network URL, etc.). The annotation is the type union
+    # the constructor populates across the if/else branches.
+    _jobstore_path: Path | None = None
+
     def __init__(
         self,
         *,
@@ -112,11 +123,42 @@ class DeepResearchScheduler:
     ) -> None:
         self._db = db
         self._settings = settings
-        # Si jobstore_url no se pasa, derivar del settings.db_path.
-        # Esto permite que tests inyecten su propia URL (e.g. SQLite in-memory).
+        # DR-Q1A scheduler-storage repair: the persistent APScheduler
+        # jobstore now lives in a dedicated SQLite file that is
+        # physically separate from the application database. The
+        # exact ``jobstore_url`` argument is still a lower-level
+        # constructor seam and is used verbatim when supplied. When
+        # not supplied, the URL is derived from the dedicated
+        # ``settings.deep_research_jobstore_path`` (preferred) or
+        # from a sibling file next to ``settings.db_path`` named
+        # ``deep_research_scheduler.db`` (default). The same-path
+        # configuration is rejected BEFORE the jobstore starts so
+        # the two databases cannot silently collapse onto one
+        # file (which would re-introduce the ``database is locked``
+        # contention observed in the v3.0.0 PREFREEZE first-wave
+        # aborts).
         if jobstore_url is None:
             db_path = Path(str(getattr(settings, "db_path", "/app/data/conversations.db")))
-            jobstore_url = f"sqlite:///{db_path}"
+            configured = getattr(settings, "deep_research_jobstore_path", None)
+            if configured is not None:
+                jobstore_path = Path(str(configured))
+            else:
+                jobstore_path = db_path.parent / "deep_research_scheduler.db"
+            self._jobstore_path = self._normalize_path(jobstore_path)
+            self._validate_distinct_from_db(
+                db_path=db_path, jobstore_path=self._jobstore_path
+            )
+            # Idempotent parent-directory creation. We do NOT
+            # create the database file itself; the SQLAlchemyJobStore
+            # owns that file and its ``apscheduler_jobs`` table.
+            self._jobstore_path.parent.mkdir(parents=True, exist_ok=True)
+            jobstore_url = f"sqlite:///{self._jobstore_path}"
+        else:
+            # Explicit seam preserved: when the caller passes a URL
+            # we do not derive, rewrite, or reject it merely because
+            # it references the application database. This is the
+            # lower-level diagnostic / test / migration path.
+            self._jobstore_path = None
         self._jobstore_url = jobstore_url
         self._scheduler: AsyncIOScheduler | None = None
         # Slice 1C1c: explicit stopping flag toggled by ``stop_accepting``
@@ -125,6 +167,61 @@ class DeepResearchScheduler:
         # an internal APScheduler that is halfway through shutdown.
         self._stopping: bool = False
         self._shutdown_event: asyncio.Event | None = None
+
+    @staticmethod
+    def _normalize_path(path: Path) -> Path:
+        """Normalize a filesystem path for comparison.
+
+        Windows is case-insensitive on the filesystem, so the
+        normalized form of ``C:\\App\\Data\\conversations.db``
+        and ``c:\\app\\data\\conversations.db`` is the same. We
+        use :meth:`Path.resolve` for the canonical form and
+        lowercase the result on Windows so the same-path guard
+        catches user typos like ``C:\\App\\Data\\foo.db`` vs
+        ``c:\\app\\data\\foo.db``. On non-Windows platforms
+        ``resolve`` is sufficient. The function does NOT require
+        the path to exist: it operates on the path string only,
+        so a fresh install is rejected correctly.
+        """
+        import sys as _sys
+
+        canonical = Path(path).resolve()
+        if _sys.platform == "win32":
+            return Path(str(canonical).lower())
+        return canonical
+
+    @staticmethod
+    def _validate_distinct_from_db(
+        *, db_path: Path, jobstore_path: Path
+    ) -> None:
+        """Reject a configuration where the jobstore shares the
+        application database file.
+
+        The synthetic observations in the DR-Q1A v3.0.0 PREFREEZE
+        calibration showed that sharing the same SQLite file
+        between ``research_jobs`` and ``apscheduler_jobs`` causes
+        ``database is locked`` failures and leaves rows in
+        ``pending`` indefinitely. The default constructor now
+        refuses this configuration before any scheduler
+        resources are allocated. The explicit ``jobstore_url``
+        argument bypasses this check (the lower-level seam is
+        preserved).
+        """
+        normalized_db = DeepResearchScheduler._normalize_path(db_path)
+        if normalized_db == jobstore_path:
+            raise ValueError(
+                "The Deep Research APScheduler jobstore and the "
+                "application database MUST use different SQLite files. "
+                f"db_path={db_path!s} and the derived jobstore path "
+                f"({db_path.parent / 'deep_research_scheduler.db'!s}) "
+                "resolve to the same filesystem location. Set "
+                "HERMES_DEEP_RESEARCH_JOBSTORE_PATH to a different "
+                "file (e.g. <data_dir>/deep_research_scheduler.db) "
+                "or pass jobstore_url=... explicitly. The shared-file "
+                "configuration causes 'database is locked' contention "
+                "and is the v3.0.0 PREFREEZE first-wave abort "
+                "root-cause observation."
+            )
 
     async def start(self) -> None:
         """Inicializa AsyncIOScheduler con SQLAlchemyJobStore persistent.

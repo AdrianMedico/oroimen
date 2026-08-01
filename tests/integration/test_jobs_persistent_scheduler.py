@@ -68,11 +68,17 @@ class StubService:
 
 # ============================================================================
 # Helpers: build a real DeepResearchScheduler against the real
-# Database fixture. The Database and the SQLAlchemyJobStore share the
-# same SQLite file (the schema-migrations live in research_jobs; the
-# jobstore uses apscheduler_jobs). The settings fixture sets
-# DB_PATH = tmp_path / "test.db"; the scheduler derives the
-# jobstore URL from settings.db_path. Both end up on the same file.
+# Database fixture. The Database and the SQLAlchemyJobStore live in
+# DEDICATED SQLite files (DR-Q1A scheduler-storage repair): the
+# application DB is ``tmp_path / "test.db"`` (set by the settings
+# fixture via ``DB_PATH``); the jobstore defaults to a sibling file
+# ``tmp_path / "deep_research_scheduler.db"`` so the two
+# databases never share an SQLite connection. Tests that need a
+# specific jobstore location (e.g. legacy tests, restart
+# persistence, in-memory SQLite) pass an explicit ``jobstore_url``
+# argument — the lower-level seam remains intact. The helper
+# below relies on the new default; the URL it exposes is the
+# dedicated jobstore URL, not the application database URL.
 # ============================================================================
 async def _make_scheduler_and_stub(
     db: Any, settings: Any
@@ -81,8 +87,11 @@ async def _make_scheduler_and_stub(
 
     Returns:
         (scheduler, stub, jobstore_url). The jobstore_url is the
-        file URL the SQLAlchemyJobStore uses so a test can also
-        open a parallel jobstore for inspection if needed.
+        dedicated file URL the SQLAlchemyJobStore uses so a test
+        can also open a parallel jobstore for inspection if
+        needed. The URL points to the dedicated scheduler SQLite
+        file (post-DR-Q1A scheduler-storage repair); it is NOT
+        the application database URL.
     """
     scheduler = DeepResearchScheduler(db=db, settings=settings)
     stub = StubService()
