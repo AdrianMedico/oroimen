@@ -161,6 +161,23 @@ def _classify_exception(
 ]:
     """Classify a typed exception into structured search error fields.
 
+    PRE2-A1 frozen matrix (in evaluation order):
+
+    +-----------------------------------------------+------------------+---------------+----------------+
+    | exception type                                | code             | retryable     | breaker_relevant|
+    +-----------------------------------------------+------------------+---------------+----------------+
+    | asyncio.TimeoutError / TimeoutError (native) | TIMEOUT          | yes           | yes            |
+    | httpx.HTTPStatusError                        | via status       | via status    | via status     |
+    | httpx.TimeoutException                       | TIMEOUT          | yes           | yes            |
+    | httpx.NetworkError (incl. ConnectError)      | NETWORK_ERROR    | yes           | yes            |
+    | httpx.ProxyError                             | NETWORK_ERROR    | yes           | yes            |
+    | httpx.RemoteProtocolError                    | NETWORK_ERROR    | yes           | yes            |
+    | builtin ConnectionError / other OSError      | NETWORK_ERROR    | yes           | yes            |
+    | httpx.LocalProtocolError                     | CLIENT_ERROR     | no            | no             |
+    | httpx.UnsupportedProtocol                    | CLIENT_ERROR     | no            | no             |
+    | anything else (e.g. ValueError)              | INVALID_RESPONSE | no            | no             |
+    +-----------------------------------------------+------------------+---------------+----------------+
+
     PRE2-A1: never inspects ``str(exc)``. Uses only exception types
     (``isinstance``) and structured HTTP status when available
     (``httpx.HTTPStatusError.response.status_code``).
@@ -168,7 +185,7 @@ def _classify_exception(
     Returns:
         (code, retryable, breaker_relevant, diagnostic_category, http_status)
     """
-    # asyncio.TimeoutError (also aliased to builtin TimeoutError in 3.11+)
+    # 1. asyncio.TimeoutError (also aliased to builtin TimeoutError in 3.11+).
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) and not isinstance(
         exc, httpx.TimeoutException
     ):
@@ -179,12 +196,12 @@ def _classify_exception(
             SearchDiagnosticCategory.TIMEOUT,
             None,
         )
-    # httpx.HTTPStatusError carries the structured response.
+    # 2. httpx.HTTPStatusError carries the structured response.
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         code, retryable, breaker, cat = _classify_http_status(status)
         return code, retryable, breaker, cat, status
-    # httpx.TimeoutException (read, connect, or write timeout).
+    # 3. httpx.TimeoutException (read, connect, or write timeout).
     if isinstance(exc, httpx.TimeoutException):
         return (
             SearchErrorCode.TIMEOUT,
@@ -193,8 +210,21 @@ def _classify_exception(
             SearchDiagnosticCategory.TIMEOUT,
             None,
         )
-    # httpx transport failures (DNS, connection refused, network).
-    if isinstance(exc, (httpx.NetworkError, httpx.ConnectError, ConnectionError)):
+    # 4. Transport / network failures (retryable, breaker-relevant).
+    #    httpx.NetworkError covers httpx.ConnectError (subclass).
+    #    httpx.ProxyError and httpx.RemoteProtocolError are TransportError
+    #    subclasses that are NOT NetworkError subclasses; they are
+    #    network-class failures and must be classified the same way.
+    if isinstance(
+        exc,
+        (
+            httpx.NetworkError,
+            httpx.ProxyError,
+            httpx.RemoteProtocolError,
+            ConnectionError,
+            OSError,
+        ),
+    ):
         return (
             SearchErrorCode.NETWORK_ERROR,
             True,
@@ -202,16 +232,21 @@ def _classify_exception(
             SearchDiagnosticCategory.NETWORK,
             None,
         )
-    # Other I/O errors (e.g., OSError subclasses not caught by httpx).
-    if isinstance(exc, OSError):
+    # 5. Local protocol / configuration failures (deterministic).
+    #    httpx.LocalProtocolError is a programming error (the client
+    #    constructed a malformed request); httpx.UnsupportedProtocol
+    #    is a configuration error (the URL scheme is not supported).
+    #    Both are non-retryable and do NOT count against the breaker
+    #    because retrying the same call yields the same result.
+    if isinstance(exc, (httpx.LocalProtocolError, httpx.UnsupportedProtocol)):
         return (
-            SearchErrorCode.NETWORK_ERROR,
-            True,
-            True,
-            SearchDiagnosticCategory.NETWORK,
+            SearchErrorCode.CLIENT_ERROR,
+            False,
+            False,
+            SearchDiagnosticCategory.CLIENT_ERROR,
             None,
         )
-    # Unknown exception: invalid response, non-retryable, non-breaker.
+    # 6. Unknown exception: invalid response, non-retryable, non-breaker.
     # PRE2-A1: do not penalize the backend for an error we cannot
     # classify structurally.
     return (
@@ -300,7 +335,11 @@ async def hermes_search(
         return _empty_result_with_error(
             _build_structured_error(
                 code=SearchErrorCode.INVALID_INTENT,
-                message=f"Unknown intent: {intent}. Use: general, semantic, deep_research.",
+                # PRE2-A1 P1-2: fixed static message. The caller-provided
+                # value is NEVER echoed back into ``SearchError.message``,
+                # so the LLM-visible error and serialized tool output
+                # cannot carry arbitrary caller text.
+                message="Unknown search intent. Use: general, semantic, deep_research.",
                 backend=None,
                 breaker_relevant=False,
                 diagnostic_category=SearchDiagnosticCategory.LOCAL_VALIDATION,
@@ -310,7 +349,11 @@ async def hermes_search(
         return _empty_result_with_error(
             _build_structured_error(
                 code=SearchErrorCode.INVALID_CONTENT,
-                message=f"Unknown content mode: {content}. Use: snippet, summary, full.",
+                # PRE2-A1 P1-2: fixed static message. The caller-provided
+                # value is NEVER echoed back into ``SearchError.message``,
+                # so the LLM-visible error and serialized tool output
+                # cannot carry arbitrary caller text.
+                message="Unknown content mode. Use: snippet, summary, full.",
                 backend=None,
                 breaker_relevant=False,
                 diagnostic_category=SearchDiagnosticCategory.LOCAL_VALIDATION,

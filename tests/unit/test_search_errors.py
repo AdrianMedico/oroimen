@@ -266,24 +266,20 @@ def test_error_to_search_result_is_json_serializable() -> None:
     assert "ALL_BACKENDS_FAILED" in json_str
 
 
-def test_pre2a1_redaction_sentinel_does_not_leak_to_safe_surfaces() -> None:
-    """PRE2-A1 redaction contract: a low-entropy sentinel planted in
-    a real unsafe input (ValueError, malformed response body, custom
-    exception string) MUST NOT leak into any of the safe surfaces:
+def test_safe_message_passes_through_serializer_unchanged() -> None:
+    """Serializer contract: ``error_to_search_result`` and the
+    ``_phase_error_from_search_error`` bridge MUST faithfully reflect
+    the ``SearchError.message`` they are given. They do not invent,
+    rewrite, or extract text from arbitrary sources.
 
-      - ``SearchError.message``
-      - ``error_to_search_result`` safe fields (``error``, ``code``,
-        ``backend``, ``diagnostic_category``)
-      - ``PhaseError.message`` (when bridged from ``SearchError``)
-
-    The errors module is a serializer, not an arbitrary-message
-    sanitizer: callers must construct ``SearchError`` with a safe
-    static ``message``. This test proves that the safe surfaces
-    stay clean as long as the caller respects that contract, even
-    when the same sentinel text is observable in three different
-    unsafe input shapes that a buggy implementation might naively
-    pass through to the message via ``str(exc)`` or raw body
-    interpolation.
+    This test verifies the serializer layer's honesty when the caller
+    provides a safe static message. The router's actual production
+    redaction proof (Cases A-D) lives in
+    ``tests/unit/test_search_router.py`` and exercises the real
+    ``hermes_search`` pipeline end-to-end with sentinel-bearing
+    caller values, backend exceptions, and HTTP response bodies. This
+    unit test only asserts the layer-local contract: the safe
+    surfaces stay clean as long as the caller respects it.
     """
     # Low-entropy sentinel. Chosen to be obviously non-secret and
     # highly unlikely to appear in any other code path or fixture.

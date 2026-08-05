@@ -19,11 +19,16 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx  # PRE2-A1: typed exception fixtures
 import pytest
 
+# PRE2-A1 P1-1/P2-1: production-path redaction surface.
+# PhaseError is the bridge target for SearchError so we must verify
+# the sentinel does not survive the bridge either.
+from hermes.jobs.service import _phase_error_from_search_error
 from hermes.memory.db import Database
 from hermes.services.search.budget import BudgetTracker
 from hermes.services.search.errors import (
     SearchDiagnosticCategory,
     SearchErrorCode,
+    error_to_search_result,
 )
 from hermes.services.search.protocol import (
     BackendProtocol,
@@ -46,6 +51,34 @@ from hermes.services.search.router import (
     _sanitize_urls,
     hermes_search,
 )
+from hermes.tools.web_search import _serialize_result
+
+
+def _walk_strings(obj: Any) -> Any:
+    """Recursively yield every string leaf in a nested object.
+
+    Used by the production-path redaction tests to assert that no
+    low-entropy sentinel leaks into ANY string-bearing surface of a
+    serialized SearchError, _serialize_result output, or PhaseError.
+    Handles dict, list, tuple, set, dataclass, and plain string leaves.
+    """
+    if isinstance(obj, str):
+        yield obj
+        return
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        for item in obj:
+            yield from _walk_strings(item)
+        return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _walk_strings(v)
+        return
+    # Fallback: dataclass-like with __dict__ but not a string container.
+    if hasattr(obj, "__dict__"):
+        for v in vars(obj).values():
+            yield from _walk_strings(v)
+        return
+    # Non-string scalars (int, bool, None) produce no strings.
 
 
 @pytest.fixture
@@ -1467,3 +1500,637 @@ def test_pre2a1_classify_exception_uses_isinstance_not_str() -> None:
     assert breaker is False
     assert cat is SearchDiagnosticCategory.INVALID_RESPONSE
     assert status is None
+
+
+# =====================================================================
+# PRE2-A1 P1-1: HTTPX transport classification expansion
+# =====================================================================
+#
+# Repair scope: httpx.ProxyError and httpx.RemoteProtocolError were
+# leaking to INVALID_RESPONSE (no breaker, no retry). They are real
+# network-class transport failures and must follow the same policy as
+# httpx.NetworkError / httpx.ConnectError. Conversely, the deterministic
+# httpx.LocalProtocolError and httpx.UnsupportedProtocol must NOT be
+# lumped into the network bucket; they are client/configuration errors
+# that will repeat on retry and therefore must not trip the breaker.
+#
+# Selected contract (frozen in PRE2-A1 §8.1):
+#
+# | Exception                       | code           | category       | retry | breaker |
+# |---------------------------------|----------------|----------------|-------|---------|
+# | httpx.ProxyError                | NETWORK_ERROR  | network        | yes   | yes     |
+# | httpx.RemoteProtocolError       | NETWORK_ERROR  | network        | yes   | yes     |
+# | httpx.LocalProtocolError        | CLIENT_ERROR   | client_error   | no    | no      |
+# | httpx.UnsupportedProtocol       | CLIENT_ERROR   | client_error   | no    | no      |
+
+
+def test_pre2a1_classify_exception_proxy_error_is_network() -> None:
+    """PRE2-A1 P1-1: httpx.ProxyError → NETWORK_ERROR, retryable, breaker."""
+    exc = httpx.ProxyError("proxy refused connection")
+    code, retryable, breaker, cat, status = _classify_exception(exc)
+    assert code is SearchErrorCode.NETWORK_ERROR
+    assert cat is SearchDiagnosticCategory.NETWORK
+    assert retryable is True
+    assert breaker is True
+    assert status is None
+
+
+def test_pre2a1_classify_exception_remote_protocol_error_is_network() -> None:
+    """PRE2-A1 P1-1: httpx.RemoteProtocolError → NETWORK_ERROR, retryable, breaker."""
+    exc = httpx.RemoteProtocolError("server closed connection unexpectedly")
+    code, retryable, breaker, cat, status = _classify_exception(exc)
+    assert code is SearchErrorCode.NETWORK_ERROR
+    assert cat is SearchDiagnosticCategory.NETWORK
+    assert retryable is True
+    assert breaker is True
+    assert status is None
+
+
+def test_pre2a1_classify_exception_local_protocol_error_is_client_error() -> None:
+    """PRE2-A1 P1-1: httpx.LocalProtocolError → CLIENT_ERROR, not retryable, not breaker.
+
+    LocalProtocolError means the CLIENT side generated a malformed wire
+    request. Retrying yields the same deterministic failure, so it is
+    neither retryable nor breaker-relevant.
+    """
+    exc = httpx.LocalProtocolError("invalid HTTP request framing")
+    code, retryable, breaker, cat, status = _classify_exception(exc)
+    assert code is SearchErrorCode.CLIENT_ERROR
+    assert cat is SearchDiagnosticCategory.CLIENT_ERROR
+    assert retryable is False
+    assert breaker is False
+    assert status is None
+
+
+def test_pre2a1_classify_exception_unsupported_protocol_is_client_error() -> None:
+    """PRE2-A1 P1-1: httpx.UnsupportedProtocol → CLIENT_ERROR, not retryable, not breaker.
+
+    UnsupportedProtocol is a configuration error (URL scheme not
+    supported). Retrying yields the same failure.
+    """
+    exc = httpx.UnsupportedProtocol("ftp://example.com")
+    code, retryable, breaker, cat, status = _classify_exception(exc)
+    assert code is SearchErrorCode.CLIENT_ERROR
+    assert cat is SearchDiagnosticCategory.CLIENT_ERROR
+    assert retryable is False
+    assert breaker is False
+    assert status is None
+
+
+def test_pre2a1_classify_exception_preserves_previous_matrix() -> None:
+    """PRE2-A1 P1-1: the new buckets must NOT regress existing transport cases.
+
+    Sanity check that the exception ordering in _classify_exception still
+    classifies the original network/timeout/invalid cases the same way
+    after the expansion.
+    """
+    # asyncio.TimeoutError → TIMEOUT
+    code, retryable, breaker, _, _ = _classify_exception(
+        TimeoutError("native")
+    )
+    assert code is SearchErrorCode.TIMEOUT
+    assert retryable is True
+    assert breaker is True
+    # httpx.TimeoutException → TIMEOUT
+    code, retryable, breaker, _, _ = _classify_exception(
+        httpx.TimeoutException("read")
+    )
+    assert code is SearchErrorCode.TIMEOUT
+    assert retryable is True
+    assert breaker is True
+    # httpx.NetworkError → NETWORK_ERROR
+    code, retryable, breaker, _, _ = _classify_exception(
+        httpx.NetworkError("dns")
+    )
+    assert code is SearchErrorCode.NETWORK_ERROR
+    assert retryable is True
+    assert breaker is True
+    # httpx.ConnectError → NETWORK_ERROR (subclass of NetworkError)
+    code, retryable, breaker, _, _ = _classify_exception(
+        httpx.ConnectError("conn refused")
+    )
+    assert code is SearchErrorCode.NETWORK_ERROR
+    assert retryable is True
+    assert breaker is True
+    # builtin ConnectionError → NETWORK_ERROR
+    code, retryable, breaker, _, _ = _classify_exception(
+        ConnectionError("conn refused")
+    )
+    assert code is SearchErrorCode.NETWORK_ERROR
+    assert retryable is True
+    assert breaker is True
+    # ValueError → INVALID_RESPONSE
+    code, retryable, breaker, _, _ = _classify_exception(
+        ValueError("malformed body")
+    )
+    assert code is SearchErrorCode.INVALID_RESPONSE
+    assert retryable is False
+    assert breaker is False
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_proxy_error_runtime_network_policy(db: Database) -> None:
+    """PRE2-A1 P1-1 runtime: a real httpx.ProxyError from a backend
+    propagates through hermes_search as NETWORK_ERROR, retryable,
+    breaker-relevant, with the breaker failure count incremented.
+    """
+    searxng = _make_backend(name="searxng")
+    searxng.search = AsyncMock(
+        side_effect=httpx.ProxyError("proxy refused connection")
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry(threshold=3, ttl_seconds=300)
+    before = _breaker_failure_count(cb, "searxng")
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.NETWORK_ERROR
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.NETWORK
+    assert result.error.retryable is True
+    assert result.error.breaker_relevant is True
+    assert result.error.http_status is None
+    # Breaker failure count incremented by 1.
+    assert _breaker_failure_count(cb, "searxng") == before + 1
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_remote_protocol_error_runtime_network_policy(
+    db: Database,
+) -> None:
+    """PRE2-A1 P1-1 runtime: real httpx.RemoteProtocolError → NETWORK_ERROR."""
+    searxng = _make_backend(name="searxng")
+    searxng.search = AsyncMock(
+        side_effect=httpx.RemoteProtocolError("server closed connection unexpectedly")
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry(threshold=3, ttl_seconds=300)
+    before = _breaker_failure_count(cb, "searxng")
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.NETWORK_ERROR
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.NETWORK
+    assert result.error.retryable is True
+    assert result.error.breaker_relevant is True
+    assert result.error.http_status is None
+    assert _breaker_failure_count(cb, "searxng") == before + 1
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_local_protocol_error_deterministic_no_breaker(
+    db: Database,
+) -> None:
+    """PRE2-A1 P1-1 runtime: real httpx.LocalProtocolError → CLIENT_ERROR.
+
+    The deterministic nature (retrying yields the same failure) means
+    the breaker MUST NOT count this against the backend.
+    """
+    searxng = _make_backend(name="searxng")
+    searxng.search = AsyncMock(
+        side_effect=httpx.LocalProtocolError("invalid HTTP request framing")
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry(threshold=1, ttl_seconds=300)
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.CLIENT_ERROR
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.CLIENT_ERROR
+    assert result.error.retryable is False
+    assert result.error.breaker_relevant is False
+    assert result.error.http_status is None
+    # Breaker MUST NOT have opened on a deterministic client error.
+    assert cb.is_open("searxng") is False
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_unsupported_protocol_deterministic_no_breaker(
+    db: Database,
+) -> None:
+    """PRE2-A1 P1-1 runtime: real httpx.UnsupportedProtocol → CLIENT_ERROR."""
+    searxng = _make_backend(name="searxng")
+    searxng.search = AsyncMock(
+        side_effect=httpx.UnsupportedProtocol("ftp://example.com")
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry(threshold=1, ttl_seconds=300)
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.CLIENT_ERROR
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.CLIENT_ERROR
+    assert result.error.retryable is False
+    assert result.error.breaker_relevant is False
+    assert cb.is_open("searxng") is False
+    searxng.search.assert_awaited_once()
+
+
+# =====================================================================
+# PRE2-A1 P1-2: local-validation message safety
+# =====================================================================
+#
+# Repair scope: invalid intent and invalid content previously
+# interpolated the caller value into SearchError.message. The LLM-
+# visible error and the serialized tool output therefore carried the
+# caller's raw text into the Safe Surfaces. Fixed messages are now
+# static and never echo the invalid value.
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_invalid_intent_message_is_static(db: Database) -> None:
+    """PRE2-A1 P1-2: invalid intent message is a fixed static string.
+
+    Verifies the message contains no caller value echo by passing a
+    recognisable token and asserting it does not appear. The local-
+    validation message is built inline in ``hermes_search`` (not via
+    ``_safe_failure_message``, which only handles backend failures), so
+    we exercise the real path.
+    """
+    sentinel = "OWNED-INTENT-VALUE-XYZ"
+    searxng = _make_backend(name="searxng")
+    backends = {"searxng": searxng}
+    result = await hermes_search(
+        query="q",
+        intent=f"bad-{sentinel}-appended",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=CircuitBreakerRegistry(),
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    msg = result.error.message
+    # The static message is well-defined and does NOT interpolate the
+    # caller value.
+    assert sentinel not in msg
+    assert "invalid" in msg.lower() or "unknown" in msg.lower()
+    assert "general" in msg
+    assert "semantic" in msg
+    assert "deep_research" in msg
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_invalid_intent_message_does_not_leak_caller_value(
+    db: Database,
+) -> None:
+    """PRE2-A1 P1-2: real hermes_search with sentinel-bearing invalid intent
+    does NOT carry the caller value in SearchError.message or in any
+    serialized safe surface.
+    """
+    sentinel = "OWNED-INTENT-VALUE-XYZ"
+    searxng = _make_backend(name="searxng")
+    backends = {"searxng": searxng}
+    result = await hermes_search(
+        query="q",
+        intent=f"bad-{sentinel}-appended",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=CircuitBreakerRegistry(),
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.INVALID_INTENT
+    # SearchError.message is static, never echoes caller value.
+    assert sentinel not in result.error.message
+    # Sanity: error_to_search_result safe surface does not echo either.
+    serialized = error_to_search_result(result.error)
+    for s in _walk_strings(serialized):
+        assert sentinel not in s, (
+            f"sentinel leaked into serialized field: {s!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_invalid_content_message_does_not_leak_caller_value(
+    db: Database,
+) -> None:
+    """PRE2-A1 P1-2: real hermes_search with sentinel-bearing invalid content
+    does NOT carry the caller value in SearchError.message or in any
+    serialized safe surface.
+    """
+    sentinel = "OWNED-CONTENT-VALUE-XYZ"
+    searxng = _make_backend(name="searxng")
+    backends = {"searxng": searxng}
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        content=f"bad-{sentinel}-appended",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=CircuitBreakerRegistry(),
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.INVALID_CONTENT
+    assert sentinel not in result.error.message
+    serialized = error_to_search_result(result.error)
+    for s in _walk_strings(serialized):
+        assert sentinel not in s, (
+            f"sentinel leaked into serialized field: {s!r}"
+        )
+
+
+# =====================================================================
+# PRE2-A1 P2-1: production-path redaction proof
+# =====================================================================
+#
+# These tests are the coupled proof that the Safe Surface contract is
+# honored when the unsafe value actually traverses the production
+# search pipeline. They replace the previous sentinel test that only
+# constructed a preselected safe message and therefore could not
+# actually demonstrate redaction of caller-supplied text.
+#
+# Sentinel: low-entropy, non-secret, recognizable. Same value across
+# all four cases so a casual reader can grep for it.
+
+
+_REDACTION_SENTINEL = "internal caller detail must remain private"
+
+
+def _assert_no_sentinel_in_surfaces(
+    *,
+    error: Any,
+    serialized_for_tool: dict[str, Any],
+    phase_error: Any,
+    caplog_records: list[Any],
+    sentinel: str = _REDACTION_SENTINEL,
+) -> None:
+    """Walk every string-bearing surface and assert the sentinel is absent.
+
+    This is the production-path redaction assertion used by Cases A-D.
+    It covers:
+      - SearchError.message
+      - error_to_search_result output (recursive)
+      - _serialize_result output (recursive)
+      - PhaseError.message (and any other string on the bridged error)
+      - caplog records captured during the path
+    """
+    # 1. SearchError.message
+    assert sentinel not in error.message, (
+        f"sentinel leaked into SearchError.message: {error.message!r}"
+    )
+    # 2. error_to_search_result output (already passed via _serialize_result,
+    #    but we walk it again to be explicit and independent of the helper).
+    serialized_error = error_to_search_result(error)
+    for s in _walk_strings(serialized_error):
+        assert sentinel not in s, (
+            f"sentinel leaked into error_to_search_result surface: {s!r}"
+        )
+    # 3. _serialize_result output (recursive)
+    for s in _walk_strings(serialized_for_tool):
+        assert sentinel not in s, (
+            f"sentinel leaked into _serialize_result surface: {s!r}"
+        )
+    # 4. PhaseError.message and any other string on the bridged error
+    for s in _walk_strings(phase_error):
+        assert sentinel not in s, (
+            f"sentinel leaked into PhaseError surface: {s!r}"
+        )
+    # 5. caplog records
+    for record in caplog_records:
+        # The LogRecord message itself
+        assert sentinel not in record.getMessage(), (
+            f"sentinel leaked into log record: {record.getMessage()!r}"
+        )
+        # The formatted args (if any)
+        for arg in record.args if isinstance(record.args, tuple) else ():
+            if isinstance(arg, str):
+                assert sentinel not in arg, (
+                    f"sentinel leaked into log arg: {arg!r}"
+                )
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_redaction_case_a_invalid_intent(
+    caplog: pytest.LogCaptureFixture,
+    db: Database,
+) -> None:
+    """PRE2-A1 P2-1 Case A: invalid intent with sentinel-bearing value
+    traversing the real hermes_search pipeline.
+
+    The sentinel-bearing invalid intent value must NOT leak into:
+      - SearchError.message
+      - error_to_search_result output
+      - _serialize_result output
+      - PhaseError.message after _phase_error_from_search_error
+      - any caplog record produced by the path
+    """
+    sentinel = _REDACTION_SENTINEL
+    unsafe_intent = f"bad-{sentinel}-appended"
+
+    # Sanity: the unsafe source genuinely carries the sentinel.
+    assert sentinel in unsafe_intent
+
+    searxng = _make_backend(name="searxng")
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry()
+
+    with caplog.at_level("INFO", logger="hermes.services.search.router"):
+        result = await hermes_search(
+            query="q",
+            intent=unsafe_intent,
+            backends=backends,
+            budget=_make_budget(db),
+            circuit_breaker=cb,
+            semaphore=ConcurrencyLimiter(),
+        )
+
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.INVALID_INTENT
+
+    # The serialized MCP tool output the LLM would receive.
+    serialized = _serialize_result(result)
+    assert serialized["success"] is False
+
+    # The bridge to PhaseError (Deep Research, etc.).
+    pe = _phase_error_from_search_error(result.error)
+
+    _assert_no_sentinel_in_surfaces(
+        error=result.error,
+        serialized_for_tool=serialized,
+        phase_error=pe,
+        caplog_records=list(caplog.records),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_redaction_case_b_invalid_content(
+    caplog: pytest.LogCaptureFixture,
+    db: Database,
+) -> None:
+    """PRE2-A1 P2-1 Case B: invalid content with sentinel-bearing value
+    traversing the real hermes_search pipeline."""
+    sentinel = _REDACTION_SENTINEL
+    unsafe_content = f"bad-{sentinel}-appended"
+
+    assert sentinel in unsafe_content
+
+    searxng = _make_backend(name="searxng")
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry()
+
+    with caplog.at_level("INFO", logger="hermes.services.search.router"):
+        result = await hermes_search(
+            query="q",
+            intent="general",
+            content=unsafe_content,
+            backends=backends,
+            budget=_make_budget(db),
+            circuit_breaker=cb,
+            semaphore=ConcurrencyLimiter(),
+        )
+
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.INVALID_CONTENT
+
+    serialized = _serialize_result(result)
+    assert serialized["success"] is False
+    pe = _phase_error_from_search_error(result.error)
+
+    _assert_no_sentinel_in_surfaces(
+        error=result.error,
+        serialized_for_tool=serialized,
+        phase_error=pe,
+        caplog_records=list(caplog.records),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_redaction_case_c_value_error(
+    caplog: pytest.LogCaptureFixture,
+    db: Database,
+) -> None:
+    """PRE2-A1 P2-1 Case C: backend raises a sentinel-bearing ValueError
+    through real hermes_search.
+
+    A backend that successfully returns HTTP 200 but with a malformed
+    body raises ValueError (or similar). The router classifies this as
+    INVALID_RESPONSE and the unsafe ValueError text must NOT leak into
+    any safe surface.
+    """
+    sentinel = _REDACTION_SENTINEL
+    unsafe_exc = ValueError(f"malformed JSON: {sentinel} token leaked")
+    # Sanity: the unsafe source genuinely carries the sentinel.
+    assert sentinel in str(unsafe_exc)
+
+    searxng = _make_backend(name="searxng")
+    searxng.search = AsyncMock(side_effect=unsafe_exc)
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry()
+
+    with caplog.at_level("INFO", logger="hermes.services.search.router"):
+        result = await hermes_search(
+            query="q",
+            intent="general",
+            backends=backends,
+            budget=_make_budget(db),
+            circuit_breaker=cb,
+            semaphore=ConcurrencyLimiter(),
+        )
+
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.INVALID_RESPONSE
+    searxng.search.assert_awaited_once()
+
+    serialized = _serialize_result(result)
+    assert serialized["success"] is False
+    pe = _phase_error_from_search_error(result.error)
+
+    _assert_no_sentinel_in_surfaces(
+        error=result.error,
+        serialized_for_tool=serialized,
+        phase_error=pe,
+        caplog_records=list(caplog.records),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_redaction_case_d_http_status_error(
+    caplog: pytest.LogCaptureFixture,
+    db: Database,
+) -> None:
+    """PRE2-A1 P2-1 Case D: backend raises a real httpx.HTTPStatusError
+    whose exception text, response body, and response header all carry
+    the sentinel. The unsafe text must NOT leak into any safe surface.
+    """
+    sentinel = _REDACTION_SENTINEL
+
+    request = httpx.Request("GET", "https://searxng.example/search")
+    # The response body AND the response header carry the sentinel.
+    body_bytes = (
+        f'{{"error": "upstream leaked: {sentinel} in body"}}'.encode()
+    )
+    response = httpx.Response(
+        503,
+        request=request,
+        content=body_bytes,
+        headers={"x-error-detail": f"upstream said: {sentinel}"},
+    )
+    # The exception text itself carries the sentinel too.
+    unsafe_exc = httpx.HTTPStatusError(
+        f"upstream failed: {sentinel}",
+        request=request,
+        response=response,
+    )
+    # Sanity: the unsafe source genuinely carries the sentinel in
+    # every channel (exception text, response body, response header).
+    assert sentinel in str(unsafe_exc)
+    assert sentinel in response.text
+    assert sentinel in response.headers.get("x-error-detail", "")
+
+    searxng = _make_backend(name="searxng")
+    searxng.search = AsyncMock(side_effect=unsafe_exc)
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry()
+
+    with caplog.at_level("INFO", logger="hermes.services.search.router"):
+        result = await hermes_search(
+            query="q",
+            intent="general",
+            backends=backends,
+            budget=_make_budget(db),
+            circuit_breaker=cb,
+            semaphore=ConcurrencyLimiter(),
+        )
+
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.SERVER_ERROR
+    assert result.error.http_status == 503
+    searxng.search.assert_awaited_once()
+
+    serialized = _serialize_result(result)
+    assert serialized["success"] is False
+    pe = _phase_error_from_search_error(result.error)
+
+    _assert_no_sentinel_in_surfaces(
+        error=result.error,
+        serialized_for_tool=serialized,
+        phase_error=pe,
+        caplog_records=list(caplog.records),
+    )
