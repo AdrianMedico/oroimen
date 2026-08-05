@@ -76,6 +76,8 @@ from hermes.jobs.prompts import (
     sanitize_summary,
 )
 from hermes.observability.influxdb import write_research_metric
+from hermes.services.search.errors import SearchError
+from hermes.services.search.protocol import SearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -107,18 +109,23 @@ RETRYABLE_ERRORS = frozenset(
 
 # PRE2-A1: mapping from ``SearchDiagnosticCategory`` to the broad
 # persisted job taxonomy. Explicit and deterministic. The mapping
-# preserves existing persisted categories (search_4xx, search_5xx,
+# preserves the existing persisted categories (search_4xx, search_5xx,
 # timeout, network) so DB schemas and dashboards are unchanged.
+# Invalid successful responses are folded into the broad ``search_5xx``
+# bucket — the structured in-memory ``SearchDiagnosticCategory`` value
+# remains available on ``PhaseError.search_diagnostic_category`` for
+# callers that need the precise cause.
 # A new diagnostic category MUST be added here with a focused
 # regression test before any ``_phase_search`` use.
 def _map_search_diagnostic_to_taxonomy(category: str) -> str:
     """Map a SearchDiagnosticCategory.value to broad job taxonomy.
 
-    PRE2-A1: the persisted taxonomy remains the existing
-    ``search_4xx`` / ``search_5xx`` / ``timeout`` / ``network`` set
-    plus the new ``search_invalid`` bucket for malformed
-    successful responses. Deep Research and other consumers
-    continue to read these stable strings.
+    PRE2-A1: the persisted taxonomy is the existing closed set
+    ``search_4xx`` / ``search_5xx`` / ``timeout`` / ``network``.
+    No new persisted bucket is added — the broad taxonomy is
+    intentionally less precise than the in-memory structured
+    fields. Deep Research and other consumers continue to read
+    these stable strings.
     """
     if category == "timeout":
         return "timeout"
@@ -126,16 +133,19 @@ def _map_search_diagnostic_to_taxonomy(category: str) -> str:
         return "network"
     if category in ("auth", "client_error", "rate_limit", "local_validation", "budget"):
         return "search_4xx"
-    if category in ("server_error", "circuit", "all_backends_failed"):
+    if category in (
+        "server_error",
+        "circuit",
+        "all_backends_failed",
+        "invalid_response",
+    ):
         return "search_5xx"
-    if category == "invalid_response":
-        return "search_invalid"
     # Conservative default: 5xx-shaped so the row is retriable from
     # the perspective of an old caller that still inspects taxonomy.
     return "search_5xx"
 
 
-def _phase_error_from_search_error(search_error: Any) -> PhaseError:
+def _phase_error_from_search_error(search_error: SearchError) -> PhaseError:
     """Build a ``PhaseError`` from a structured ``SearchError``.
 
     PRE2-A1: uses ONLY the structured fields. The message field on
@@ -2002,26 +2012,58 @@ class DeepResearchService:
             # (e.g. unusual exception type, or a test double that
             # raises before SearchResult is produced), fall back to a
             # structured PhaseError without parsing str(exc).
+            # At this outer boundary we cannot tell which backend
+            # raised nor its HTTP status; the only honest
+            # classification is a server_error-shaped transient
+            # search failure (retryable, broad 5xx taxonomy,
+            # breaker relevance unknown).
             raise PhaseError(
                 "search_5xx",
                 "search_backend_failed",
                 retryable=True,
-                search_error_code="INVALID_RESPONSE",
-                search_diagnostic_category="invalid_response",
+                search_error_code="SERVER_ERROR",
+                search_diagnostic_category="server_error",
             ) from exc
 
-        # Extract URLs (duck-typed) — consume SearchResult.error FIRST.
+        # Extract URLs (typed-first, duck-typed-fallback) — consume a
+        # real SearchResult.error BEFORE accessing URLs and BEFORE
+        # falling back to a legacy duck-typed shape. We never inspect
+        # a synthetic ``.error`` attribute on arbitrary objects or
+        # ``MagicMock`` instances: only a real ``SearchResult`` is
+        # trusted to carry a structured failure.
         if isinstance(result, list):
-            # Legacy convenience: list of URL strings. Empty list is a
-            # valid empty phase-one result (PRE2-A1).
+            # Legacy convenience: list of URL strings. Empty list is
+            # a valid empty phase-one result.
             return [str(u) for u in result if u][:max_sources]
-        if hasattr(result, "error") and result.error is not None:
-            # PRE2-A1: bridge structured SearchError into PhaseError
-            # using the explicit fields. Do NOT parse message text.
-            raise _phase_error_from_search_error(result.error)
+        if isinstance(result, SearchResult):
+            # Real SearchResult: consume structured error before
+            # URLs. error=None means success (including empty
+            # success).
+            if result.error is not None:
+                if not isinstance(result.error, SearchError):
+                    # An unexpected non-SearchError value inside a
+                    # real SearchResult is a safe structural
+                    # failure, not a router-typed failure. We do
+                    # not parse the value; we report a stable
+                    # non-retryable failure.
+                    raise PhaseError(
+                        "search_5xx",
+                        "search_invalid_error_shape",
+                        retryable=False,
+                        search_breaker_relevant=False,
+                    )
+                raise _phase_error_from_search_error(result.error)
+            # Successful SearchResult (possibly empty). Empty
+            # results is a valid phase-one result.
+            return [
+                r["url"]
+                for r in result.results
+                if r.get("url")
+            ][:max_sources]
         if hasattr(result, "results"):
-            # Successful SearchResult (possibly empty). Empty results
-            # is a valid phase-one result; do NOT raise search_5xx/no_results.
+            # Legacy duck-typed object: has .results but is not a
+            # real SearchResult. Use it directly. We do NOT inspect
+            # a synthetic .error attribute on such objects.
             return [
                 r["url"]
                 for r in result.results

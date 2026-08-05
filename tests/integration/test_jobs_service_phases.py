@@ -33,6 +33,7 @@ from hermes.services.search.errors import (
     SearchErrorCode,
     _build_structured_error,
 )
+from hermes.services.search.protocol import SearchResult
 
 
 @dataclass
@@ -600,7 +601,15 @@ def test_pre2a1_phase_error_4xx_with_retryable_true_contradictory() -> None:
 
 
 def test_pre2a1_mapping_diagnostic_to_taxonomy_is_explicit() -> None:
-    """PRE2-A1: every diagnostic category maps deterministically."""
+    """PRE2-A1: every diagnostic category maps deterministically.
+
+    The persisted taxonomy is the closed set
+    ``search_4xx / search_5xx / timeout / network``. No new
+    persisted bucket is added — invalid_response folds into the
+    broad ``search_5xx`` group, with the precise cause available
+    only in the in-memory ``PhaseError.search_diagnostic_category``
+    field.
+    """
     assert _map_search_diagnostic_to_taxonomy("timeout") == "timeout"
     assert _map_search_diagnostic_to_taxonomy("network") == "network"
     assert _map_search_diagnostic_to_taxonomy("auth") == "search_4xx"
@@ -613,8 +622,9 @@ def test_pre2a1_mapping_diagnostic_to_taxonomy_is_explicit() -> None:
     assert (
         _map_search_diagnostic_to_taxonomy("all_backends_failed") == "search_5xx"
     )
+    # invalid_response folds into the broad search_5xx bucket.
     assert (
-        _map_search_diagnostic_to_taxonomy("invalid_response") == "search_invalid"
+        _map_search_diagnostic_to_taxonomy("invalid_response") == "search_5xx"
     )
 
 
@@ -629,7 +639,14 @@ def _make_search_result_with_error(
     http_status: int | None,
     category: SearchDiagnosticCategory,
 ) -> Any:
-    """Build a SearchResult-like object with structured error."""
+    """Build a real ``SearchResult`` with a structured error.
+
+    PRE2-A1 contract: ``_phase_search`` only treats a real
+    ``SearchResult`` instance as carrying a structured failure.
+    A ``_FakeSearchResult`` (duck-typed, with just ``results`` and
+    ``error``) is not a real ``SearchResult`` and the phase would
+    fall through to the legacy ``hasattr(result, "results")`` path.
+    """
     err = _build_structured_error(
         code=code,
         message=f"Search backend {backend} returned HTTP {http_status or 'N/A'}.",
@@ -639,8 +656,15 @@ def _make_search_result_with_error(
         http_status=http_status,
         diagnostic_category=category,
     )
-    return _FakeSearchResult(
+    return SearchResult(
         results=[{"url": "https://example.com/should-not-be-read"}],
+        backend_used=backend,
+        query="q",
+        content_mode="snippet",
+        original_content_mode="snippet",
+        format_fallback=False,
+        size_guard_chars=50000,
+        truncated=False,
         error=err,
     )
 
@@ -927,7 +951,17 @@ async def test_pre2a1_phase_search_no_exception_text_parsing(
         http_status=403,
         diagnostic_category=SearchDiagnosticCategory.AUTH,
     )
-    result = _FakeSearchResult(results=[], error=err)
+    result = SearchResult(
+        results=[],
+        backend_used="tavily",
+        query="q",
+        content_mode="snippet",
+        original_content_mode="snippet",
+        format_fallback=False,
+        size_guard_chars=50000,
+        truncated=False,
+        error=err,
+    )
     service._search = AsyncMock(return_value=result)
     with pytest.raises(PhaseError) as exc_info:
         await service._phase_search(job_id)
@@ -936,3 +970,114 @@ async def test_pre2a1_phase_search_no_exception_text_parsing(
     assert pe.retryable is False
     assert pe.search_error_code == "AUTH_ERROR"
     assert pe.search_http_status == 403
+
+
+# --- PRE2-A1: invalid-response persistence compatibility ---
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_invalid_response_search_failure_persists_search_5xx(
+    db, service_with_mocks
+) -> None:
+    """PRE2-A1: a structured invalid-response search failure reaches
+    a terminal ``failed`` state in the DB with the broad
+    ``error_taxonomy='search_5xx'``.
+
+    Exercises the full job-failure transition (not just
+    ``_phase_search`` in isolation) so persistence compatibility is
+    proven end-to-end:
+
+      1. exactly one search attempt is made;
+      2. no retry happens (retryable=False at the phase boundary);
+      3. the row reaches terminal ``failed``;
+      4. ``error_taxonomy='search_5xx'`` is persisted (the broad
+         bucket — no new persisted column, no schema change, no
+         DTO change);
+      5. ``retryable=False`` is preserved at the phase boundary;
+      6. the row is NOT left in ``running``;
+      7. no provider or network call is made beyond the in-process
+         search mock.
+
+    The point of going through the full ``_run_research`` loop
+    (rather than calling ``_phase_search`` directly) is to prove
+    the broad ``search_5xx`` taxonomy is acceptable to the existing
+    ``error_taxonomy`` CHECK constraint and that the conditional
+    ``running -> failed`` transition writes both
+    ``error_taxonomy`` and ``error_message`` to the same row.
+    """
+    service, _llm, _search, _notifier = service_with_mocks
+    job_id = "pre2a1-invalid-response-persistence"
+    await db.create_research_job(
+        job_id=job_id,
+        query="q",
+        notify_via_tg=0,
+        user_id=0,
+    )
+
+    # Build a real ``SearchResult`` with a structured
+    # ``INVALID_RESPONSE`` ``SearchError``. ``retryable=False`` so
+    # the retry loop MUST NOT re-attempt the search.
+    invalid_response_error = _build_structured_error(
+        code=SearchErrorCode.INVALID_RESPONSE,
+        message="Search backend tavily returned invalid response.",
+        backend="tavily",
+        retryable=False,
+        breaker_relevant=False,
+        http_status=None,
+        diagnostic_category=SearchDiagnosticCategory.INVALID_RESPONSE,
+    )
+    real_search_result = SearchResult(
+        results=[],
+        backend_used="tavily",
+        query="q",
+        content_mode="snippet",
+        original_content_mode="snippet",
+        format_fallback=False,
+        size_guard_chars=50000,
+        truncated=False,
+        error=invalid_response_error,
+    )
+
+    # Track how many times the search callable is invoked.
+    # PRE2-A1: ``retryable=False`` MUST result in a single search
+    # attempt — the retry loop sees ``exc.retryable is False`` and
+    # re-raises without sleeping or re-calling.
+    invocation_count = 0
+
+    async def _counting_search(**kwargs: Any) -> SearchResult:
+        nonlocal invocation_count
+        invocation_count += 1
+        return real_search_result
+
+    service._search = _counting_search
+
+    # Run the full research loop synchronously. The job starts in
+    # 'pending'; the startup CAS transitions it to 'running'; phase 1
+    # raises ``PhaseError(taxonomy='search_5xx', retryable=False)``;
+    # the inner ``except PhaseError`` branch transitions the row to
+    # 'failed' with the broad taxonomy.
+    await service._run_research(job_id)
+
+    # 1. The search was called exactly once (no retry).
+    assert invocation_count == 1
+    # 2. The row is in terminal 'failed' state, NOT 'running'.
+    row = await db.get_research_job(job_id)
+    assert row["status"] == "failed"
+    assert row["status"] != "running"
+    # 3. The persisted ``error_taxonomy`` is the broad ``search_5xx``.
+    #    No new persisted bucket (``search_invalid``) is introduced.
+    assert row["error_taxonomy"] == "search_5xx"
+    # 4. The ``error_message`` is the safe static string from the
+    #    structured ``SearchError`` (NOT ``str(exc)`` and NOT a raw
+    #    body / header).
+    assert row["error_message"] == (
+        "Search backend tavily returned invalid response."
+    )
+    # 5. ``completed_at`` is set (terminal transition recorded).
+    assert row["completed_at"] is not None
+    # 6. The fetcher (phase 2) was never called: the invalid-response
+    #    failure halts the pipeline at phase 1 so no URL is produced
+    #    for it to fetch. (The LLM, scheduler, and notifier are
+    #    all in-process mocks; no real provider / network call is
+    #    made by the test itself.)
+    assert service._fetcher.calls == []
