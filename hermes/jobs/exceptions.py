@@ -88,16 +88,57 @@ class PhaseError(Exception):
     """Internal error durante ejecución de una phase.
 
     Args:
-        taxonomy: ErrorTaxonomy value (string). Determina retry behavior
-            (RETRYABLE_ERRORS set en service.py).
-        message: human-readable detalle.
-        retryable: si False, el retry loop NO reintenta esta phase.
+        taxonomy: ErrorTaxonomy value (string). Determina la taxonomía
+            amplia persistida (search_4xx, search_5xx, timeout, network,
+            llm_5xx, llm_4xx, etc.). El nombre de la taxonomía ya NO
+            decide el retry: el campo ``retryable`` es autoritativo
+            desde PRE2-A1.
+        message: human-readable detalle. PRE2-A1: cuando viene de un
+            search failure, debe ser un mensaje estático seguro
+            (sin ``str(exc)``).
+        retryable: PRE2-A1. Si False, el retry loop NO reintenta esta
+            phase. Si True, se aplican los retries acotados (3 intentos
+            totales, backoff efectivo 1s y 4s).
+        search_error_code: PRE2-A1. SearchErrorCode.value cuando el
+            error viene del search router. None en otros casos.
+        search_backend: PRE2-A1. Backend que produjo el search failure.
+        search_breaker_relevant: PRE2-A1. Indica si el error de search
+            debe contar contra el circuit breaker del backend.
+        search_http_status: PRE2-A1. HTTP status code del search
+            failure si estaba disponible.
+        search_diagnostic_category: PRE2-A1. SearchDiagnosticCategory
+            value del search failure (estable y finita).
+
+    PRE2-A1 note: el retry loop (``_run_phase_with_retry``) decide
+    basado en ``retryable``, NO en pertenencia a un set de taxonomías.
+    Esto permite reportar search_4xx con retryable=True (caso 429) y
+    search_5xx con retryable=False (caso específico) sin contradicción
+    con la taxonomía persistida.
     """
 
-    def __init__(self, taxonomy: str, message: str, retryable: bool = True) -> None:
+    def __init__(
+        self,
+        taxonomy: str,
+        message: str,
+        retryable: bool = True,
+        *,
+        search_error_code: str | None = None,
+        search_backend: str | None = None,
+        search_breaker_relevant: bool | None = None,
+        search_http_status: int | None = None,
+        search_diagnostic_category: str | None = None,
+    ) -> None:
         self.taxonomy = taxonomy
         self.message = message
         self.retryable = retryable
+        # PRE2-A1: in-memory structured bridge from search failure
+        # to phase error. Not persisted; the broad taxonomy is the
+        # only persisted identifier.
+        self.search_error_code = search_error_code
+        self.search_backend = search_backend
+        self.search_breaker_relevant = search_breaker_relevant
+        self.search_http_status = search_http_status
+        self.search_diagnostic_category = search_diagnostic_category
         super().__init__(f"{taxonomy}: {message}")
 
 

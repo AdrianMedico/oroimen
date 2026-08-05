@@ -16,11 +16,13 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx  # PRE2-A1: typed exception fixtures
 import pytest
 
 from hermes.memory.db import Database
 from hermes.services.search.budget import BudgetTracker
 from hermes.services.search.errors import (
+    SearchDiagnosticCategory,
     SearchErrorCode,
 )
 from hermes.services.search.protocol import (
@@ -35,9 +37,12 @@ from hermes.services.search.router import (
     _BACKEND_BY_INTENT,
     _TIMEOUTS,
     _apply_size_guard,
+    _classify_exception,
+    _classify_http_status,
     _compute_usage_cost,
     _dedup_results,
     _normalize_result_urls,
+    _safe_failure_message,
     _sanitize_urls,
     hermes_search,
 )
@@ -930,3 +935,535 @@ async def test_format_fallback_reason_is_none_when_no_fallback(db: Database) -> 
     )
     assert result.format_fallback is False
     assert result.format_fallback_reason is None
+
+
+# =====================================================================
+# PRE2-A1: frozen retry/breaker policy matrix
+# =====================================================================
+#
+# Each test below asserts the full contract for one condition:
+#   - error code
+#   - backend
+#   - http_status (None for non-HTTP)
+#   - retryable
+#   - breaker_relevant
+#   - diagnostic_category
+#   - circuit breaker failure count delta (0 = no breaker change)
+#   - backend call count delta (1 = the call was attempted)
+#
+# The matrix is FROZEN in PRE2-A1 §8.2. Any new condition must be
+# added there first, with a corresponding test, classifier entry,
+# and ERROR_DEFAULTS entry.
+
+
+def _breaker_failure_count(cb: CircuitBreakerRegistry, backend: str) -> int:
+    """Return the current failure count for ``backend`` from the CB state."""
+    return cb._state.get(backend, {}).get("fails", 0)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_local_validation_400_equivalent(db: Database) -> None:
+    """Local validation: no retryable, no breaker."""
+    searxng = _make_backend(name="searxng")
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry()
+    before = _breaker_failure_count(cb, "searxng")
+    result = await hermes_search(
+        query="",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.EMPTY_QUERY
+    assert result.error.backend is None
+    assert result.error.retryable is False
+    assert result.error.breaker_relevant is False
+    assert result.error.http_status is None
+    assert (
+        result.error.diagnostic_category
+        is SearchDiagnosticCategory.LOCAL_VALIDATION
+    )
+    # Breaker state unchanged (validation happens BEFORE the backend call).
+    assert _breaker_failure_count(cb, "searxng") == before
+    # Backend not called.
+    searxng.search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_http_400_non_retryable_no_breaker(db: Database) -> None:
+    """HTTP 400: non-retryable, no breaker change."""
+    searxng = _make_backend(name="searxng")
+    request = httpx.Request("GET", "https://searxng.example/search")
+    response = httpx.Response(400, request=request)
+    searxng.search = AsyncMock(
+        side_effect=httpx.HTTPStatusError(
+            "400 Bad Request", request=request, response=response
+        )
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry()
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.CLIENT_ERROR
+    assert result.error.backend == "searxng"
+    assert result.error.http_status == 400
+    assert result.error.retryable is False
+    assert result.error.breaker_relevant is False
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.CLIENT_ERROR
+    # Breaker was NOT incremented.
+    assert cb._state.get("searxng") is None  # type: ignore[attr-defined]
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_http_401_non_retryable_no_breaker(db: Database) -> None:
+    """HTTP 401: non-retryable, no breaker change."""
+    searxng = _make_backend(name="searxng")
+    request = httpx.Request("GET", "https://searxng.example/search")
+    response = httpx.Response(401, request=request)
+    searxng.search = AsyncMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized", request=request, response=response
+        )
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry()
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.AUTH_ERROR
+    assert result.error.http_status == 401
+    assert result.error.retryable is False
+    assert result.error.breaker_relevant is False
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.AUTH
+    assert cb._state.get("searxng") is None  # type: ignore[attr-defined]
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_http_403_non_retryable_no_breaker(db: Database) -> None:
+    """HTTP 403: non-retryable, no breaker change."""
+    searxng = _make_backend(name="searxng")
+    request = httpx.Request("GET", "https://searxng.example/search")
+    response = httpx.Response(403, request=request)
+    searxng.search = AsyncMock(
+        side_effect=httpx.HTTPStatusError(
+            "403 Forbidden", request=request, response=response
+        )
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry()
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.AUTH_ERROR
+    assert result.error.http_status == 403
+    assert result.error.retryable is False
+    assert result.error.breaker_relevant is False
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.AUTH
+    assert cb._state.get("searxng") is None  # type: ignore[attr-defined]
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_http_422_non_retryable_no_breaker(db: Database) -> None:
+    """HTTP 422: non-retryable, no breaker change (client_error)."""
+    searxng = _make_backend(name="searxng")
+    request = httpx.Request("GET", "https://searxng.example/search")
+    response = httpx.Response(422, request=request)
+    searxng.search = AsyncMock(
+        side_effect=httpx.HTTPStatusError(
+            "422 Unprocessable Entity", request=request, response=response
+        )
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry()
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.CLIENT_ERROR
+    assert result.error.http_status == 422
+    assert result.error.retryable is False
+    assert result.error.breaker_relevant is False
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.CLIENT_ERROR
+    assert cb._state.get("searxng") is None  # type: ignore[attr-defined]
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_http_429_retryable_no_breaker(db: Database) -> None:
+    """HTTP 429: retryable but NOT breaker-relevant."""
+    searxng = _make_backend(name="searxng")
+    request = httpx.Request("GET", "https://searxng.example/search")
+    response = httpx.Response(429, request=request)
+    searxng.search = AsyncMock(
+        side_effect=httpx.HTTPStatusError(
+            "429 Too Many Requests", request=request, response=response
+        )
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry()
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.RATE_LIMITED
+    assert result.error.http_status == 429
+    assert result.error.retryable is True
+    assert result.error.breaker_relevant is False
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.RATE_LIMIT
+    # Breaker NOT incremented (rate limit is per-request, not backend health).
+    assert cb._state.get("searxng") is None  # type: ignore[attr-defined]
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_http_500_retryable_breaker(db: Database) -> None:
+    """HTTP 500: retryable AND breaker-relevant."""
+    searxng = _make_backend(name="searxng")
+    request = httpx.Request("GET", "https://searxng.example/search")
+    response = httpx.Response(500, request=request)
+    searxng.search = AsyncMock(
+        side_effect=httpx.HTTPStatusError(
+            "500 Internal Server Error", request=request, response=response
+        )
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry(threshold=1, ttl_seconds=300)
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.SERVER_ERROR
+    assert result.error.http_status == 500
+    assert result.error.retryable is True
+    assert result.error.breaker_relevant is True
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.SERVER_ERROR
+    # Breaker incremented (threshold=1 → open after 1 failure).
+    assert cb.is_open("searxng") is True
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_http_503_retryable_breaker(db: Database) -> None:
+    """HTTP 503: retryable AND breaker-relevant (server_error)."""
+    searxng = _make_backend(name="searxng")
+    request = httpx.Request("GET", "https://searxng.example/search")
+    response = httpx.Response(503, request=request)
+    searxng.search = AsyncMock(
+        side_effect=httpx.HTTPStatusError(
+            "503 Service Unavailable", request=request, response=response
+        )
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry(threshold=1, ttl_seconds=300)
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.SERVER_ERROR
+    assert result.error.http_status == 503
+    assert result.error.retryable is True
+    assert result.error.breaker_relevant is True
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.SERVER_ERROR
+    assert cb.is_open("searxng") is True
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_timeout_retryable_breaker(db: Database) -> None:
+    """asyncio.TimeoutError: retryable AND breaker-relevant."""
+    searxng = _make_backend(name="searxng")
+
+    async def _slow(*args: Any, **kwargs: Any) -> SearchResult:
+        await asyncio.sleep(2)
+        return SearchResult(
+            results=[],
+            backend_used="searxng",
+            query="q",
+            content_mode="snippet",
+            original_content_mode="snippet",
+            format_fallback=False,
+            size_guard_chars=50000,
+            truncated=False,
+        )
+
+    searxng.search = AsyncMock(side_effect=_slow)
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry(threshold=1, ttl_seconds=300)
+    import hermes.services.search.router as router_mod
+
+    original_timeout = router_mod._TIMEOUTS["searxng"]
+    router_mod._TIMEOUTS["searxng"] = 0.01
+    try:
+        result = await hermes_search(
+            query="q",
+            intent="general",
+            backends=backends,
+            budget=_make_budget(db),
+            circuit_breaker=cb,
+            semaphore=ConcurrencyLimiter(),
+        )
+    finally:
+        router_mod._TIMEOUTS["searxng"] = original_timeout
+
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.TIMEOUT
+    assert result.error.http_status is None
+    assert result.error.retryable is True
+    assert result.error.breaker_relevant is True
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.TIMEOUT
+    assert cb.is_open("searxng") is True
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_network_failure_retryable_breaker(db: Database) -> None:
+    """httpx.ConnectError / network: retryable AND breaker-relevant."""
+    searxng = _make_backend(name="searxng")
+    searxng.search = AsyncMock(
+        side_effect=httpx.ConnectError("dns failure")
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry(threshold=1, ttl_seconds=300)
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.NETWORK_ERROR
+    assert result.error.http_status is None
+    assert result.error.retryable is True
+    assert result.error.breaker_relevant is True
+    assert result.error.diagnostic_category is SearchDiagnosticCategory.NETWORK
+    assert cb.is_open("searxng") is True
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_invalid_2xx_non_retryable_no_breaker(db: Database) -> None:
+    """Invalid 2xx (e.g. backend raises on malformed body): non-retryable, non-breaker.
+
+    PRE2-A1: a backend that successfully returns HTTP 200 but with a
+    malformed body raises some exception (e.g. JSONDecodeError,
+    ValueError) instead of producing a valid SearchResult. The
+    router classifies this as INVALID_RESPONSE and does NOT touch
+    the circuit breaker (a buggy response is not a backend outage).
+    """
+    searxng = _make_backend(name="searxng")
+    searxng.search = AsyncMock(
+        side_effect=ValueError("malformed JSON body")
+    )
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry()
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    assert result.error is not None
+    assert result.error.code is SearchErrorCode.INVALID_RESPONSE
+    assert result.error.retryable is False
+    assert result.error.breaker_relevant is False
+    assert (
+        result.error.diagnostic_category
+        is SearchDiagnosticCategory.INVALID_RESPONSE
+    )
+    # Breaker was NOT incremented (we do not penalize the backend
+    # for an error we cannot classify structurally).
+    assert cb._state.get("searxng") is None  # type: ignore[attr-defined]
+    searxng.search.assert_awaited_once()
+    # PRE2-A1: message must NOT contain the exception text. The
+    # router builds a safe static message.
+    assert "malformed JSON body" not in result.error.message
+    assert "ValueError" not in result.error.message
+
+
+@pytest.mark.asyncio
+async def test_pre2a1_valid_200_zero_results_not_an_error(db: Database) -> None:
+    """Successful 200 with zero results: SearchResult(error=None, results=[])."""
+    searxng = MagicMock(spec=BackendProtocol)
+    searxng.name = "searxng"
+    searxng.SUPPORTED_CONTENT_MODES = frozenset({"snippet"})
+    searxng.has_budget = AsyncMock(return_value=True)
+    searxng.health_check = AsyncMock(return_value=True)
+
+    async def _empty_search(
+        query: str,
+        content_mode: str,
+        num_results: int,
+        *,
+        intent: str = "general",
+    ) -> SearchResult:
+        return SearchResult(
+            results=[],
+            backend_used="searxng",
+            query=query,
+            content_mode="snippet",
+            original_content_mode="snippet",
+            format_fallback=False,
+            size_guard_chars=50000,
+            truncated=False,
+        )
+
+    searxng.search = AsyncMock(side_effect=_empty_search)
+    backends = {"searxng": searxng}
+    cb = CircuitBreakerRegistry()
+    result = await hermes_search(
+        query="q",
+        intent="general",
+        backends=backends,
+        budget=_make_budget(db),
+        circuit_breaker=cb,
+        semaphore=ConcurrencyLimiter(),
+    )
+    # Valid empty result: error is None, results is [].
+    assert result.error is None
+    assert result.results == []
+    assert result.backend_used == "searxng"
+    searxng.search.assert_awaited_once()
+
+
+# --- PRE2-A1: safe message construction ---
+
+
+def test_pre2a1_safe_message_omits_exception_text() -> None:
+    """PRE2-A1: _safe_failure_message never includes str(exc)."""
+    msg = _safe_failure_message(
+        "tavily",
+        SearchErrorCode.SERVER_ERROR,
+        http_status=503,
+    )
+    # Safe static parts only.
+    assert "tavily" in msg
+    assert "503" in msg
+    # No exception text — never an open-ended concat of str(exc).
+    assert "exception" not in msg.lower()
+
+
+def test_pre2a1_safe_message_timeout_includes_seconds() -> None:
+    """PRE2-A1: timeout message includes the timeout value (safe static)."""
+    msg = _safe_failure_message(
+        "tavily", SearchErrorCode.TIMEOUT, http_status=None, timeout_s=10.0
+    )
+    assert "10" in msg
+    assert "tavily" in msg
+    assert "timed out" in msg.lower()
+
+
+# --- PRE2-A1: structured classifier unit tests ---
+
+
+def test_pre2a1_classify_http_status_matrix() -> None:
+    """PRE2-A1: frozen HTTP status matrix."""
+    assert _classify_http_status(400) == (
+        SearchErrorCode.CLIENT_ERROR,
+        False,
+        False,
+        SearchDiagnosticCategory.CLIENT_ERROR,
+    )
+    assert _classify_http_status(422) == (
+        SearchErrorCode.CLIENT_ERROR,
+        False,
+        False,
+        SearchDiagnosticCategory.CLIENT_ERROR,
+    )
+    assert _classify_http_status(401) == (
+        SearchErrorCode.AUTH_ERROR,
+        False,
+        False,
+        SearchDiagnosticCategory.AUTH,
+    )
+    assert _classify_http_status(403) == (
+        SearchErrorCode.AUTH_ERROR,
+        False,
+        False,
+        SearchDiagnosticCategory.AUTH,
+    )
+    assert _classify_http_status(429) == (
+        SearchErrorCode.RATE_LIMITED,
+        True,
+        False,
+        SearchDiagnosticCategory.RATE_LIMIT,
+    )
+    for s in (500, 502, 503, 504):
+        assert _classify_http_status(s) == (
+            SearchErrorCode.SERVER_ERROR,
+            True,
+            True,
+            SearchDiagnosticCategory.SERVER_ERROR,
+        )
+
+
+def test_pre2a1_classify_exception_uses_isinstance_not_str() -> None:
+    """PRE2-A1: _classify_exception uses isinstance, never str(exc)."""
+    # httpx.HTTPStatusError carries the structured status code.
+    request = httpx.Request("GET", "https://x")
+    response = httpx.Response(429, request=request)
+    exc = httpx.HTTPStatusError("msg", request=request, response=response)
+    code, retryable, breaker, cat, status = _classify_exception(exc)
+    assert code is SearchErrorCode.RATE_LIMITED
+    assert retryable is True
+    assert breaker is False
+    assert cat is SearchDiagnosticCategory.RATE_LIMIT
+    assert status == 429
+
+    # Unknown exception → INVALID_RESPONSE, non-retryable, non-breaker.
+    code, retryable, breaker, cat, status = _classify_exception(
+        ValueError("anything")
+    )
+    assert code is SearchErrorCode.INVALID_RESPONSE
+    assert retryable is False
+    assert breaker is False
+    assert cat is SearchDiagnosticCategory.INVALID_RESPONSE
+    assert status is None

@@ -80,10 +80,17 @@ from hermes.observability.influxdb import write_research_metric
 logger = logging.getLogger(__name__)
 
 
-# Retryable errors (TDD §6.7). 4xx / cancelled / budget / oom NO retry.
+# Retryable errors (TDD §6.7). PRE2-A1: retained only for
+# backwards-compatibility introspection (e.g. legacy log keys and
+# dashboards). The retry decision itself is taken from
+# ``PhaseError.retryable`` in ``_run_phase_with_retry``.
+#
+# 4xx / cancelled / budget / oom NO retry (por taxonomía amplia),
+# pero casos como search_4xx con retryable=True (HTTP 429) sí se
+# reintentan — el campo autoritativo es ``PhaseError.retryable``.
 RETRYABLE_ERRORS = frozenset(
     {
-        "search_5xx",  # Tavily transient
+        "search_5xx",  # Tavily transient (or search 5xx-like)
         "llm_5xx",  # LLM provider transient
         "timeout",  # asyncio.wait_for agotó
         "network",  # DNS, connection refused
@@ -96,6 +103,71 @@ RETRYABLE_ERRORS = frozenset(
         # 'checkpoint_corrupt' (data corruption — re-init manual)
     }
 )
+
+
+# PRE2-A1: mapping from ``SearchDiagnosticCategory`` to the broad
+# persisted job taxonomy. Explicit and deterministic. The mapping
+# preserves existing persisted categories (search_4xx, search_5xx,
+# timeout, network) so DB schemas and dashboards are unchanged.
+# A new diagnostic category MUST be added here with a focused
+# regression test before any ``_phase_search`` use.
+def _map_search_diagnostic_to_taxonomy(category: str) -> str:
+    """Map a SearchDiagnosticCategory.value to broad job taxonomy.
+
+    PRE2-A1: the persisted taxonomy remains the existing
+    ``search_4xx`` / ``search_5xx`` / ``timeout`` / ``network`` set
+    plus the new ``search_invalid`` bucket for malformed
+    successful responses. Deep Research and other consumers
+    continue to read these stable strings.
+    """
+    if category == "timeout":
+        return "timeout"
+    if category == "network":
+        return "network"
+    if category in ("auth", "client_error", "rate_limit", "local_validation", "budget"):
+        return "search_4xx"
+    if category in ("server_error", "circuit", "all_backends_failed"):
+        return "search_5xx"
+    if category == "invalid_response":
+        return "search_invalid"
+    # Conservative default: 5xx-shaped so the row is retriable from
+    # the perspective of an old caller that still inspects taxonomy.
+    return "search_5xx"
+
+
+def _phase_error_from_search_error(search_error: Any) -> PhaseError:
+    """Build a ``PhaseError`` from a structured ``SearchError``.
+
+    PRE2-A1: uses ONLY the structured fields. The message field on
+    the ``SearchError`` is already a safe static string (the router
+    never concatenates ``str(exc)`` into it since PRE2-A1), so it is
+    safe to surface here.
+    """
+    category_value = (
+        search_error.diagnostic_category.value
+        if hasattr(search_error.diagnostic_category, "value")
+        else str(search_error.diagnostic_category)
+    )
+    code_value = (
+        search_error.code.value
+        if hasattr(search_error.code, "value")
+        else str(search_error.code)
+    )
+    taxonomy = _map_search_diagnostic_to_taxonomy(category_value)
+    return PhaseError(
+        taxonomy=taxonomy,
+        message=search_error.message,
+        retryable=bool(search_error.retryable),
+        search_error_code=code_value,
+        search_backend=search_error.backend,
+        search_breaker_relevant=(
+            bool(search_error.breaker_relevant)
+            if search_error.breaker_relevant is not None
+            else None
+        ),
+        search_http_status=search_error.http_status,
+        search_diagnostic_category=category_value,
+    )
 
 # Backoff schedule (seconds): 3 attempts total.
 _RETRY_BACKOFF_SCHEDULE = (1, 4, 16)
@@ -1881,7 +1953,19 @@ class DeepResearchService:
     # =====================================================================
 
     async def _phase_search(self, job_id: str) -> list[str]:
-        """Phase 1: web search via hermes_search(intent='deep_research')."""
+        """Phase 1: web search via hermes_search(intent='deep_research').
+
+        PRE2-A1: consumes ``SearchResult.error`` BEFORE accessing URLs
+        and maps the structured failure to ``PhaseError`` using the
+        structured fields (``code``, ``backend``, ``http_status``,
+        ``diagnostic_category``, ``retryable``, ``breaker_relevant``).
+        Never inspects ``str(exc)`` to decide retry or classification.
+
+        A successful ``SearchResult(error=None, results=[])`` is the
+        valid empty phase-one result and returns ``[]`` without
+        raising. Multi-query or all-empty aggregation semantics are
+        out of scope (PRE2-C).
+        """
         query = await self._db.get_research_job_query(job_id)
         if not query:
             raise PhaseError("search_5xx", "job_query_missing", retryable=False)
@@ -1901,29 +1985,54 @@ class DeepResearchService:
                 timeout=timeout,
             )
         except TimeoutError as exc:
-            raise PhaseError("timeout", "search_timeout", retryable=True) from exc
+            # Outer asyncio.wait_for timeout (the search itself did not
+            # complete within the phase budget). Preserve the existing
+            # taxonomy but flag it as search timeout for structured
+            # bridges.
+            raise PhaseError(
+                "timeout",
+                "search_phase_timeout",
+                retryable=True,
+                search_error_code="TIMEOUT",
+                search_diagnostic_category="timeout",
+            ) from exc
         except Exception as exc:
-            err_msg = str(exc).lower()
-            if "401" in err_msg or "403" in err_msg or "api key" in err_msg:
-                raise PhaseError("search_4xx", f"search_auth:{exc!s}", retryable=False) from exc
-            raise PhaseError("search_5xx", f"search_error:{exc!s}", retryable=True) from exc
-
-        # Extraer URLs del SearchResult (duck-typed) o si es ya list[str].
-        urls: list[str] = []
-        if isinstance(result, list):
-            urls = [str(u) for u in result]
-        elif hasattr(result, "results"):
-            urls = [r["url"] for r in result.results if r.get("url")]
-        else:
+            # The router now classifies typed exceptions itself, but if
+            # a backend raised an exception that escaped the router
+            # (e.g. unusual exception type, or a test double that
+            # raises before SearchResult is produced), fall back to a
+            # structured PhaseError without parsing str(exc).
             raise PhaseError(
                 "search_5xx",
-                f"unexpected_search_result:{type(result).__name__}",
+                "search_backend_failed",
                 retryable=True,
-            )
+                search_error_code="INVALID_RESPONSE",
+                search_diagnostic_category="invalid_response",
+            ) from exc
 
-        if not urls:
-            raise PhaseError("search_5xx", "no_results", retryable=True)
-        return urls[:max_sources]
+        # Extract URLs (duck-typed) — consume SearchResult.error FIRST.
+        if isinstance(result, list):
+            # Legacy convenience: list of URL strings. Empty list is a
+            # valid empty phase-one result (PRE2-A1).
+            return [str(u) for u in result if u][:max_sources]
+        if hasattr(result, "error") and result.error is not None:
+            # PRE2-A1: bridge structured SearchError into PhaseError
+            # using the explicit fields. Do NOT parse message text.
+            raise _phase_error_from_search_error(result.error)
+        if hasattr(result, "results"):
+            # Successful SearchResult (possibly empty). Empty results
+            # is a valid phase-one result; do NOT raise search_5xx/no_results.
+            return [
+                r["url"]
+                for r in result.results
+                if r.get("url")
+            ][:max_sources]
+        # No recognizable shape — structural problem, retryable.
+        raise PhaseError(
+            "search_5xx",
+            f"unexpected_search_result:{type(result).__name__}",
+            retryable=True,
+        )
 
     async def _phase_scrape(self, job_id: str, urls: list[str]) -> list[dict]:
         """Phase 2: safe-fetch external URL + selectolax html_to_text.
@@ -2471,24 +2580,24 @@ class DeepResearchService:
     ) -> Any:
         """Wrapper: ejecuta phase_fn con retry de 3 intentos totales.
 
-        Comportamiento actual (DR-Q1A-PRE1A, sin cambios de comportamiento):
-          - Máximo de 3 intentos totales para errores retryables
-            (``RETRYABLE_ERRORS``: search_5xx, llm_5xx, timeout, network).
+        PRE2-A1: ``PhaseError.retryable`` es autoritativo. La taxonomía
+        (``exc.taxonomy``) ya NO decide si se reintenta — sólo etiqueta
+        el fallo para persistencia. Esto permite reportar ``search_4xx``
+        con retryable=True (caso 429) y ``search_5xx`` con retryable=False
+        sin contradicción con la base de datos.
+
+        Comportamiento (DR-Q1A-PRE1A + PRE2-A1):
+          - Máximo de 3 intentos totales cuando ``exc.retryable`` es True.
           - Backoff efectivo: 1 segundo después del primer fallo,
             4 segundos después del segundo fallo.
           - El tercer fallo TERMINA la fase (no se reintenta);
             el ``PhaseError`` se relanza.
-          - El valor 16 en ``_RETRY_BACKOFF_SCHEDULE = (1, 4, 16)``
-            EXISTE en la tupla pero NO se consume en el bucle actual
-            (el bucle itera ``for attempt in range(3)`` y solo lee
-            ``_RETRY_BACKOFF_SCHEDULE[attempt]`` cuando
-            ``attempt < 2``). El valor 16 es un residuo histórico y
-            no afecta el comportamiento observable.
+          - Si ``exc.retryable`` es False, se hace UN solo intento y
+            el ``PhaseError`` se relanza inmediatamente.
 
-        El docstring anterior ("exp backoff 1s, 4s, 16s, max 3
-        attempts") era incorrecto: las esperas efectivas son 1 y 4
-        segundos, no 1, 4 y 16. El cambio es de documentación
-        únicamente.
+        Required contradictory-case behavior (PRE2-A1):
+          - ``PhaseError("search_5xx", retryable=False)`` → 1 intento.
+          - ``PhaseError("search_4xx", retryable=True)``  → 3 intentos.
 
         Si el job total excede ~30 minutos, el recovery hook lo
         detecta y re-enqueua (con el checkpoint de la última fase
@@ -2501,13 +2610,20 @@ class DeepResearchService:
                 return result
             except PhaseError as exc:
                 last_error = exc
-                if exc.taxonomy not in RETRYABLE_ERRORS:
+                # PRE2-A1: ``retryable`` is authoritative. The
+                # taxonomy is logged but does not gate the retry.
+                if not exc.retryable:
                     logger.warning(
                         "phase_non_retryable_error",
                         extra={
                             "job_id": job_id,
                             "phase": phase_name.value,
                             "error_taxonomy": exc.taxonomy,
+                            "error_retryable": exc.retryable,
+                            "search_error_code": exc.search_error_code,
+                            "search_diagnostic_category": (
+                                exc.search_diagnostic_category
+                            ),
                         },
                     )
                     raise
@@ -2520,7 +2636,12 @@ class DeepResearchService:
                             "phase": phase_name.value,
                             "attempt": attempt + 1,
                             "error_taxonomy": exc.taxonomy,
+                            "error_retryable": exc.retryable,
                             "next_retry_in_s": backoff,
+                            "search_error_code": exc.search_error_code,
+                            "search_diagnostic_category": (
+                                exc.search_diagnostic_category
+                            ),
                         },
                     )
                     await asyncio.sleep(backoff)
@@ -2531,6 +2652,11 @@ class DeepResearchService:
                             "job_id": job_id,
                             "phase": phase_name.value,
                             "error_taxonomy": exc.taxonomy,
+                            "error_retryable": exc.retryable,
+                            "search_error_code": exc.search_error_code,
+                            "search_diagnostic_category": (
+                                exc.search_diagnostic_category
+                            ),
                         },
                     )
                     raise

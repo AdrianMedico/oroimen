@@ -1,4 +1,4 @@
-"""Sprint 9.3: Web Search Router (multi-backend).
+"""Sprint 9.3 + PRE2-A1: Web Search Router (multi-backend).
 
 Backends implementados:
 - SearXNG (self-hosted, default para intent='general' y como fallback)
@@ -13,11 +13,16 @@ Ver:
 - docs/TDD_S9_3_WEB_SEARCH_ROUTER.md v1.3
 - ADR-001 (cross-review disciplinado)
 - 3 rondas de cross-review (Gemini 3.5 Thinking + GLM 5.2)
+
+PRE2-A1: exposes ``SearchDiagnosticCategory`` and the extended
+``SearchError`` fields so Deep Research and other consumers can
+bridge structured failures without parsing exception text.
 """
 
 from __future__ import annotations
 
 from hermes.services.search.errors import (
+    SearchDiagnosticCategory,
     SearchError,
     SearchErrorCode,
 )
@@ -32,6 +37,7 @@ __all__ = [
     "ALL_CONTENT_MODES",
     "BackendProtocol",
     "ContentMode",
+    "SearchDiagnosticCategory",
     "SearchError",
     "SearchErrorCode",
     "SearchResult",
