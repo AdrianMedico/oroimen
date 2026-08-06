@@ -1,9 +1,17 @@
-"""Sprint 9.3: Web Search Router (Capa 6).
+"""Sprint 9.3 + PRE2-A1: Web Search Router (Capa 6).
 
 Implementa TODOS los fixes de las 3 rondas de cross-review:
 - v1.0 -> v1.1 (Gemini 3.5 Thinking): 3 P0 + 2 P1
 - v1.1 -> v1.2 (GLM 5.2): 7 P0 + 9 P1 + 6 P2
 - v1.2 -> v1.3 (Gemini 3.5 Thinking): 2 P1 (concurrency)
+
+PRE2-A1 (truthful search-error bridge): the router now classifies
+typed HTTP/transport exceptions into structured ``SearchError``
+fields, calls ``circuit_breaker.record_failure`` only when
+``breaker_relevant`` is True, and never parses ``str(exc)`` to
+decide HTTP status, retryability, or breaker behavior. The
+frozen retry/breaker matrix is implemented via the classifier
+helpers ``_classify_http_status`` and ``_classify_exception``.
 
 Flow:
 1. Validar inputs (empty/long query, invalid intent/content)
@@ -27,7 +35,10 @@ import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+import httpx  # PRE2-A1: typed HTTP/transport exception classification
+
 from hermes.services.search.errors import (
+    SearchDiagnosticCategory,
     SearchError,
     SearchErrorCode,
     _build_structured_error,
@@ -79,6 +90,201 @@ _DANGEROUS_SCHEMES: tuple[str, ...] = (
 )
 
 
+# =====================================================================
+# PRE2-A1: typed classification helpers
+# =====================================================================
+
+
+def _classify_http_status(
+    status_code: int,
+) -> tuple[SearchErrorCode, bool, bool, SearchDiagnosticCategory]:
+    """Map HTTP status code to (code, retryable, breaker_relevant, category).
+
+    PRE2-A1 frozen matrix:
+
+    +------------------+-----------+----------------+
+    | status           | retryable | breaker_relevant|
+    +------------------+-----------+----------------+
+    | 400, 422         |    no     |       no       |
+    | 401, 403         |    no     |       no       |
+    | 429              |   yes     |       no       |
+    | 5xx              |   yes     |      yes       |
+    | 2xx (fallback)   |    no     |       no       | (invalid_response)
+    +------------------+-----------+----------------+
+    """
+    if status_code in (400, 422):
+        return (
+            SearchErrorCode.CLIENT_ERROR,
+            False,
+            False,
+            SearchDiagnosticCategory.CLIENT_ERROR,
+        )
+    if status_code in (401, 403):
+        return (
+            SearchErrorCode.AUTH_ERROR,
+            False,
+            False,
+            SearchDiagnosticCategory.AUTH,
+        )
+    if status_code == 429:
+        return (
+            SearchErrorCode.RATE_LIMITED,
+            True,
+            False,
+            SearchDiagnosticCategory.RATE_LIMIT,
+        )
+    if 500 <= status_code < 600:
+        return (
+            SearchErrorCode.SERVER_ERROR,
+            True,
+            True,
+            SearchDiagnosticCategory.SERVER_ERROR,
+        )
+    # 2xx should not reach here on a failure path; if it does
+    # (e.g. a malformed 2xx body), treat as invalid response.
+    return (
+        SearchErrorCode.INVALID_RESPONSE,
+        False,
+        False,
+        SearchDiagnosticCategory.INVALID_RESPONSE,
+    )
+
+
+def _classify_exception(
+    exc: BaseException,
+) -> tuple[
+    SearchErrorCode,
+    bool,
+    bool,
+    SearchDiagnosticCategory,
+    int | None,
+]:
+    """Classify a typed exception into structured search error fields.
+
+    PRE2-A1 frozen matrix (in evaluation order):
+
+    +-----------------------------------------------+------------------+---------------+----------------+
+    | exception type                                | code             | retryable     | breaker_relevant|
+    +-----------------------------------------------+------------------+---------------+----------------+
+    | asyncio.TimeoutError / TimeoutError (native) | TIMEOUT          | yes           | yes            |
+    | httpx.HTTPStatusError                        | via status       | via status    | via status     |
+    | httpx.TimeoutException                       | TIMEOUT          | yes           | yes            |
+    | httpx.NetworkError (incl. ConnectError)      | NETWORK_ERROR    | yes           | yes            |
+    | httpx.ProxyError                             | NETWORK_ERROR    | yes           | yes            |
+    | httpx.RemoteProtocolError                    | NETWORK_ERROR    | yes           | yes            |
+    | builtin ConnectionError / other OSError      | NETWORK_ERROR    | yes           | yes            |
+    | httpx.LocalProtocolError                     | CLIENT_ERROR     | no            | no             |
+    | httpx.UnsupportedProtocol                    | CLIENT_ERROR     | no            | no             |
+    | anything else (e.g. ValueError)              | INVALID_RESPONSE | no            | no             |
+    +-----------------------------------------------+------------------+---------------+----------------+
+
+    PRE2-A1: never inspects ``str(exc)``. Uses only exception types
+    (``isinstance``) and structured HTTP status when available
+    (``httpx.HTTPStatusError.response.status_code``).
+
+    Returns:
+        (code, retryable, breaker_relevant, diagnostic_category, http_status)
+    """
+    # 1. asyncio.TimeoutError (also aliased to builtin TimeoutError in 3.11+).
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) and not isinstance(
+        exc, httpx.TimeoutException
+    ):
+        return (
+            SearchErrorCode.TIMEOUT,
+            True,
+            True,
+            SearchDiagnosticCategory.TIMEOUT,
+            None,
+        )
+    # 2. httpx.HTTPStatusError carries the structured response.
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        code, retryable, breaker, cat = _classify_http_status(status)
+        return code, retryable, breaker, cat, status
+    # 3. httpx.TimeoutException (read, connect, or write timeout).
+    if isinstance(exc, httpx.TimeoutException):
+        return (
+            SearchErrorCode.TIMEOUT,
+            True,
+            True,
+            SearchDiagnosticCategory.TIMEOUT,
+            None,
+        )
+    # 4. Transport / network failures (retryable, breaker-relevant).
+    #    httpx.NetworkError covers httpx.ConnectError (subclass).
+    #    httpx.ProxyError and httpx.RemoteProtocolError are TransportError
+    #    subclasses that are NOT NetworkError subclasses; they are
+    #    network-class failures and must be classified the same way.
+    if isinstance(
+        exc,
+        (
+            httpx.NetworkError,
+            httpx.ProxyError,
+            httpx.RemoteProtocolError,
+            ConnectionError,
+            OSError,
+        ),
+    ):
+        return (
+            SearchErrorCode.NETWORK_ERROR,
+            True,
+            True,
+            SearchDiagnosticCategory.NETWORK,
+            None,
+        )
+    # 5. Local protocol / configuration failures (deterministic).
+    #    httpx.LocalProtocolError is a programming error (the client
+    #    constructed a malformed request); httpx.UnsupportedProtocol
+    #    is a configuration error (the URL scheme is not supported).
+    #    Both are non-retryable and do NOT count against the breaker
+    #    because retrying the same call yields the same result.
+    if isinstance(exc, (httpx.LocalProtocolError, httpx.UnsupportedProtocol)):
+        return (
+            SearchErrorCode.CLIENT_ERROR,
+            False,
+            False,
+            SearchDiagnosticCategory.CLIENT_ERROR,
+            None,
+        )
+    # 6. Unknown exception: invalid response, non-retryable, non-breaker.
+    # PRE2-A1: do not penalize the backend for an error we cannot
+    # classify structurally.
+    return (
+        SearchErrorCode.INVALID_RESPONSE,
+        False,
+        False,
+        SearchDiagnosticCategory.INVALID_RESPONSE,
+        None,
+    )
+
+
+def _safe_failure_message(
+    backend_name: str,
+    code: SearchErrorCode,
+    http_status: int | None,
+    timeout_s: float | None = None,
+) -> str:
+    """Build a safe static failure message. No exception text.
+
+    PRE2-A1: ``message`` fields never contain ``str(exc)``, response
+    bodies, headers, or credentials. The structured fields carry the
+    diagnostic information; the message is a short human-readable
+    label for the LLM and operator.
+    """
+    if code is SearchErrorCode.TIMEOUT:
+        if timeout_s is not None:
+            return f"Search timed out after {timeout_s:g}s on {backend_name}."
+        return f"Search timed out on {backend_name}."
+    if http_status is not None:
+        return f"Search backend {backend_name} returned HTTP {http_status}."
+    return f"Search backend {backend_name} failed ({code.value})."
+
+
+# =====================================================================
+# Public entry point
+# =====================================================================
+
+
 async def hermes_search(
     query: str,
     intent: str = "general",
@@ -113,8 +319,10 @@ async def hermes_search(
         return _empty_result_with_error(
             _build_structured_error(
                 code=SearchErrorCode.EMPTY_QUERY,
-                message="Query cannot be empty",
+                message="Query cannot be empty.",
                 backend=None,
+                breaker_relevant=False,
+                diagnostic_category=SearchDiagnosticCategory.LOCAL_VALIDATION,
             )
         )
     if len(query) > _MAX_QUERY_CHARS:
@@ -127,16 +335,28 @@ async def hermes_search(
         return _empty_result_with_error(
             _build_structured_error(
                 code=SearchErrorCode.INVALID_INTENT,
-                message=f"Unknown intent: {intent}. Use: general, semantic, deep_research.",
+                # PRE2-A1 P1-2: fixed static message. The caller-provided
+                # value is NEVER echoed back into ``SearchError.message``,
+                # so the LLM-visible error and serialized tool output
+                # cannot carry arbitrary caller text.
+                message="Unknown search intent. Use: general, semantic, deep_research.",
                 backend=None,
+                breaker_relevant=False,
+                diagnostic_category=SearchDiagnosticCategory.LOCAL_VALIDATION,
             )
         )
     if content not in _ALL_CONTENT_MODES:
         return _empty_result_with_error(
             _build_structured_error(
                 code=SearchErrorCode.INVALID_CONTENT,
-                message=f"Unknown content mode: {content}. Use: snippet, summary, full.",
+                # PRE2-A1 P1-2: fixed static message. The caller-provided
+                # value is NEVER echoed back into ``SearchError.message``,
+                # so the LLM-visible error and serialized tool output
+                # cannot carry arbitrary caller text.
+                message="Unknown content mode. Use: snippet, summary, full.",
                 backend=None,
+                breaker_relevant=False,
+                diagnostic_category=SearchDiagnosticCategory.LOCAL_VALIDATION,
             )
         )
 
@@ -172,6 +392,8 @@ async def hermes_search(
                     backend="searxng",
                     backends_tried=list(_BACKEND_BY_INTENT.values()),
                     reasons={b: "CIRCUIT_OPEN" for b in _BACKEND_BY_INTENT.values()},
+                    breaker_relevant=False,
+                    diagnostic_category=SearchDiagnosticCategory.ALL_BACKENDS_FAILED,
                 )
             )
         backend = backends["searxng"]
@@ -214,10 +436,17 @@ async def hermes_search(
             return _empty_result_with_error(
                 _build_structured_error(
                     code=SearchErrorCode.BUDGET_EXHAUSTED,
-                    message=(f"Budget for {backend_name} exhausted while " "waiting in queue."),
+                    message=(
+                        f"Budget for {backend_name} exhausted while "
+                        "waiting in queue."
+                    ),
                     backend=backend_name,
                     retryable=True,
-                    suggestion=("Use intent='general' (unlimited SearXNG) " "or retry later."),
+                    breaker_relevant=False,
+                    diagnostic_category=SearchDiagnosticCategory.BUDGET,
+                    suggestion=(
+                        "Use intent='general' (unlimited SearXNG) or retry later."
+                    ),
                 )
             )
 
@@ -238,24 +467,35 @@ async def hermes_search(
                 ),
                 timeout=_TIMEOUTS[backend_name],
             )
-        except TimeoutError:
-            circuit_breaker.record_failure(backend_name)
-            return _empty_result_with_error(
-                _build_structured_error(
-                    code=SearchErrorCode.TIMEOUT,
-                    message=(f"Timeout after {_TIMEOUTS[backend_name]}s " f"on {backend_name}."),
-                    backend=backend_name,
-                    retryable=True,
-                )
-            )
         except Exception as exc:
-            circuit_breaker.record_failure(backend_name)
+            # PRE2-A1: classify typed exception, decide breaker
+            # and retryable from structured fields. Never parse str(exc).
+            (
+                code,
+                retryable,
+                breaker,
+                cat,
+                http_status,
+            ) = _classify_exception(exc)
+            if breaker:
+                circuit_breaker.record_failure(backend_name)
+            timeout_s = (
+                _TIMEOUTS[backend_name]
+                if code is SearchErrorCode.TIMEOUT
+                else None
+            )
+            message = _safe_failure_message(
+                backend_name, code, http_status, timeout_s=timeout_s
+            )
             return _empty_result_with_error(
                 _build_structured_error(
-                    code=SearchErrorCode.INVALID_RESPONSE,
-                    message=f"Runtime error: {str(exc)[:200]}",
+                    code=code,
+                    message=message,
                     backend=backend_name,
-                    retryable=False,
+                    retryable=retryable,
+                    breaker_relevant=breaker,
+                    http_status=http_status,
+                    diagnostic_category=cat,
                 )
             )
 
