@@ -15,11 +15,19 @@ truncamiento determinista (text[:N]) independiente del tokenizador.
 PRE2-A2 (backend query-length capabilities): adds the immutable
 ``BackendQueryCapabilities`` shape and a stable class-level
 ``QUERY_CAPABILITIES`` attribute on ``BackendProtocol``. The router
-uses this to validate a query against the SELECTED backend's declared
-limit AFTER backend selection and BEFORE any semaphore, budget, or
-dispatch side effect. ``max_query_chars = None`` means unknown /
-no provider-specific local rejection; it is NOT a guarantee of
-unlimited acceptance.
+uses this to validate the ORIGINAL query against the SELECTED
+backend's declared limit AFTER backend selection (including
+fallback) and BEFORE the generic 2000-char truncation, so the
+rejection surfaces the original length (not a truncated one).
+``max_query_chars = None`` means unknown / no provider-specific
+local rejection; it is NOT a guarantee of unlimited acceptance.
+
+The 399 value carried by ``TAVILY_MAX_QUERY_CHARS`` is an
+Oroimen-side conservative operational / compatibility cap. It is
+a defensive cut that protects the local pipeline until live Tavily
+measurements confirm the actual provider limit. It is NOT a claim
+that Tavily's hosted API currently enforces a hard 399-character
+limit on the ``query`` field.
 """
 
 from __future__ import annotations
@@ -43,11 +51,13 @@ ALL_CONTENT_MODES: frozenset[str] = frozenset({"snippet", "summary", "full"})
 DEFAULT_SIZE_GUARD_CHARS: int = 200000
 
 
-# PRE2-A2: Tavily's hosted API enforces a hard 399-char limit on
-# the ``query`` field. Rejecting locally is safer than letting the
-# provider return a 4xx (which would be classified as CLIENT_ERROR
-# and would not be semantically accurate: the LLM crafted a too-long
-# query, the provider did not fail mid-flight).
+# PRE2-A2: Oroimen conservative operational / compatibility cap.
+# 399 is a defensive cut that protects the local pipeline until live
+# Tavily measurements confirm the actual provider limit. It is NOT
+# a claim that the hosted Tavily API currently enforces a hard
+# 399-character limit. The router validates the ORIGINAL query
+# against this cap BEFORE the generic 2000-char truncation so the
+# rejection surfaces the original length (not a truncated one).
 TAVILY_MAX_QUERY_CHARS: int = 399
 
 
@@ -61,13 +71,16 @@ class BackendQueryCapabilities:
     validation surface and adding a focused regression test.
 
     Attributes:
-        max_query_chars: hard upper bound for the query string the
-            backend will accept. ``None`` means unknown /
-            no provider-specific local rejection. ``None`` is NOT
-            a guarantee of unlimited acceptance; the router does not
-            create a provider-specific rejection for ``None``, but
-            generic/API input constraints (e.g. the existing
-            ``_MAX_QUERY_CHARS`` ceiling) still apply.
+        max_query_chars: Oroimen-side operational cap for the
+            query string the backend will accept. ``None`` means
+            unknown / no provider-specific local rejection.
+            ``None`` is NOT a guarantee of unlimited acceptance;
+            the router does not create a provider-specific
+            rejection for ``None``, but the generic
+            ``_MAX_QUERY_CHARS`` ceiling (2000) still applies.
+            The value reflects an Oroimen conservative operational
+            / compatibility cut pending live provider validation;
+            it is not a claim about the provider's current API limit.
     """
 
     max_query_chars: int | None
@@ -144,15 +157,20 @@ class BackendProtocol(Protocol):
             - Tavily: 'snippet', 'summary', 'full' (todos)
 
         QUERY_CAPABILITIES: PRE2-A2. ``BackendQueryCapabilities``
-            con el limite duro de query chars que el backend
-            acepta. Declarado por cada backend concreta. Usado
-            por el router para validar queries contra el backend
-            SELECCIONADO (incluyendo fallback), ANTES de adquirir
-            semaforo, debitar budget, despachar ``search``, o
-            mutar el circuit breaker. ``max_query_chars = None``
-            significa "desconocido / sin rechazo local
-            provider-specific"; NO es una garantia de aceptacion
-            ilimitada.
+            con el cap operacional/conservador de Oroimen para el
+            tamano de query que el backend acepta. Declarado por
+            cada backend concreta. El valor es un cut
+            operacional defensivo pendiente de validacion con el
+            provider real; NO es una afirmacion sobre el limite
+            actual de la API del provider. Usado por el router
+            para validar la query ORIGINAL contra el backend
+            SELECCIONADO (incluyendo fallback), ANTES del
+            truncamiento generico de 2000 chars y ANTES de
+            adquirir semaforo, debitar budget, despachar
+            ``search``, o mutar el circuit breaker.
+            ``max_query_chars = None`` significa "desconocido /
+            sin rechazo local provider-specific"; NO es una
+            garantia de aceptacion ilimitada.
 
     Estado externo (NO en este Protocol, vive en BudgetTracker):
         - Budget mensual por backend (SQLite atomico).

@@ -41,15 +41,19 @@ class SearXNGBackend:
     PRE2-A2: declares ``QUERY_CAPABILITIES`` with
     ``max_query_chars = None``. The router does NOT create a
     provider-specific rejection for ``None``; the existing
-    generic/API input constraints (e.g. ``_MAX_QUERY_CHARS`` in
-    router.py) still apply. ``None`` is NOT a guarantee of
-    unlimited acceptance.
+    generic/API input constraint (the 2000-char ``_MAX_QUERY_CHARS``
+    ceiling in router.py) still applies. ``None`` is NOT a
+    guarantee of unlimited acceptance — a 5000-char query is
+    still truncated to 2000 by the generic cap before dispatch.
     """
 
     name: str = "searxng"
     SUPPORTED_CONTENT_MODES: frozenset[str] = frozenset({"snippet"})
-    # PRE2-A2: no provider-specific local rejection. Generic/API
-    # input constraints in the router still apply.
+    # PRE2-A2: no provider-specific local rejection. The router
+    # falls through to the existing generic 2000-char
+    # ``_MAX_QUERY_CHARS`` truncation. ``None`` is an
+    # "unknown / no specific cut" statement, not a "no limit"
+    # claim.
     QUERY_CAPABILITIES: BackendQueryCapabilities = BackendQueryCapabilities(
         max_query_chars=None,
     )

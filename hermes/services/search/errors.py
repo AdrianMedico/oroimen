@@ -51,11 +51,19 @@ class SearchErrorCode(StrEnum):
     NETWORK_ERROR = "NETWORK_ERROR"  # transport-level failure
     # PRE2-A2: local validation against the SELECTED backend's
     # declared ``BackendQueryCapabilities.max_query_chars``. The
-    # router raises this BEFORE acquiring the semaphore, debiting
+    # router raises this AFTER backend selection (including
+    # fallback) and BEFORE acquiring the semaphore, debiting
     # budget, dispatching ``backend.search``, or mutating the
-    # circuit breaker. Length and backend identity are safe to
-    # surface; the query text itself is NEVER included in the
-    # message, the serialized dict, or the logs.
+    # circuit breaker. The router validates the ORIGINAL query
+    # (before the generic 2000-char truncation) so the surfaced
+    # length is the user-visible length, not a post-truncation
+    # artifact. The 399 value carried by Tavily is an Oroimen
+    # conservative operational / compatibility cap pending live
+    # Tavily validation; ``QUERY_TOO_LONG`` is the surface for
+    # that cut, not a claim about the hosted API's current limit.
+    # Length and backend identity are safe to surface; the query
+    # text itself is NEVER included in the message, the
+    # serialized dict, or the logs.
     QUERY_TOO_LONG = "QUERY_TOO_LONG"
 
 

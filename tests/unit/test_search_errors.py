@@ -13,6 +13,13 @@ Cubre:
   en una superficie insegura real.
 - PRE2-A2: QUERY_TOO_LONG is a local-validation code that is
   non-retryable, non-breaker, and never carries the query text.
+  The 399 value on Tavily is an Oroimen conservative operational
+  / compatibility cap pending live Tavily validation; it is NOT
+  a claim about the hosted Tavily API's current limit.
+  Note: the structured ``search_error_code`` and
+  ``search_diagnostic_category`` propagate to the in-memory
+  ``PhaseError``; only the broad ``search_4xx`` taxonomy is
+  persisted to the job row.
 """
 
 from __future__ import annotations

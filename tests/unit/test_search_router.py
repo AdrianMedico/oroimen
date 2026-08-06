@@ -106,8 +106,9 @@ def _make_backend(
     PRE2-A2: ``max_query_chars`` (default ``None``) is exposed via
     ``QUERY_CAPABILITIES`` so the router's per-backend validation
     can be exercised. Pass an int (e.g. 399) to simulate a backend
-    with a hard limit; pass ``None`` for the default "no
-    provider-specific rejection" semantics.
+    with an Oroimen conservative operational / compatibility cap;
+    pass ``None`` for the default "no provider-specific
+    rejection" semantics.
     """
     from hermes.services.search.protocol import BackendQueryCapabilities
 
@@ -2150,7 +2151,13 @@ async def test_pre2a1_redaction_case_d_http_status_error(
 
 
 # =====================================================================
-# PRE2-A2: per-backend query-length validation (Tavily 399; None for SearXNG/Exa)
+# PRE2-A2: per-backend query-length validation
+#   Tavily: Oroimen conservative operational / compatibility cap = 399
+#   SearXNG / Exa: ``max_query_chars = None`` (no provider-specific
+#   rejection; generic 2000-char ``_MAX_QUERY_CHARS`` still applies).
+#   The router validates the ORIGINAL query BEFORE the generic
+#   2000-char truncation so the surfaced length is the user-visible
+#   length (e.g. 400 or 5000), not a post-truncation artifact.
 # =====================================================================
 
 
@@ -2166,7 +2173,10 @@ async def _assert_no_dispatch_no_debit_no_breaker(
     AFTER backend selection and BEFORE any semaphore acquisition,
     budget debit, ``backend.search`` dispatch, or circuit-breaker
     mutation. This helper verifies the three "no" properties
-    that prove the validation is properly placed.
+    that prove the validation is properly placed. The validation
+    also happens BEFORE the generic 2000-char truncation so the
+    surfaced ``QUERY_TOO_LONG`` length is the ORIGINAL query
+    length, not a post-truncation artifact.
 
     Returns the ``SearchResult`` so the caller can also assert
     the structured error.
@@ -2240,7 +2250,9 @@ async def test_pre2a2_tavily_398_dispatches_unchanged(
 
     398 < 399, so the per-backend validation does not reject.
     The query reaches ``backend.search`` with the original
-    length and the budget is debited normally.
+    length and the budget is debited normally. The 399 value
+    is an Oroimen conservative operational / compatibility cap,
+    not a claim about the hosted Tavily API's current limit.
     """
     tavily = _make_backend(name="tavily", max_query_chars=399)
     backends = {"tavily": tavily}
@@ -2271,8 +2283,11 @@ async def test_pre2a2_tavily_399_dispatches_unchanged(
 ) -> None:
     """PRE2-A2: Tavily with a 399-char query dispatches unchanged.
 
-    399 == 399 is the boundary. The provider accepts up to 399
-    chars, so the local validation lets it through.
+    399 == 399 is the boundary of the Oroimen conservative
+    cap. The local validation lets it through; the query
+    reaches ``backend.search`` unchanged. The cap is a
+    defensive cut pending live Tavily validation, not a
+    claim about the hosted API's current limit.
     """
     tavily = _make_backend(name="tavily", max_query_chars=399)
     backends = {"tavily": tavily}
@@ -2305,7 +2320,8 @@ async def test_pre2a2_tavily_400_fails_locally_with_query_too_long(
     400 > 399, so the per-backend validation rejects with
     ``SearchErrorCode.QUERY_TOO_LONG``. The error carries
     ``retryable=False``, ``breaker_relevant=False``, and
-    ``diagnostic_category=LOCAL_VALIDATION``.
+    ``diagnostic_category=LOCAL_VALIDATION``. The surfaced
+    length is the ORIGINAL 400 (not a post-truncation artifact).
     """
     tavily = _make_backend(name="tavily", max_query_chars=399)
     backends = {"tavily": tavily}
@@ -2332,6 +2348,10 @@ async def test_pre2a2_tavily_400_fails_locally_with_query_too_long(
         result.error.diagnostic_category
         == SearchDiagnosticCategory.LOCAL_VALIDATION
     )
+    # ORIGINAL length surfaced (not 2000 from a post-truncation
+    # artifact).
+    assert "400" in result.error.message
+    assert "399" in result.error.message
 
 
 @pytest.mark.asyncio
@@ -2342,12 +2362,15 @@ async def test_pre2a2_tavily_400_zero_dispatch_zero_debit_zero_breaker(
 
     The validation must occur AFTER backend selection and BEFORE
     any of:
+    - the generic 2000-char ``_MAX_QUERY_CHARS`` truncation
     - ``backend.search`` dispatch (zero calls)
     - ``budget.record_usage`` (zero debits)
     - circuit-breaker mutation (zero state changes)
 
     This is the zero-dispatch / zero-budget / zero-breaker proof
-    required by the PRE2-A2 contract.
+    required by the PRE2-A2 contract. The validation operates
+    on the ORIGINAL query so the surfaced length is 400, not
+    a post-truncation artifact.
     """
     tavily = _make_backend(name="tavily", max_query_chars=399)
     backends = {"tavily": tavily}
@@ -2371,10 +2394,12 @@ async def test_pre2a2_tavily_5000_fails_locally(
 ) -> None:
     """PRE2-A2: Tavily with a 5000-char query is rejected locally.
 
-    The existing generic/API constraint truncates to 2000 first;
-    then the per-backend validation (399) rejects the truncated
-    query. Net result: ``QUERY_TOO_LONG`` is surfaced and no
-    provider call is made.
+    The router validates the ORIGINAL query against Tavily's
+    399-char cap BEFORE the generic 2000-char truncation, so
+    the surfaced ``QUERY_TOO_LONG`` length is the ORIGINAL 5000
+    (not a truncated 2000). Zero side effects: no
+    ``backend.search`` call, no ``budget.record_usage``, no
+    breaker mutation.
     """
     tavily = _make_backend(name="tavily", max_query_chars=399)
     backends = {"tavily": tavily}
@@ -2394,9 +2419,17 @@ async def test_pre2a2_tavily_5000_fails_locally(
 
     assert result.error is not None
     assert result.error.code == SearchErrorCode.QUERY_TOO_LONG
+    # ORIGINAL length surfaced (not 2000 from a post-truncation
+    # artifact). The router validates the ORIGINAL query before
+    # the generic 2000-char truncation.
+    assert "5000" in result.error.message
+    assert "399" in result.error.message
+    assert "tavily" in result.error.message
     tavily.search.assert_not_awaited()
     # No budget debit because no dispatch happened.
     assert await budget.remaining("tavily") == 1000
+    # Breaker state untouched.
+    assert circuit_breaker.is_closed("tavily")
 
 
 @pytest.mark.asyncio
@@ -2407,8 +2440,9 @@ async def test_pre2a2_searxng_none_accepts_long_query(
 
     ``None`` means "unknown / no provider-specific local rejection".
     It is NOT a guarantee of unlimited acceptance; the existing
-    generic/API input constraints (``_MAX_QUERY_CHARS = 2000``)
-    still apply. A 1500-char query passes through.
+    generic 2000-char ``_MAX_QUERY_CHARS`` ceiling still applies.
+    A 1500-char query (under both the generic cap and the None
+    per-backend cap) passes through unchanged.
     """
     searxng = _make_backend(name="searxng", max_query_chars=None)
     backends = {"searxng": searxng}
@@ -2438,7 +2472,9 @@ async def test_pre2a2_exa_none_accepts_long_query(
     """PRE2-A2: Exa (``max_query_chars = None``) does NOT reject.
 
     Same semantics as SearXNG: ``None`` means no provider-specific
-    local rejection. The 1500-char query is dispatched unchanged.
+    local rejection. The 1500-char query (under the generic
+    2000-char cap) is dispatched unchanged. ``None`` is NOT a
+    guarantee of unlimited acceptance.
     """
     exa = _make_backend(name="exa", max_query_chars=None)
     backends = {"exa": exa}
@@ -2462,39 +2498,6 @@ async def test_pre2a2_exa_none_accepts_long_query(
 
 
 @pytest.mark.asyncio
-async def test_pre2a2_searxng_3000_still_truncated_by_generic_cap(
-    db: Database,
-) -> None:
-    """PRE2-A2: existing generic 2000-char truncation is preserved.
-
-    The mission contract requires that existing short-query
-    behavior and existing generic/API input constraints are
-    preserved. A 3000-char query against SearXNG (which has
-    ``max_query_chars = None``) is truncated to 2000 by the
-    generic cap, NOT rejected by a per-backend cap.
-    """
-    searxng = _make_backend(name="searxng", max_query_chars=None)
-    backends = {"searxng": searxng}
-    budget = _make_budget(db)
-    circuit_breaker = CircuitBreakerRegistry()
-    semaphore = ConcurrencyLimiter()
-    query = "g" * 3000
-
-    result = await hermes_search(
-        query=query,
-        intent="general",
-        backends=backends,
-        budget=budget,
-        circuit_breaker=circuit_breaker,
-        semaphore=semaphore,
-    )
-
-    # The 2000-char generic cap truncates; no error is raised.
-    assert result.error is None
-    assert result.query == "g" * 2000
-
-
-@pytest.mark.asyncio
 async def test_pre2a2_query_too_long_error_omits_query_text(
     db: Database,
 ) -> None:
@@ -2502,9 +2505,9 @@ async def test_pre2a2_query_too_long_error_omits_query_text(
 
     The mission contract explicitly forbids putting the query
     text into the error message, the serialized dict, or the
-    logs. Only the length and the backend identity are safe to
-    surface. We use a low-entropy sentinel to prove the query
-    text is not echoed back through any safe surface.
+    logs. Only the ORIGINAL length and the backend identity are
+    safe to surface. We use a low-entropy sentinel to prove the
+    query text is not echoed back through any safe surface.
     """
     tavily = _make_backend(name="tavily", max_query_chars=399)
     backends = {"tavily": tavily}
@@ -2587,35 +2590,40 @@ async def test_pre2a2_query_too_long_after_fallback_to_searxng(
 
 
 @pytest.mark.asyncio
-async def test_pre2a2_short_query_behavior_unchanged(
+async def test_pre2a2_searxng_5000_truncated_to_2000_dispatched(
     db: Database,
 ) -> None:
-    """PRE2-A2: existing short-query behavior is preserved.
+    """PRE2-A2: SearXNG (``max_query_chars = None``) preserves the
+    existing generic 2000-char truncation for long queries.
 
-    A 100-char query against Tavily with ``max_query_chars=399``
-    dispatches unchanged, the budget is debited, and the
-    circuit breaker is reset to closed. PRE2-A2 does not
-    regress any short-query path.
+    The mission contract requires that for backends with
+    ``max_query_chars = None``, the existing generic 2000-char
+    ``_MAX_QUERY_CHARS`` ceiling still applies. A 5000-char query
+    against SearXNG (None cap) is truncated to 2000 and
+    dispatched unchanged. PRE2-A2 does NOT add a provider-specific
+    rejection for ``None``.
+
+    This complements ``test_long_query_is_truncated`` (Sprint
+    9.3 generic-cap regression) and proves the None-semantics
+    preservation for PRE2-A2.
     """
-    tavily = _make_backend(name="tavily", max_query_chars=399)
-    backends = {"tavily": tavily}
+    searxng = _make_backend(name="searxng", max_query_chars=None)
+    backends = {"searxng": searxng}
     budget = _make_budget(db)
     circuit_breaker = CircuitBreakerRegistry()
     semaphore = ConcurrencyLimiter()
-    query = "i" * 100
+    query = "g" * 5000
 
     result = await hermes_search(
         query=query,
-        intent="deep_research",
+        intent="general",
         backends=backends,
         budget=budget,
         circuit_breaker=circuit_breaker,
         semaphore=semaphore,
     )
 
+    # The 2000-char generic cap truncates; no error is raised.
     assert result.error is None
-    assert result.query == "i" * 100
-    tavily.search.assert_awaited_once()
-    assert await budget.remaining("tavily") == 1000 - 2
-    # Success: breaker should be reset (entry exists but closed).
-    assert circuit_breaker.is_closed("tavily")
+    assert result.query == "g" * 2000
+    searxng.search.assert_awaited_once()

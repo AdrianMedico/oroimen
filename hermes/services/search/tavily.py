@@ -36,20 +36,28 @@ class TavilyBackend:
         timeout: HTTP request timeout en segundos (default 15.0).
 
     PRE2-A2: declares ``QUERY_CAPABILITIES`` with
-    ``max_query_chars = TAVILY_MAX_QUERY_CHARS (399)``. The router
-    validates the query against this limit AFTER Tavily is selected
-    (including fallback) and BEFORE any semaphore, budget, or
-    dispatch side effect. A 400+ char query against Tavily raises
-    ``SearchErrorCode.QUERY_TOO_LONG`` locally; the provider is
-    never called.
+    ``max_query_chars = TAVILY_MAX_QUERY_CHARS (399)``. The 399 value
+    is an Oroimen-side conservative operational / compatibility cap
+    pending live Tavily validation. It is NOT a claim about the
+    hosted API's current limit. The router validates the ORIGINAL
+    query against this cap AFTER Tavily is selected (including
+    fallback) and BEFORE the generic 2000-char truncation; if the
+    cap is exceeded, the router returns
+    ``SearchErrorCode.QUERY_TOO_LONG`` locally with the ORIGINAL
+    length surfaced (not a truncated one), and no network call is
+    made.
     """
 
     name: str = "tavily"
     SUPPORTED_CONTENT_MODES: frozenset[str] = frozenset({"snippet", "summary", "full"})
-    # PRE2-A2: Tavily's hosted API enforces a 399-char hard limit.
-    # Declaring it here lets the router reject locally before any
-    # network call. Local rejection is non-retryable, non-breaker,
-    # and categorised as ``local_validation`` (see errors.py).
+    # PRE2-A2: Oroimen conservative operational / compatibility cap.
+    # 399 is a defensive cut pending live Tavily validation; it is
+    # NOT a claim about the hosted API's current limit. Declaring
+    # it here lets the router reject locally before any network
+    # call. Local rejection is non-retryable, non-breaker, and
+    # categorised as ``local_validation`` (see errors.py). The
+    # router validates the ORIGINAL query so the surfaced length
+    # is the user-visible length, not a post-truncation artifact.
     QUERY_CAPABILITIES: BackendQueryCapabilities = BackendQueryCapabilities(
         max_query_chars=TAVILY_MAX_QUERY_CHARS,
     )

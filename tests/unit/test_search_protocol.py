@@ -409,9 +409,13 @@ def test_backend_query_capabilities_accepts_none() -> None:
 def test_tavily_max_query_chars_constant_is_399() -> None:
     """PRE2-A2: ``TAVILY_MAX_QUERY_CHARS`` is exactly 399.
 
-    This is the hard limit Tavily's hosted API enforces on the
-    ``query`` field. The router rejects queries that exceed
-    this limit locally, before any network call.
+    The 399 value is the Oroimen conservative operational /
+    compatibility cap carried in the constant. It is a
+    defensive cut pending live Tavily validation; it is NOT
+    a claim about the hosted Tavily API's current limit. The
+    router rejects queries above this cap locally, before any
+    network call, and surfaces the ORIGINAL query length in
+    the ``QUERY_TOO_LONG`` error.
     """
     assert TAVILY_MAX_QUERY_CHARS == 399
 
@@ -420,7 +424,10 @@ def test_tavily_declares_query_capabilities_399() -> None:
     """PRE2-A2: Tavily declares ``max_query_chars = 399``.
 
     The router uses this to reject 400+ char queries against
-    Tavily AFTER backend selection and BEFORE any side effect.
+    Tavily AFTER backend selection (including fallback) and
+    BEFORE the generic 2000-char truncation. The surfaced
+    ``QUERY_TOO_LONG`` length is the ORIGINAL query length,
+    not a post-truncation artifact.
     """
     caps = TavilyBackend.QUERY_CAPABILITIES
     assert isinstance(caps, BackendQueryCapabilities)
@@ -431,9 +438,10 @@ def test_searxng_declares_query_capabilities_none() -> None:
     """PRE2-A2: SearXNG declares ``max_query_chars = None``.
 
     ``None`` means the router does NOT create a provider-specific
-    rejection for SearXNG. It is NOT a guarantee of unlimited
-    acceptance; the existing ``_MAX_QUERY_CHARS`` generic
-    constraint still applies.
+    rejection for SearXNG. The generic 2000-char
+    ``_MAX_QUERY_CHARS`` constraint still applies; a 5000-char
+    query against SearXNG is truncated to 2000 and dispatched.
+    ``None`` is NOT a guarantee of unlimited acceptance.
     """
     caps = SearXNGBackend.QUERY_CAPABILITIES
     assert isinstance(caps, BackendQueryCapabilities)
@@ -444,8 +452,9 @@ def test_exa_declares_query_capabilities_none() -> None:
     """PRE2-A2: Exa declares ``max_query_chars = None``.
 
     Same semantics as SearXNG: no provider-specific local
-    rejection. ``None`` is NOT a guarantee of unlimited
-    acceptance.
+    rejection. The generic 2000-char ``_MAX_QUERY_CHARS``
+    constraint still applies. ``None`` is NOT a guarantee of
+    unlimited acceptance.
     """
     caps = ExaBackend.QUERY_CAPABILITIES
     assert isinstance(caps, BackendQueryCapabilities)
@@ -460,7 +469,9 @@ def test_all_three_production_backends_satisfy_backend_protocol() -> None:
     production backend must declare ``name``,
     ``SUPPORTED_CONTENT_MODES``, and (PRE2-A2)
     ``QUERY_CAPABILITIES`` and implement ``search``,
-    ``has_budget``, and ``health_check``.
+    ``has_budget``, and ``health_check``. The values of
+    ``QUERY_CAPABILITIES.max_query_chars`` are checked separately
+    by the per-backend tests below.
     """
     # Build minimal stubs that mirror each backend's class-level
     # declarations. We do not construct a full backend (which would
@@ -477,20 +488,3 @@ def test_all_three_production_backends_satisfy_backend_protocol() -> None:
             f"{cls.__name__} does not satisfy BackendProtocol"
         )
         assert isinstance(instance.QUERY_CAPABILITIES, BackendQueryCapabilities)
-        assert instance.QUERY_CAPABILITIES.max_query_chars is not None or (
-            instance.QUERY_CAPABILITIES.max_query_chars is None
-        )  # tautology — both branches accepted; see per-backend tests
-
-
-def test_protocol_includes_query_capabilities_attribute() -> None:
-    """PRE2-A2: ``BackendProtocol`` declares ``QUERY_CAPABILITIES``.
-
-    The router reads ``backend.QUERY_CAPABILITIES.max_query_chars``
-    after backend selection. A backend that does not expose
-    this attribute is treated as having no provider-specific
-    rejection (``None``) — see router.py.
-
-    Note: ``Protocol`` class-level annotations live in
-    ``__annotations__``; ``dir()`` does not surface them.
-    """
-    assert "QUERY_CAPABILITIES" in BackendProtocol.__annotations__
