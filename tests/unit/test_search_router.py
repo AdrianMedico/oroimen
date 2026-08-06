@@ -99,11 +99,24 @@ def _make_backend(
     results: list[dict] | None = None,
     response_content_mode: str = "snippet",
     response_original_content_mode: str = "snippet",
+    max_query_chars: int | None = None,
 ) -> BackendProtocol:
-    """Crea un backend mock que respeta el Protocol."""
+    """Crea un backend mock que respeta el Protocol.
+
+    PRE2-A2: ``max_query_chars`` (default ``None``) is exposed via
+    ``QUERY_CAPABILITIES`` so the router's per-backend validation
+    can be exercised. Pass an int (e.g. 399) to simulate a backend
+    with a hard limit; pass ``None`` for the default "no
+    provider-specific rejection" semantics.
+    """
+    from hermes.services.search.protocol import BackendQueryCapabilities
+
     backend = MagicMock(spec=BackendProtocol)
     backend.name = name
     backend.SUPPORTED_CONTENT_MODES = content_modes
+    backend.QUERY_CAPABILITIES = BackendQueryCapabilities(
+        max_query_chars=max_query_chars,
+    )
     backend.has_budget = AsyncMock(return_value=has_budget)
     backend.health_check = AsyncMock(return_value=healthy)
 
@@ -2134,3 +2147,475 @@ async def test_pre2a1_redaction_case_d_http_status_error(
         phase_error=pe,
         caplog_records=list(caplog.records),
     )
+
+
+# =====================================================================
+# PRE2-A2: per-backend query-length validation (Tavily 399; None for SearXNG/Exa)
+# =====================================================================
+
+
+async def _assert_no_dispatch_no_debit_no_breaker(
+    db: Database,
+    backends: dict[str, Any],
+    budget: BudgetTracker,
+    circuit_breaker: CircuitBreakerRegistry,
+) -> SearchResult:
+    """Run ``hermes_search`` and assert zero side effects.
+
+    PRE2-A2: the per-backend query-length validation must happen
+    AFTER backend selection and BEFORE any semaphore acquisition,
+    budget debit, ``backend.search`` dispatch, or circuit-breaker
+    mutation. This helper verifies the three "no" properties
+    that prove the validation is properly placed.
+
+    Returns the ``SearchResult`` so the caller can also assert
+    the structured error.
+    """
+    semaphore = ConcurrencyLimiter()
+    # Snapshot before: capture backend call counts, budget state,
+    # and circuit-breaker state.
+    tavily_before = backends.get("tavily")
+    searxng_before = backends.get("searxng")
+    tavily_calls_before = (
+        tavily_before.search.call_count if tavily_before is not None else None
+    )
+    searxng_calls_before = (
+        searxng_before.search.call_count if searxng_before is not None else None
+    )
+    # Capture breaker state for each backend (a fresh registry has
+    # no entries; any non-empty entry would mean a mutation
+    # happened).
+    cb_state_before = {
+        b: dict(circuit_breaker._state.get(b, {}))
+        for b in ("tavily", "searxng", "exa")
+    }
+    # Capture remaining budget per backend.
+    remaining_before = {
+        b: await budget.remaining(b) for b in ("tavily", "searxng", "exa")
+    }
+
+    result = await hermes_search(
+        query="x" * 400,
+        intent="deep_research",
+        backends=backends,
+        budget=budget,
+        circuit_breaker=circuit_breaker,
+        semaphore=semaphore,
+    )
+
+    # --- Zero backend.search calls ---
+    if tavily_before is not None:
+        assert tavily_before.search.call_count == tavily_calls_before, (
+            "Tavily.search was called even though the query was "
+            "rejected by PRE2-A2 local validation"
+        )
+    if searxng_before is not None:
+        assert searxng_before.search.call_count == searxng_calls_before, (
+            "SearXNG.search was called even though the query was "
+            "rejected by PRE2-A2 local validation"
+        )
+    # --- Zero budget debits ---
+    for b in ("tavily", "searxng", "exa"):
+        assert await budget.remaining(b) == remaining_before[b], (
+            f"Budget for {b} was debited even though the query "
+            f"was rejected by PRE2-A2 local validation"
+        )
+    # --- Zero breaker mutations ---
+    cb_state_after = {
+        b: dict(circuit_breaker._state.get(b, {}))
+        for b in ("tavily", "searxng", "exa")
+    }
+    assert cb_state_after == cb_state_before, (
+        f"Circuit breaker state was mutated: "
+        f"before={cb_state_before} after={cb_state_after}"
+    )
+    return result
+
+
+@pytest.mark.asyncio
+async def test_pre2a2_tavily_398_dispatches_unchanged(
+    db: Database,
+) -> None:
+    """PRE2-A2: Tavily with a 398-char query dispatches unchanged.
+
+    398 < 399, so the per-backend validation does not reject.
+    The query reaches ``backend.search`` with the original
+    length and the budget is debited normally.
+    """
+    tavily = _make_backend(name="tavily", max_query_chars=399)
+    backends = {"tavily": tavily}
+    budget = _make_budget(db)
+    circuit_breaker = CircuitBreakerRegistry()
+    semaphore = ConcurrencyLimiter()
+    query = "a" * 398
+
+    result = await hermes_search(
+        query=query,
+        intent="deep_research",
+        backends=backends,
+        budget=budget,
+        circuit_breaker=circuit_breaker,
+        semaphore=semaphore,
+    )
+
+    assert result.error is None
+    assert result.query == "a" * 398
+    tavily.search.assert_awaited_once()
+    # deep_research intent -> Tavily cost is 2
+    assert await budget.remaining("tavily") == 1000 - 2
+
+
+@pytest.mark.asyncio
+async def test_pre2a2_tavily_399_dispatches_unchanged(
+    db: Database,
+) -> None:
+    """PRE2-A2: Tavily with a 399-char query dispatches unchanged.
+
+    399 == 399 is the boundary. The provider accepts up to 399
+    chars, so the local validation lets it through.
+    """
+    tavily = _make_backend(name="tavily", max_query_chars=399)
+    backends = {"tavily": tavily}
+    budget = _make_budget(db)
+    circuit_breaker = CircuitBreakerRegistry()
+    semaphore = ConcurrencyLimiter()
+    query = "b" * 399
+
+    result = await hermes_search(
+        query=query,
+        intent="deep_research",
+        backends=backends,
+        budget=budget,
+        circuit_breaker=circuit_breaker,
+        semaphore=semaphore,
+    )
+
+    assert result.error is None
+    assert result.query == "b" * 399
+    tavily.search.assert_awaited_once()
+    assert await budget.remaining("tavily") == 1000 - 2
+
+
+@pytest.mark.asyncio
+async def test_pre2a2_tavily_400_fails_locally_with_query_too_long(
+    db: Database,
+) -> None:
+    """PRE2-A2: Tavily with a 400-char query is rejected locally.
+
+    400 > 399, so the per-backend validation rejects with
+    ``SearchErrorCode.QUERY_TOO_LONG``. The error carries
+    ``retryable=False``, ``breaker_relevant=False``, and
+    ``diagnostic_category=LOCAL_VALIDATION``.
+    """
+    tavily = _make_backend(name="tavily", max_query_chars=399)
+    backends = {"tavily": tavily}
+    budget = _make_budget(db)
+    circuit_breaker = CircuitBreakerRegistry()
+    semaphore = ConcurrencyLimiter()
+    query = "c" * 400
+
+    result = await hermes_search(
+        query=query,
+        intent="deep_research",
+        backends=backends,
+        budget=budget,
+        circuit_breaker=circuit_breaker,
+        semaphore=semaphore,
+    )
+
+    assert result.error is not None
+    assert result.error.code == SearchErrorCode.QUERY_TOO_LONG
+    assert result.error.backend == "tavily"
+    assert result.error.retryable is False
+    assert result.error.breaker_relevant is False
+    assert (
+        result.error.diagnostic_category
+        == SearchDiagnosticCategory.LOCAL_VALIDATION
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre2a2_tavily_400_zero_dispatch_zero_debit_zero_breaker(
+    db: Database,
+) -> None:
+    """PRE2-A2: 400-char query against Tavily has zero side effects.
+
+    The validation must occur AFTER backend selection and BEFORE
+    any of:
+    - ``backend.search`` dispatch (zero calls)
+    - ``budget.record_usage`` (zero debits)
+    - circuit-breaker mutation (zero state changes)
+
+    This is the zero-dispatch / zero-budget / zero-breaker proof
+    required by the PRE2-A2 contract.
+    """
+    tavily = _make_backend(name="tavily", max_query_chars=399)
+    backends = {"tavily": tavily}
+    budget = _make_budget(db)
+    circuit_breaker = CircuitBreakerRegistry()
+
+    result = await _assert_no_dispatch_no_debit_no_breaker(
+        db,
+        backends,
+        budget,
+        circuit_breaker,
+    )
+
+    assert result.error is not None
+    assert result.error.code == SearchErrorCode.QUERY_TOO_LONG
+
+
+@pytest.mark.asyncio
+async def test_pre2a2_tavily_5000_fails_locally(
+    db: Database,
+) -> None:
+    """PRE2-A2: Tavily with a 5000-char query is rejected locally.
+
+    The existing generic/API constraint truncates to 2000 first;
+    then the per-backend validation (399) rejects the truncated
+    query. Net result: ``QUERY_TOO_LONG`` is surfaced and no
+    provider call is made.
+    """
+    tavily = _make_backend(name="tavily", max_query_chars=399)
+    backends = {"tavily": tavily}
+    budget = _make_budget(db)
+    circuit_breaker = CircuitBreakerRegistry()
+    semaphore = ConcurrencyLimiter()
+    query = "d" * 5000
+
+    result = await hermes_search(
+        query=query,
+        intent="deep_research",
+        backends=backends,
+        budget=budget,
+        circuit_breaker=circuit_breaker,
+        semaphore=semaphore,
+    )
+
+    assert result.error is not None
+    assert result.error.code == SearchErrorCode.QUERY_TOO_LONG
+    tavily.search.assert_not_awaited()
+    # No budget debit because no dispatch happened.
+    assert await budget.remaining("tavily") == 1000
+
+
+@pytest.mark.asyncio
+async def test_pre2a2_searxng_none_accepts_long_query(
+    db: Database,
+) -> None:
+    """PRE2-A2: SearXNG (``max_query_chars = None``) does NOT reject.
+
+    ``None`` means "unknown / no provider-specific local rejection".
+    It is NOT a guarantee of unlimited acceptance; the existing
+    generic/API input constraints (``_MAX_QUERY_CHARS = 2000``)
+    still apply. A 1500-char query passes through.
+    """
+    searxng = _make_backend(name="searxng", max_query_chars=None)
+    backends = {"searxng": searxng}
+    budget = _make_budget(db)
+    circuit_breaker = CircuitBreakerRegistry()
+    semaphore = ConcurrencyLimiter()
+    query = "e" * 1500
+
+    result = await hermes_search(
+        query=query,
+        intent="general",
+        backends=backends,
+        budget=budget,
+        circuit_breaker=circuit_breaker,
+        semaphore=semaphore,
+    )
+
+    assert result.error is None
+    assert result.query == "e" * 1500
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a2_exa_none_accepts_long_query(
+    db: Database,
+) -> None:
+    """PRE2-A2: Exa (``max_query_chars = None``) does NOT reject.
+
+    Same semantics as SearXNG: ``None`` means no provider-specific
+    local rejection. The 1500-char query is dispatched unchanged.
+    """
+    exa = _make_backend(name="exa", max_query_chars=None)
+    backends = {"exa": exa}
+    budget = _make_budget(db)
+    circuit_breaker = CircuitBreakerRegistry()
+    semaphore = ConcurrencyLimiter()
+    query = "f" * 1500
+
+    result = await hermes_search(
+        query=query,
+        intent="semantic",
+        backends=backends,
+        budget=budget,
+        circuit_breaker=circuit_breaker,
+        semaphore=semaphore,
+    )
+
+    assert result.error is None
+    assert result.query == "f" * 1500
+    exa.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a2_searxng_3000_still_truncated_by_generic_cap(
+    db: Database,
+) -> None:
+    """PRE2-A2: existing generic 2000-char truncation is preserved.
+
+    The mission contract requires that existing short-query
+    behavior and existing generic/API input constraints are
+    preserved. A 3000-char query against SearXNG (which has
+    ``max_query_chars = None``) is truncated to 2000 by the
+    generic cap, NOT rejected by a per-backend cap.
+    """
+    searxng = _make_backend(name="searxng", max_query_chars=None)
+    backends = {"searxng": searxng}
+    budget = _make_budget(db)
+    circuit_breaker = CircuitBreakerRegistry()
+    semaphore = ConcurrencyLimiter()
+    query = "g" * 3000
+
+    result = await hermes_search(
+        query=query,
+        intent="general",
+        backends=backends,
+        budget=budget,
+        circuit_breaker=circuit_breaker,
+        semaphore=semaphore,
+    )
+
+    # The 2000-char generic cap truncates; no error is raised.
+    assert result.error is None
+    assert result.query == "g" * 2000
+
+
+@pytest.mark.asyncio
+async def test_pre2a2_query_too_long_error_omits_query_text(
+    db: Database,
+) -> None:
+    """PRE2-A2: ``QUERY_TOO_LONG`` error never carries query text.
+
+    The mission contract explicitly forbids putting the query
+    text into the error message, the serialized dict, or the
+    logs. Only the length and the backend identity are safe to
+    surface. We use a low-entropy sentinel to prove the query
+    text is not echoed back through any safe surface.
+    """
+    tavily = _make_backend(name="tavily", max_query_chars=399)
+    backends = {"tavily": tavily}
+    budget = _make_budget(db)
+    circuit_breaker = CircuitBreakerRegistry()
+    semaphore = ConcurrencyLimiter()
+    # Low-entropy sentinel that must NOT leak into any safe surface.
+    sentinel = "PII_PII_PII_DO_NOT_LEAK"
+    query = sentinel + "x" * (400 - len(sentinel))
+    assert len(query) == 400
+
+    result = await hermes_search(
+        query=query,
+        intent="deep_research",
+        backends=backends,
+        budget=budget,
+        circuit_breaker=circuit_breaker,
+        semaphore=semaphore,
+    )
+
+    assert result.error is not None
+    assert result.error.code == SearchErrorCode.QUERY_TOO_LONG
+    # Walk every string leaf in the SearchError and in its
+    # serialized dict; the sentinel must NOT appear in any of
+    # them. Length and backend identity are safe to surface.
+    safe_strings = list(_walk_strings(result.error))
+    safe_strings.extend(_walk_strings(error_to_search_result(result.error)))
+    for s in safe_strings:
+        assert sentinel not in s, (
+            f"Sentinel leaked into safe surface: {s!r}"
+        )
+    # Sanity: the length IS surfaced, the backend identity IS surfaced.
+    assert "400" in result.error.message
+    assert "tavily" in result.error.message
+
+
+@pytest.mark.asyncio
+async def test_pre2a2_query_too_long_after_fallback_to_searxng(
+    db: Database,
+) -> None:
+    """PRE2-A2: validation uses the SELECTED backend's capability.
+
+    If the primary backend is unavailable (e.g. Tavily circuit
+    open or missing) and the router falls back to SearXNG, the
+    per-backend validation is performed against SearXNG's
+    capability (``None``). A 400-char query against SearXNG
+    passes (no provider-specific rejection).
+
+    This proves the validation honors "the SELECTED backend",
+    not the originally requested one.
+    """
+    tavily = _make_backend(name="tavily", max_query_chars=399)
+    searxng = _make_backend(name="searxng", max_query_chars=None)
+    # Force circuit open on Tavily so the router falls back to SearXNG.
+    backends = {"tavily": tavily, "searxng": searxng}
+    budget = _make_budget(db)
+    circuit_breaker = CircuitBreakerRegistry()
+    # Pre-open Tavily's circuit by recording 3 failures.
+    for _ in range(3):
+        circuit_breaker.record_failure("tavily")
+    assert circuit_breaker.is_open("tavily")
+    semaphore = ConcurrencyLimiter()
+    query = "h" * 400
+
+    result = await hermes_search(
+        query=query,
+        intent="deep_research",  # would be Tavily
+        backends=backends,
+        budget=budget,
+        circuit_breaker=circuit_breaker,
+        semaphore=semaphore,
+    )
+
+    # Routed to SearXNG (fallback). SearXNG has None -> no
+    # provider-specific rejection. Dispatched.
+    assert result.error is None
+    assert result.query == "h" * 400
+    tavily.search.assert_not_awaited()
+    searxng.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre2a2_short_query_behavior_unchanged(
+    db: Database,
+) -> None:
+    """PRE2-A2: existing short-query behavior is preserved.
+
+    A 100-char query against Tavily with ``max_query_chars=399``
+    dispatches unchanged, the budget is debited, and the
+    circuit breaker is reset to closed. PRE2-A2 does not
+    regress any short-query path.
+    """
+    tavily = _make_backend(name="tavily", max_query_chars=399)
+    backends = {"tavily": tavily}
+    budget = _make_budget(db)
+    circuit_breaker = CircuitBreakerRegistry()
+    semaphore = ConcurrencyLimiter()
+    query = "i" * 100
+
+    result = await hermes_search(
+        query=query,
+        intent="deep_research",
+        backends=backends,
+        budget=budget,
+        circuit_breaker=circuit_breaker,
+        semaphore=semaphore,
+    )
+
+    assert result.error is None
+    assert result.query == "i" * 100
+    tavily.search.assert_awaited_once()
+    assert await budget.remaining("tavily") == 1000 - 2
+    # Success: breaker should be reset (entry exists but closed).
+    assert circuit_breaker.is_closed("tavily")

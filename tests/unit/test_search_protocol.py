@@ -1,10 +1,13 @@
-"""Tests Sprint 9.3: BackendProtocol contract (Capa 1).
+"""Tests Sprint 9.3 + PRE2-A2: BackendProtocol contract (Capa 1).
 
 Cubre:
 - SearchResult dataclass: inmutabilidad, defaults, equality, repr
 - ContentMode: tipos correctos
 - BackendProtocol: estructura, runtime_checkable
 - MockBackend: implementacion valida del Protocol
+- PRE2-A2: BackendQueryCapabilities (inmutable), per-backend
+  capability declarations (Tavily 399, SearXNG None, Exa None),
+  and protocol satisfaction by all three production backends.
 """
 
 from __future__ import annotations
@@ -14,12 +17,17 @@ from typing import ClassVar
 
 import pytest
 
+from hermes.services.search.exa import ExaBackend
 from hermes.services.search.protocol import (
     ALL_CONTENT_MODES,
+    TAVILY_MAX_QUERY_CHARS,
     BackendProtocol,
+    BackendQueryCapabilities,
     ContentMode,
     SearchResult,
 )
+from hermes.services.search.searxng import SearXNGBackend
+from hermes.services.search.tavily import TavilyBackend
 
 # --- SearchResult dataclass ---
 
@@ -173,6 +181,10 @@ def test_backend_protocol_is_runtime_checkable() -> None:
     class FakeBackend:
         name: ClassVar[str] = "fake"
         SUPPORTED_CONTENT_MODES: ClassVar[frozenset[str]] = frozenset({"snippet"})
+        # PRE2-A2: QUERY_CAPABILITIES is part of the Protocol.
+        QUERY_CAPABILITIES: ClassVar[BackendQueryCapabilities] = (
+            BackendQueryCapabilities(max_query_chars=None)
+        )
 
         async def search(
             self,
@@ -223,10 +235,23 @@ class MockBackend:
     Usado en tests del router (Capa 6) para verificar dispatch
     polimorfico sin tocar red. Configurable para simular failures
     y circuit breaker scenarios.
+
+    PRE2-A2: declares ``QUERY_CAPABILITIES`` with
+    ``max_query_chars = None`` so the mock does NOT introduce a
+    provider-specific local rejection. The mock can simulate a
+    limit by passing ``max_query_chars`` to ``__init__`` and
+    updating the class attribute for a single instance, but the
+    default is the safe ``None``.
     """
 
     name: ClassVar[str] = "mock"
     SUPPORTED_CONTENT_MODES: ClassVar[frozenset[str]] = frozenset({"snippet", "summary"})
+    # PRE2-A2: mock default is "no provider-specific rejection"
+    # so tests that don't care about query-length validation
+    # are unaffected.
+    QUERY_CAPABILITIES: ClassVar[BackendQueryCapabilities] = (
+        BackendQueryCapabilities(max_query_chars=None)
+    )
 
     def __init__(
         self,
@@ -351,3 +376,121 @@ async def test_mock_backend_tracks_call_count() -> None:
     assert backend.last_query == "q3"
     assert backend.last_content_mode == "summary"
     assert backend.last_num_results == 10
+
+
+# =====================================================================
+# PRE2-A2: BackendQueryCapabilities + per-backend declarations
+# =====================================================================
+
+
+def test_backend_query_capabilities_is_frozen() -> None:
+    """PRE2-A2: ``BackendQueryCapabilities`` is a frozen dataclass.
+
+    The capability shape is immutable so the router can rely on
+    class-level declarations and any test/mutation that tries to
+    rewrite a backend's capabilities at runtime fails fast.
+    """
+    caps = BackendQueryCapabilities(max_query_chars=399)
+    with pytest.raises(FrozenInstanceError):
+        caps.max_query_chars = 500  # type: ignore[misc]
+
+
+def test_backend_query_capabilities_accepts_none() -> None:
+    """PRE2-A2: ``max_query_chars = None`` is a valid declaration.
+
+    ``None`` means "unknown / no provider-specific local
+    rejection". It is NOT a guarantee of unlimited acceptance;
+    the existing generic/API input constraints still apply.
+    """
+    caps = BackendQueryCapabilities(max_query_chars=None)
+    assert caps.max_query_chars is None
+
+
+def test_tavily_max_query_chars_constant_is_399() -> None:
+    """PRE2-A2: ``TAVILY_MAX_QUERY_CHARS`` is exactly 399.
+
+    This is the hard limit Tavily's hosted API enforces on the
+    ``query`` field. The router rejects queries that exceed
+    this limit locally, before any network call.
+    """
+    assert TAVILY_MAX_QUERY_CHARS == 399
+
+
+def test_tavily_declares_query_capabilities_399() -> None:
+    """PRE2-A2: Tavily declares ``max_query_chars = 399``.
+
+    The router uses this to reject 400+ char queries against
+    Tavily AFTER backend selection and BEFORE any side effect.
+    """
+    caps = TavilyBackend.QUERY_CAPABILITIES
+    assert isinstance(caps, BackendQueryCapabilities)
+    assert caps.max_query_chars == 399
+
+
+def test_searxng_declares_query_capabilities_none() -> None:
+    """PRE2-A2: SearXNG declares ``max_query_chars = None``.
+
+    ``None`` means the router does NOT create a provider-specific
+    rejection for SearXNG. It is NOT a guarantee of unlimited
+    acceptance; the existing ``_MAX_QUERY_CHARS`` generic
+    constraint still applies.
+    """
+    caps = SearXNGBackend.QUERY_CAPABILITIES
+    assert isinstance(caps, BackendQueryCapabilities)
+    assert caps.max_query_chars is None
+
+
+def test_exa_declares_query_capabilities_none() -> None:
+    """PRE2-A2: Exa declares ``max_query_chars = None``.
+
+    Same semantics as SearXNG: no provider-specific local
+    rejection. ``None`` is NOT a guarantee of unlimited
+    acceptance.
+    """
+    caps = ExaBackend.QUERY_CAPABILITIES
+    assert isinstance(caps, BackendQueryCapabilities)
+    assert caps.max_query_chars is None
+
+
+def test_all_three_production_backends_satisfy_backend_protocol() -> None:
+    """PRE2-A2: Tavily, SearXNG, and Exa all satisfy ``BackendProtocol``.
+
+    The router relies on ``isinstance(backend, BackendProtocol)``
+    (via ``@runtime_checkable``) to dispatch polymorphically. Each
+    production backend must declare ``name``,
+    ``SUPPORTED_CONTENT_MODES``, and (PRE2-A2)
+    ``QUERY_CAPABILITIES`` and implement ``search``,
+    ``has_budget``, and ``health_check``.
+    """
+    # Build minimal stubs that mirror each backend's class-level
+    # declarations. We do not construct a full backend (which would
+    # require a real BudgetTracker / API key); instead we verify
+    # that the CLASS exposes the Protocol surface. The Protocol's
+    # ``@runtime_checkable`` check works on instances, so we
+    # build a tiny ``__init__`` stub via ``object.__new__`` and
+    # set the class attributes on the instance.
+    for cls in (TavilyBackend, SearXNGBackend, ExaBackend):
+        instance = object.__new__(cls)
+        # Class attributes are inherited; no per-instance setup
+        # is required for the runtime_checkable to see them.
+        assert isinstance(instance, BackendProtocol), (
+            f"{cls.__name__} does not satisfy BackendProtocol"
+        )
+        assert isinstance(instance.QUERY_CAPABILITIES, BackendQueryCapabilities)
+        assert instance.QUERY_CAPABILITIES.max_query_chars is not None or (
+            instance.QUERY_CAPABILITIES.max_query_chars is None
+        )  # tautology — both branches accepted; see per-backend tests
+
+
+def test_protocol_includes_query_capabilities_attribute() -> None:
+    """PRE2-A2: ``BackendProtocol`` declares ``QUERY_CAPABILITIES``.
+
+    The router reads ``backend.QUERY_CAPABILITIES.max_query_chars``
+    after backend selection. A backend that does not expose
+    this attribute is treated as having no provider-specific
+    rejection (``None``) — see router.py.
+
+    Note: ``Protocol`` class-level annotations live in
+    ``__annotations__``; ``dir()`` does not surface them.
+    """
+    assert "QUERY_CAPABILITIES" in BackendProtocol.__annotations__

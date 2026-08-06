@@ -14,7 +14,12 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from hermes.services.search.protocol import DEFAULT_SIZE_GUARD_CHARS, SearchResult
+from hermes.services.search.protocol import (
+    DEFAULT_SIZE_GUARD_CHARS,
+    TAVILY_MAX_QUERY_CHARS,
+    BackendQueryCapabilities,
+    SearchResult,
+)
 
 if TYPE_CHECKING:
     from hermes.services.search.budget import BudgetTracker
@@ -29,10 +34,25 @@ class TavilyBackend:
         api_key: Tavily API key (env: TAVILY_API_KEY).
         budget: BudgetTracker para has_budget().
         timeout: HTTP request timeout en segundos (default 15.0).
+
+    PRE2-A2: declares ``QUERY_CAPABILITIES`` with
+    ``max_query_chars = TAVILY_MAX_QUERY_CHARS (399)``. The router
+    validates the query against this limit AFTER Tavily is selected
+    (including fallback) and BEFORE any semaphore, budget, or
+    dispatch side effect. A 400+ char query against Tavily raises
+    ``SearchErrorCode.QUERY_TOO_LONG`` locally; the provider is
+    never called.
     """
 
     name: str = "tavily"
     SUPPORTED_CONTENT_MODES: frozenset[str] = frozenset({"snippet", "summary", "full"})
+    # PRE2-A2: Tavily's hosted API enforces a 399-char hard limit.
+    # Declaring it here lets the router reject locally before any
+    # network call. Local rejection is non-retryable, non-breaker,
+    # and categorised as ``local_validation`` (see errors.py).
+    QUERY_CAPABILITIES: BackendQueryCapabilities = BackendQueryCapabilities(
+        max_query_chars=TAVILY_MAX_QUERY_CHARS,
+    )
 
     def __init__(
         self,

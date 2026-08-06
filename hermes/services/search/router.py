@@ -1,4 +1,4 @@
-"""Sprint 9.3 + PRE2-A1: Web Search Router (Capa 6).
+"""Sprint 9.3 + PRE2-A1 + PRE2-A2: Web Search Router (Capa 6).
 
 Implementa TODOS los fixes de las 3 rondas de cross-review:
 - v1.0 -> v1.1 (Gemini 3.5 Thinking): 3 P0 + 2 P1
@@ -13,17 +13,36 @@ decide HTTP status, retryability, or breaker behavior. The
 frozen retry/breaker matrix is implemented via the classifier
 helpers ``_classify_http_status`` and ``_classify_exception``.
 
+PRE2-A2 (backend query-length capabilities): after the real
+backend has been selected (including fallback) and before any
+side effect (semaphore acquisition, budget debit, ``search``
+dispatch, circuit-breaker mutation), the router validates the
+query against ``backend.QUERY_CAPABILITIES.max_query_chars``.
+If the limit is set and the query exceeds it, the router
+returns a ``SearchError`` with ``code = QUERY_TOO_LONG``,
+``retryable = False``, ``breaker_relevant = False``, and
+``diagnostic_category = LOCAL_VALIDATION``. The query text
+itself is NEVER included in the error message or logs; only
+the length and the backend identity are safe to surface.
+Deep Research must not silently slice an incompatible query
+as a repair. ``max_query_chars = None`` means unknown / no
+provider-specific local rejection; it is NOT a guarantee of
+unlimited acceptance.
+
 Flow:
 1. Validar inputs (empty/long query, invalid intent/content)
 2. Resolver backend por intent
 3. Circuit fallback (verificar SearXNG tambien, P0-2)
 4. Format fallback (degradar content al maximo soportado, P0 Gemini)
-5. Double-checked locking en budget (P1-1 v1.3)
-6. record_usage ANTES de search (P1-2 v1.1)
-7. asyncio.wait_for con _TIMEOUTS (P0-1 v1.1)
-8. _normalize_result_urls (P1-1 v1.1)
-9. _apply_size_guard (P1-9 v1.2)
-10. search_query log estructurado (Capa 10, query_hash NO plain text)
+5. PRE2-A2: per-backend query-length validation against
+   ``backend.QUERY_CAPABILITIES.max_query_chars`` — rejects
+   with ``QUERY_TOO_LONG`` BEFORE any side effect.
+6. Double-checked locking en budget (P1-1 v1.3)
+7. record_usage ANTES de search (P1-2 v1.1)
+8. asyncio.wait_for con _TIMEOUTS (P0-1 v1.1)
+9. _normalize_result_urls (P1-1 v1.1)
+10. _apply_size_guard (P1-9 v1.2)
+11. search_query log estructurado (Capa 10, query_hash NO plain text)
 """
 
 from __future__ import annotations
@@ -426,7 +445,64 @@ async def hermes_search(
         content = "snippet"
         format_fallback = True
 
-    # 5. Double-checked locking (P1-1 v1.3) + execute
+    # 5. PRE2-A2: per-backend query-length validation.
+    # The query has already been truncated to ``_MAX_QUERY_CHARS``
+    # at step 1 (generic/API input constraint — preserved). Now we
+    # validate against the SELECTED backend's declared capability,
+    # AFTER backend selection (including fallback) and BEFORE any
+    # side effect: no semaphore acquisition, no ``budget.record_usage``,
+    # no ``backend.search`` dispatch, and no circuit-breaker mutation.
+    # A rejected query produces a structured ``QUERY_TOO_LONG`` error
+    # with ``retryable=False``, ``breaker_relevant=False``, and
+    # ``diagnostic_category=LOCAL_VALIDATION``. The query text is
+    # NEVER echoed back; only the length and the backend identity
+    # are safe to surface. ``max_query_chars = None`` means
+    # unknown / no provider-specific local rejection (NOT a guarantee
+    # of unlimited acceptance).
+    #
+    # Defensive contract: ``max_query_chars`` MUST be ``int`` or
+    # ``None``. Anything else (e.g. an auto-generated MagicMock
+    # child attribute in a spec'd mock) is treated as "no
+    # provider-specific local rejection" to avoid breaking the
+    # router with a TypeError. Production backends declare
+    # ``BackendQueryCapabilities(max_query_chars=...)`` with the
+    # correct type at import time.
+    _caps = getattr(backend, "QUERY_CAPABILITIES", None)
+    _max = getattr(_caps, "max_query_chars", None) if _caps is not None else None
+    if not isinstance(_max, int):
+        _max = None
+    if _max is not None and len(query) > _max:
+        query_len = len(query)
+        # Log the rejection with safe metadata only (no query text).
+        logger.info(
+            "search_query_too_long",
+            extra={
+                "backend": backend_name,
+                "query_len": query_len,
+                "max_query_chars": _max,
+            },
+        )
+        return _empty_result_with_error(
+            _build_structured_error(
+                code=SearchErrorCode.QUERY_TOO_LONG,
+                # Safe static message: length + backend identity only.
+                # The query text is NEVER included.
+                message=(
+                    f"Query length {query_len} exceeds "
+                    f"{backend_name} limit of {_max} characters."
+                ),
+                backend=backend_name,
+                retryable=False,
+                suggestion=(
+                    "Shorten the query to fit the selected backend's "
+                    "limit, or pick a different intent."
+                ),
+                breaker_relevant=False,
+                diagnostic_category=SearchDiagnosticCategory.LOCAL_VALIDATION,
+            )
+        )
+
+    # 6. Double-checked locking (P1-1 v1.3) + execute
     # P0-3 fix v1.1: get_semaphore() retorna asyncio.Semaphore nativo
     # P1-2 fix v1.1: record_usage ANTES de search (budget leak prevention)
     async with semaphore.get_semaphore(backend_name):

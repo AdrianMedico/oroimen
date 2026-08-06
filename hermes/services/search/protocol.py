@@ -1,4 +1,4 @@
-"""Sprint 9.3: BackendProtocol y SearchResult.
+"""Sprint 9.3 + PRE2-A2: BackendProtocol y SearchResult.
 
 Contrato comun para backends de busqueda web (SearXNG, Tavily, Exa).
 El router usa este Protocol para dispatch polimorfico.
@@ -11,6 +11,15 @@ esta soportado, sin error al LLM).
 
 P1-1 (Gemini 3.5 Thinking): Size Guard de 50K chars por default,
 truncamiento determinista (text[:N]) independiente del tokenizador.
+
+PRE2-A2 (backend query-length capabilities): adds the immutable
+``BackendQueryCapabilities`` shape and a stable class-level
+``QUERY_CAPABILITIES`` attribute on ``BackendProtocol``. The router
+uses this to validate a query against the SELECTED backend's declared
+limit AFTER backend selection and BEFORE any semaphore, budget, or
+dispatch side effect. ``max_query_chars = None`` means unknown /
+no provider-specific local rejection; it is NOT a guarantee of
+unlimited acceptance.
 """
 
 from __future__ import annotations
@@ -32,6 +41,36 @@ ALL_CONTENT_MODES: frozenset[str] = frozenset({"snippet", "summary", "full"})
 # Permite mas contexto al LLM (cross-reference) sin truncar agresivo.
 # Backends y router referencian este constant para evitar stale 50000.
 DEFAULT_SIZE_GUARD_CHARS: int = 200000
+
+
+# PRE2-A2: Tavily's hosted API enforces a hard 399-char limit on
+# the ``query`` field. Rejecting locally is safer than letting the
+# provider return a 4xx (which would be classified as CLIENT_ERROR
+# and would not be semantically accurate: the LLM crafted a too-long
+# query, the provider did not fail mid-flight).
+TAVILY_MAX_QUERY_CHARS: int = 399
+
+
+@dataclass(frozen=True)
+class BackendQueryCapabilities:
+    """Immutable capability declaration for a backend.
+
+    PRE2-A2: minimal shape — the only capability the router needs to
+    enforce per-backend query-length rejection is ``max_query_chars``.
+    Adding new capability axes here requires updating the router's
+    validation surface and adding a focused regression test.
+
+    Attributes:
+        max_query_chars: hard upper bound for the query string the
+            backend will accept. ``None`` means unknown /
+            no provider-specific local rejection. ``None`` is NOT
+            a guarantee of unlimited acceptance; the router does not
+            create a provider-specific rejection for ``None``, but
+            generic/API input constraints (e.g. the existing
+            ``_MAX_QUERY_CHARS`` ceiling) still apply.
+    """
+
+    max_query_chars: int | None
 
 
 @dataclass(frozen=True)
@@ -104,6 +143,17 @@ class BackendProtocol(Protocol):
             - Exa: solo 'snippet' (devuelve highlights, no summaries)
             - Tavily: 'snippet', 'summary', 'full' (todos)
 
+        QUERY_CAPABILITIES: PRE2-A2. ``BackendQueryCapabilities``
+            con el limite duro de query chars que el backend
+            acepta. Declarado por cada backend concreta. Usado
+            por el router para validar queries contra el backend
+            SELECCIONADO (incluyendo fallback), ANTES de adquirir
+            semaforo, debitar budget, despachar ``search``, o
+            mutar el circuit breaker. ``max_query_chars = None``
+            significa "desconocido / sin rechazo local
+            provider-specific"; NO es una garantia de aceptacion
+            ilimitada.
+
     Estado externo (NO en este Protocol, vive en BudgetTracker):
         - Budget mensual por backend (SQLite atomico).
         - Circuit breaker state (open/closed/half-open).
@@ -118,6 +168,9 @@ class BackendProtocol(Protocol):
 
     # Modos de contenido soportados nativamente (P0 Gemini 3.5)
     SUPPORTED_CONTENT_MODES: ClassVar[frozenset[str]]
+
+    # PRE2-A2: query-length capability (inmutable, class-level).
+    QUERY_CAPABILITIES: ClassVar[BackendQueryCapabilities]
 
     async def search(
         self,

@@ -18,7 +18,11 @@ from urllib.parse import quote
 
 import httpx
 
-from hermes.services.search.protocol import DEFAULT_SIZE_GUARD_CHARS, SearchResult
+from hermes.services.search.protocol import (
+    DEFAULT_SIZE_GUARD_CHARS,
+    BackendQueryCapabilities,
+    SearchResult,
+)
 
 if TYPE_CHECKING:
     from hermes.services.search.budget import BudgetTracker
@@ -33,10 +37,22 @@ class SearXNGBackend:
         url: base URL del SearXNG container (e.g., http://searxng:8888).
         budget: BudgetTracker para has_budget().
         timeout: HTTP request timeout en segundos.
+
+    PRE2-A2: declares ``QUERY_CAPABILITIES`` with
+    ``max_query_chars = None``. The router does NOT create a
+    provider-specific rejection for ``None``; the existing
+    generic/API input constraints (e.g. ``_MAX_QUERY_CHARS`` in
+    router.py) still apply. ``None`` is NOT a guarantee of
+    unlimited acceptance.
     """
 
     name: str = "searxng"
     SUPPORTED_CONTENT_MODES: frozenset[str] = frozenset({"snippet"})
+    # PRE2-A2: no provider-specific local rejection. Generic/API
+    # input constraints in the router still apply.
+    QUERY_CAPABILITIES: BackendQueryCapabilities = BackendQueryCapabilities(
+        max_query_chars=None,
+    )
 
     def __init__(
         self,
