@@ -14,7 +14,12 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from hermes.services.search.protocol import DEFAULT_SIZE_GUARD_CHARS, SearchResult
+from hermes.services.search.protocol import (
+    DEFAULT_SIZE_GUARD_CHARS,
+    TAVILY_MAX_QUERY_CHARS,
+    BackendQueryCapabilities,
+    SearchResult,
+)
 
 if TYPE_CHECKING:
     from hermes.services.search.budget import BudgetTracker
@@ -29,10 +34,33 @@ class TavilyBackend:
         api_key: Tavily API key (env: TAVILY_API_KEY).
         budget: BudgetTracker para has_budget().
         timeout: HTTP request timeout en segundos (default 15.0).
+
+    PRE2-A2: declares ``QUERY_CAPABILITIES`` with
+    ``max_query_chars = TAVILY_MAX_QUERY_CHARS (399)``. The 399 value
+    is an Oroimen-side conservative operational / compatibility cap
+    pending live Tavily validation. It is NOT a claim about the
+    hosted API's current limit. The router validates the ORIGINAL
+    query against this cap AFTER Tavily is selected (including
+    fallback) and BEFORE the generic 2000-char truncation; if the
+    cap is exceeded, the router returns
+    ``SearchErrorCode.QUERY_TOO_LONG`` locally with the ORIGINAL
+    length surfaced (not a truncated one), and no network call is
+    made.
     """
 
     name: str = "tavily"
     SUPPORTED_CONTENT_MODES: frozenset[str] = frozenset({"snippet", "summary", "full"})
+    # PRE2-A2: Oroimen conservative operational / compatibility cap.
+    # 399 is a defensive cut pending live Tavily validation; it is
+    # NOT a claim about the hosted API's current limit. Declaring
+    # it here lets the router reject locally before any network
+    # call. Local rejection is non-retryable, non-breaker, and
+    # categorised as ``local_validation`` (see errors.py). The
+    # router validates the ORIGINAL query so the surfaced length
+    # is the user-visible length, not a post-truncation artifact.
+    QUERY_CAPABILITIES: BackendQueryCapabilities = BackendQueryCapabilities(
+        max_query_chars=TAVILY_MAX_QUERY_CHARS,
+    )
 
     def __init__(
         self,

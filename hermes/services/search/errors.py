@@ -49,6 +49,22 @@ class SearchErrorCode(StrEnum):
     RATE_LIMITED = "RATE_LIMITED"  # HTTP 429
     SERVER_ERROR = "SERVER_ERROR"  # HTTP 5xx
     NETWORK_ERROR = "NETWORK_ERROR"  # transport-level failure
+    # PRE2-A2: local validation against the SELECTED backend's
+    # declared ``BackendQueryCapabilities.max_query_chars``. The
+    # router raises this AFTER backend selection (including
+    # fallback) and BEFORE acquiring the semaphore, debiting
+    # budget, dispatching ``backend.search``, or mutating the
+    # circuit breaker. The router validates the ORIGINAL query
+    # (before the generic 2000-char truncation) so the surfaced
+    # length is the user-visible length, not a post-truncation
+    # artifact. The 399 value carried by Tavily is an Oroimen
+    # conservative operational / compatibility cap pending live
+    # Tavily validation; ``QUERY_TOO_LONG`` is the surface for
+    # that cut, not a claim about the hosted API's current limit.
+    # Length and backend identity are safe to surface; the query
+    # text itself is NEVER included in the message, the
+    # serialized dict, or the logs.
+    QUERY_TOO_LONG = "QUERY_TOO_LONG"
 
 
 class SearchDiagnosticCategory(StrEnum):
@@ -206,6 +222,21 @@ ERROR_DEFAULTS: dict[SearchErrorCode, dict[str, Any]] = {
     SearchErrorCode.INVALID_CONTENT: {
         "retryable": False,
         "suggestion": "Use one of: snippet, summary, full.",
+        "breaker_relevant": False,
+        "diagnostic_category": SearchDiagnosticCategory.LOCAL_VALIDATION,
+    },
+    # PRE2-A2: local validation against the selected backend's
+    # declared ``max_query_chars``. Non-retryable (the LLM
+    # crafted a too-long query for this backend), non-breaker
+    # (no provider call ever happened), and categorised as
+    # ``local_validation`` so the job taxonomy treats it like
+    # the other pre-dispatch rejections.
+    SearchErrorCode.QUERY_TOO_LONG: {
+        "retryable": False,
+        "suggestion": (
+            "Shorten the query to fit the selected backend's limit, "
+            "or pick a different intent."
+        ),
         "breaker_relevant": False,
         "diagnostic_category": SearchDiagnosticCategory.LOCAL_VALIDATION,
     },

@@ -1,7 +1,7 @@
-"""Tests Sprint 9.3 + PRE2-A1: Errors module (Capa 9).
+"""Tests Sprint 9.3 + PRE2-A1 + PRE2-A2: Errors module (Capa 9).
 
 Cubre:
-- SearchErrorCode enum: 14 codigos (9 legacy + 5 nuevos PRE2-A1)
+- SearchErrorCode enum: 15 codigos (9 legacy + 5 PRE2-A1 + 1 PRE2-A2)
 - SearchDiagnosticCategory enum: 11 categorias estables y finitas
 - SearchError: dataclass con backends_tried, reasons, breaker_relevant,
   http_status, diagnostic_category
@@ -11,6 +11,15 @@ Cubre:
 - Secret / raw-text redaction: ni message ni serializacion contienen
   texto de excepcion ni un sentinel de redaccion low-entropy plantado
   en una superficie insegura real.
+- PRE2-A2: QUERY_TOO_LONG is a local-validation code that is
+  non-retryable, non-breaker, and never carries the query text.
+  The 399 value on Tavily is an Oroimen conservative operational
+  / compatibility cap pending live Tavily validation; it is NOT
+  a claim about the hosted Tavily API's current limit.
+  Note: the structured ``search_error_code`` and
+  ``search_diagnostic_category`` propagate to the in-memory
+  ``PhaseError``; only the broad ``search_4xx`` taxonomy is
+  persisted to the job row.
 """
 
 from __future__ import annotations
@@ -27,9 +36,9 @@ from hermes.services.search.errors import (
 # --- SearchErrorCode enum ---
 
 
-def test_search_error_code_has_fourteen_codes() -> None:
-    """SearchErrorCode tiene 14 codigos (9 legacy + 5 nuevos PRE2-A1)."""
-    assert len(SearchErrorCode) == 14
+def test_search_error_code_has_fifteen_codes() -> None:
+    """SearchErrorCode tiene 15 codigos (9 legacy + 5 PRE2-A1 + 1 PRE2-A2)."""
+    assert len(SearchErrorCode) == 15
 
 
 def test_search_error_code_includes_pre2a1_codes() -> None:
@@ -42,6 +51,46 @@ def test_search_error_code_includes_pre2a1_codes() -> None:
         SearchErrorCode.NETWORK_ERROR,
     ):
         assert code in SearchErrorCode
+
+
+def test_search_error_code_includes_pre2a2_query_too_long() -> None:
+    """PRE2-A2: ``QUERY_TOO_LONG`` is a valid code in the enum.
+
+    The router uses it to surface the local per-backend
+    query-length rejection. It is non-retryable, non-breaker,
+    and categorised as ``LOCAL_VALIDATION``.
+    """
+    assert SearchErrorCode.QUERY_TOO_LONG in SearchErrorCode
+    assert SearchErrorCode.QUERY_TOO_LONG.value == "QUERY_TOO_LONG"
+
+
+def test_query_too_long_default_is_local_validation() -> None:
+    """PRE2-A2: ``QUERY_TOO_LONG`` defaults are local-validation.
+
+    ``retryable=False``, ``breaker_relevant=False``,
+    ``diagnostic_category=LOCAL_VALIDATION``. The router does
+    NOT count this against any backend's circuit breaker; no
+    provider call ever happened.
+    """
+    defaults = ERROR_DEFAULTS[SearchErrorCode.QUERY_TOO_LONG]
+    assert defaults["retryable"] is False
+    assert defaults["breaker_relevant"] is False
+    assert (
+        defaults["diagnostic_category"]
+        == SearchDiagnosticCategory.LOCAL_VALIDATION
+    )
+
+
+def test_query_too_long_suggestion_mentions_shorten_or_intent() -> None:
+    """PRE2-A2: ``QUERY_TOO_LONG`` suggestion guides the LLM.
+
+    The LLM-facing suggestion must mention how to recover: by
+    shortening the query or by switching intent (e.g. general
+    / SearXNG which has ``max_query_chars = None``).
+    """
+    defaults = ERROR_DEFAULTS[SearchErrorCode.QUERY_TOO_LONG]
+    suggestion = defaults["suggestion"]
+    assert "shorten" in suggestion.lower() or "intent" in suggestion.lower()
 
 
 def test_search_error_code_values_are_strings() -> None:

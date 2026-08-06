@@ -1,4 +1,4 @@
-"""Sprint 9.3 + PRE2-A1: Web Search Router (Capa 6).
+"""Sprint 9.3 + PRE2-A1 + PRE2-A2: Web Search Router (Capa 6).
 
 Implementa TODOS los fixes de las 3 rondas de cross-review:
 - v1.0 -> v1.1 (Gemini 3.5 Thinking): 3 P0 + 2 P1
@@ -13,17 +13,49 @@ decide HTTP status, retryability, or breaker behavior. The
 frozen retry/breaker matrix is implemented via the classifier
 helpers ``_classify_http_status`` and ``_classify_exception``.
 
+PRE2-A2 (backend query-length capabilities): after the real
+backend has been selected (including fallback) and before any
+side effect (semaphore acquisition, budget debit, ``search``
+dispatch, circuit-breaker mutation, AND the generic 2000-char
+truncation), the router validates the ORIGINAL query against
+``backend.QUERY_CAPABILITIES.max_query_chars``. If the cap is
+set and the query exceeds it, the router returns a
+``SearchError`` with ``code = QUERY_TOO_LONG``,
+``retryable = False``, ``breaker_relevant = False``, and
+``diagnostic_category = LOCAL_VALIDATION``. The surfaced length
+is the ORIGINAL user-visible length (e.g. 400 or 5000), not
+a post-truncation artifact, because validation happens BEFORE
+the generic 2000-char truncation. The query text itself is
+NEVER included in the error message or logs; only the length
+and the backend identity are safe to surface. Deep Research
+must not silently slice an incompatible query as a repair.
+``max_query_chars = None`` means unknown / no provider-specific
+local rejection; it is NOT a guarantee of unlimited acceptance
+— a 5000-char query against a ``None`` backend is still
+truncated to 2000 by the generic cap before dispatch.
+
+The 399 value carried by Tavily is an Oroimen conservative
+operational / compatibility cap pending live Tavily validation.
+It is NOT a claim about the hosted Tavily API's current limit.
+
 Flow:
-1. Validar inputs (empty/long query, invalid intent/content)
+1. Validar inputs (empty query, invalid intent/content)
 2. Resolver backend por intent
 3. Circuit fallback (verificar SearXNG tambien, P0-2)
 4. Format fallback (degradar content al maximo soportado, P0 Gemini)
-5. Double-checked locking en budget (P1-1 v1.3)
-6. record_usage ANTES de search (P1-2 v1.1)
-7. asyncio.wait_for con _TIMEOUTS (P0-1 v1.1)
-8. _normalize_result_urls (P1-1 v1.1)
-9. _apply_size_guard (P1-9 v1.2)
-10. search_query log estructurado (Capa 10, query_hash NO plain text)
+5. PRE2-A2: per-backend query-length validation against the
+   ORIGINAL query using ``backend.QUERY_CAPABILITIES.max_query_chars``
+   — rejects with ``QUERY_TOO_LONG`` (with ORIGINAL length
+   surfaced) BEFORE the generic 2000-char truncation and BEFORE
+   any side effect. ``None`` falls through.
+6. Generic 2000-char truncation (preserved existing behavior;
+   only reached for ``None`` caps or queries under the cap).
+7. Double-checked locking en budget (P1-1 v1.3)
+8. record_usage ANTES de search (P1-2 v1.1)
+9. asyncio.wait_for con _TIMEOUTS (P0-1 v1.1)
+10. _normalize_result_urls (P1-1 v1.1)
+11. _apply_size_guard (P1-9 v1.2)
+12. search_query log estructurado (Capa 10, query_hash NO plain text)
 """
 
 from __future__ import annotations
@@ -325,12 +357,15 @@ async def hermes_search(
                 diagnostic_category=SearchDiagnosticCategory.LOCAL_VALIDATION,
             )
         )
-    if len(query) > _MAX_QUERY_CHARS:
-        logger.warning(
-            "search_query_truncated",
-            extra={"original_len": len(query), "max": _MAX_QUERY_CHARS},
-        )
-        query = query[:_MAX_QUERY_CHARS]
+    # PRE2-A2: the generic 2000-char ``_MAX_QUERY_CHARS``
+    # truncation was moved out of step 1 so the per-backend
+    # PRE2-A2 validation at step 5 sees the ORIGINAL query
+    # length. The truncation is now applied at step 6, after
+    # the per-backend cap has been checked. This means a
+    # 5000-char query against Tavily surfaces ``length=5000``
+    # in the ``QUERY_TOO_LONG`` error (not ``length=2000``),
+    # while a 5000-char query against SearXNG (None cap) is
+    # truncated to 2000 at step 6 and dispatched.
     if intent not in _BACKEND_BY_INTENT:
         return _empty_result_with_error(
             _build_structured_error(
@@ -426,7 +461,86 @@ async def hermes_search(
         content = "snippet"
         format_fallback = True
 
-    # 5. Double-checked locking (P1-1 v1.3) + execute
+    # 5. PRE2-A2: per-backend query-length validation.
+    # Validates the ORIGINAL query against the SELECTED backend's
+    # declared capability, AFTER backend selection (including
+    # fallback) and BEFORE the generic 2000-char truncation and
+    # BEFORE any side effect: no semaphore acquisition, no
+    # ``budget.record_usage``, no ``backend.search`` dispatch,
+    # and no circuit-breaker mutation. A rejected query produces
+    # a structured ``QUERY_TOO_LONG`` error with
+    # ``retryable=False``, ``breaker_relevant=False``, and
+    # ``diagnostic_category=LOCAL_VALIDATION``. The surfaced
+    # length is the ORIGINAL user-visible length (e.g. 400 or
+    # 5000) because the validation happens BEFORE the generic
+    # 2000-char truncation at step 6. The query text is NEVER
+    # echoed back; only the length and the backend identity are
+    # safe to surface. ``max_query_chars = None`` means unknown
+    # / no provider-specific local rejection (NOT a guarantee of
+    # unlimited acceptance — the generic 2000-char truncation
+    # at step 6 still applies).
+    #
+    # The 399 value carried by Tavily is an Oroimen conservative
+    # operational / compatibility cap pending live Tavily
+    # validation. It is NOT a claim about the hosted API's
+    # current limit.
+    #
+    # Defensive contract: ``max_query_chars`` MUST be ``int`` or
+    # ``None``. Anything else (e.g. an auto-generated MagicMock
+    # child attribute in a spec'd mock) is treated as "no
+    # provider-specific local rejection" to avoid breaking the
+    # router with a TypeError. Production backends declare
+    # ``BackendQueryCapabilities(max_query_chars=...)`` with the
+    # correct type at import time.
+    _caps = getattr(backend, "QUERY_CAPABILITIES", None)
+    _max = getattr(_caps, "max_query_chars", None) if _caps is not None else None
+    if not isinstance(_max, int):
+        _max = None
+    if _max is not None and len(query) > _max:
+        query_len = len(query)
+        # Log the rejection with safe metadata only (no query text).
+        logger.info(
+            "search_query_too_long",
+            extra={
+                "backend": backend_name,
+                "query_len": query_len,
+                "max_query_chars": _max,
+            },
+        )
+        return _empty_result_with_error(
+            _build_structured_error(
+                code=SearchErrorCode.QUERY_TOO_LONG,
+                # Safe static message: ORIGINAL length + backend
+                # identity. The query text is NEVER included.
+                message=(
+                    f"Query length {query_len} exceeds "
+                    f"{backend_name} limit of {_max} characters."
+                ),
+                backend=backend_name,
+                retryable=False,
+                suggestion=(
+                    "Shorten the query to fit the selected backend's "
+                    "limit, or pick a different intent."
+                ),
+                breaker_relevant=False,
+                diagnostic_category=SearchDiagnosticCategory.LOCAL_VALIDATION,
+            )
+        )
+
+    # 6. Generic 2000-char truncation (P0-1 v1.1: avoids huge
+    # bills). PRE2-A2: this lives AFTER the per-backend cap so
+    # the surfaced ``QUERY_TOO_LONG`` length reflects the ORIGINAL
+    # user-visible length (e.g. 5000), not a post-truncation
+    # artifact. For backends with ``max_query_chars = None``
+    # (SearXNG, Exa) this is the only truncation that applies.
+    if len(query) > _MAX_QUERY_CHARS:
+        logger.warning(
+            "search_query_truncated",
+            extra={"original_len": len(query), "max": _MAX_QUERY_CHARS},
+        )
+        query = query[:_MAX_QUERY_CHARS]
+
+    # 7. Double-checked locking (P1-1 v1.3) + execute
     # P0-3 fix v1.1: get_semaphore() retorna asyncio.Semaphore nativo
     # P1-2 fix v1.1: record_usage ANTES de search (budget leak prevention)
     async with semaphore.get_semaphore(backend_name):
@@ -499,10 +613,10 @@ async def hermes_search(
                 )
             )
 
-    # 6. Success: reset circuit breaker
+    # 8. Success: reset circuit breaker
     circuit_breaker.record_success(backend_name)
 
-    # 7. P1-1 v1.1: normalizar URLs (.rstrip('/'))
+    # 9. P1-1 v1.1: normalizar URLs (.rstrip('/'))
     # S9.3.1 punto 5: sanitizar URLs peligrosas (javascript:, data:, file:, vbscript:)
     # P1-4 fix: deduplicar URLs normalizadas
     # P1-2 v1.3: aplicar size guard sobre resultado NORMALIZADO + DEDUP

@@ -1081,3 +1081,144 @@ async def test_pre2a1_invalid_response_search_failure_persists_search_5xx(
     #    all in-process mocks; no real provider / network call is
     #    made by the test itself.)
     assert service._fetcher.calls == []
+
+
+# =====================================================================
+# PRE2-A2: Deep Research does not silently slice an incompatible query
+# =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_pre2a2_deep_research_surfaces_query_too_long_without_retry(
+    db, service_with_mocks
+) -> None:
+    """PRE2-A2: Deep Research surfaces ``QUERY_TOO_LONG`` exactly once.
+
+    Mission contract: when the search layer returns a structured
+    ``SearchError(QUERY_TOO_LONG)`` (because the LLM-crafted query
+    exceeds the SELECTED backend's Oroimen conservative
+    operational / compatibility cap), Deep Research must:
+
+    1. surface the structured error as a ``PhaseError``;
+    2. NOT silently slice the query and retry;
+    3. NOT dispatch a second ``service._search`` call;
+    4. propagate the structured fields to the in-memory
+       ``PhaseError`` (``search_error_code = "QUERY_TOO_LONG"``,
+       ``search_diagnostic_category = "local_validation"``,
+       ``retryable = False``) for downstream consumers.
+
+    Evidence truth: the structured fields above propagate to the
+    in-memory ``PhaseError``. The only thing persisted to the job
+    row is the broad ``search_4xx`` taxonomy (mapped from
+    ``local_validation``); the precise structured fields remain
+    in memory unless explicitly read from the ``PhaseError``
+    instance.
+
+    The 399 value is the Oroimen conservative operational /
+    compatibility cap pending live Tavily validation; it is NOT
+    a claim about the hosted Tavily API's current limit.
+
+    The test injects a 400-char query (above the 399 cap) and a
+    stub ``service._search`` that returns a real ``SearchResult``
+    with ``error=QUERY_TOO_LONG`` on the FIRST call. It then
+    asserts the single-call, single-PhaseError contract.
+    """
+    service, _llm, _search, _notifier = service_with_mocks
+    job_id = "pre2a2_qtl"
+    long_query = "x" * 400  # > the 399 Oroimen conservative cap
+    await db.create_research_job(
+        job_id=job_id,
+        query=long_query,
+        notify_via_tg=0,
+        user_id=0,
+    )
+
+    # Stub: the real hermes_search would have raised QUERY_TOO_LONG
+    # before any network call. We simulate the post-router state
+    # here so we can assert the Deep Research contract without
+    # actually running the router (which is already exhaustively
+    # tested in tests/unit/test_search_router.py).
+    query_too_long_error = _build_structured_error(
+        code=SearchErrorCode.QUERY_TOO_LONG,
+        # Safe static message: ORIGINAL length + backend identity
+        # only. The query text is NEVER included.
+        message=(
+            f"Query length {len(long_query)} exceeds tavily limit "
+            f"of 399 characters."
+        ),
+        backend="tavily",
+        retryable=False,
+        breaker_relevant=False,
+        diagnostic_category=SearchDiagnosticCategory.LOCAL_VALIDATION,
+    )
+    rejection_result = SearchResult(
+        results=[],
+        backend_used="tavily",
+        query="",  # router never echoes the rejected query
+        content_mode="snippet",
+        original_content_mode="snippet",
+        format_fallback=False,
+        size_guard_chars=0,
+        truncated=False,
+        error=query_too_long_error,
+    )
+
+    search_call_count = 0
+
+    async def _stub_search(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal search_call_count
+        search_call_count += 1
+        # Sanity: the ORIGINAL 400-char query was passed unchanged
+        # (no silent slicing at the call site). The slicing /
+        # validation responsibility belongs to the router; this
+        # stub is the post-router sink.
+        assert kwargs.get("query") == long_query or (
+            len(args) >= 1 and args[0] == long_query
+        ), (
+            "Deep Research must pass the LLM-crafted query to the "
+            "search layer unchanged; PRE2-A2 forbids silent slicing "
+            "at the Deep Research layer."
+        )
+        return rejection_result
+
+    service._search = _stub_search
+
+    # Act: run the search phase with the standard retry wrapper.
+    # If Deep Research silently sliced the query, the stub's
+    # ``search_call_count`` would grow beyond 1.
+    with pytest.raises(PhaseError) as exc_info:
+        await service._run_phase_with_retry(
+            job_id,
+            PhaseName.SEARCH,
+            lambda: service._phase_search(job_id),
+        )
+
+    # 1. The error is a PhaseError, not silently swallowed.
+    err = exc_info.value
+    # 2. retryable=False (QUERY_TOO_LONG is non-retryable). The
+    #    retry wrapper would have attempted up to 3 times if
+    #    retryable were True. We assert single-call instead to
+    #    prove the no-retry contract directly.
+    assert err.retryable is False
+    # 3. search_error_code propagates the structured code (in
+    #    memory; not necessarily persisted).
+    assert err.search_error_code == "QUERY_TOO_LONG"
+    # 4. search_diagnostic_category propagates the structured
+    #    category in memory for downstream consumers.
+    assert err.search_diagnostic_category == "local_validation"
+    # 5. broad taxonomy mapping (``local_validation`` -> ``search_4xx``).
+    #    This is the only thing persisted to the job row.
+    assert err.taxonomy == "search_4xx"
+    # 6. ZERO second search dispatch. The stub was called exactly
+    #    once. PRE2-A2 forbids silent slicing and retry of an
+    #    incompatible query.
+    assert search_call_count == 1, (
+        f"Deep Research dispatched search {search_call_count} "
+        f"times; PRE2-A2 forbids retry/slicing for QUERY_TOO_LONG."
+    )
+    # 7. The error message in the PhaseError MUST NOT carry the
+    #    long query text. The router already built a safe static
+    #    message; the bridge must preserve that.
+    assert "x" * 50 not in err.message
+    assert "400" in err.message  # ORIGINAL length is safe to surface
+    assert "tavily" in err.message  # backend identity is safe

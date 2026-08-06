@@ -1,4 +1,4 @@
-"""Sprint 9.3: BackendProtocol y SearchResult.
+"""Sprint 9.3 + PRE2-A2: BackendProtocol y SearchResult.
 
 Contrato comun para backends de busqueda web (SearXNG, Tavily, Exa).
 El router usa este Protocol para dispatch polimorfico.
@@ -11,6 +11,23 @@ esta soportado, sin error al LLM).
 
 P1-1 (Gemini 3.5 Thinking): Size Guard de 50K chars por default,
 truncamiento determinista (text[:N]) independiente del tokenizador.
+
+PRE2-A2 (backend query-length capabilities): adds the immutable
+``BackendQueryCapabilities`` shape and a stable class-level
+``QUERY_CAPABILITIES`` attribute on ``BackendProtocol``. The router
+uses this to validate the ORIGINAL query against the SELECTED
+backend's declared limit AFTER backend selection (including
+fallback) and BEFORE the generic 2000-char truncation, so the
+rejection surfaces the original length (not a truncated one).
+``max_query_chars = None`` means unknown / no provider-specific
+local rejection; it is NOT a guarantee of unlimited acceptance.
+
+The 399 value carried by ``TAVILY_MAX_QUERY_CHARS`` is an
+Oroimen-side conservative operational / compatibility cap. It is
+a defensive cut that protects the local pipeline until live Tavily
+measurements confirm the actual provider limit. It is NOT a claim
+that Tavily's hosted API currently enforces a hard 399-character
+limit on the ``query`` field.
 """
 
 from __future__ import annotations
@@ -32,6 +49,41 @@ ALL_CONTENT_MODES: frozenset[str] = frozenset({"snippet", "summary", "full"})
 # Permite mas contexto al LLM (cross-reference) sin truncar agresivo.
 # Backends y router referencian este constant para evitar stale 50000.
 DEFAULT_SIZE_GUARD_CHARS: int = 200000
+
+
+# PRE2-A2: Oroimen conservative operational / compatibility cap.
+# 399 is a defensive cut that protects the local pipeline until live
+# Tavily measurements confirm the actual provider limit. It is NOT
+# a claim that the hosted Tavily API currently enforces a hard
+# 399-character limit. The router validates the ORIGINAL query
+# against this cap BEFORE the generic 2000-char truncation so the
+# rejection surfaces the original length (not a truncated one).
+TAVILY_MAX_QUERY_CHARS: int = 399
+
+
+@dataclass(frozen=True)
+class BackendQueryCapabilities:
+    """Immutable capability declaration for a backend.
+
+    PRE2-A2: minimal shape — the only capability the router needs to
+    enforce per-backend query-length rejection is ``max_query_chars``.
+    Adding new capability axes here requires updating the router's
+    validation surface and adding a focused regression test.
+
+    Attributes:
+        max_query_chars: Oroimen-side operational cap for the
+            query string the backend will accept. ``None`` means
+            unknown / no provider-specific local rejection.
+            ``None`` is NOT a guarantee of unlimited acceptance;
+            the router does not create a provider-specific
+            rejection for ``None``, but the generic
+            ``_MAX_QUERY_CHARS`` ceiling (2000) still applies.
+            The value reflects an Oroimen conservative operational
+            / compatibility cut pending live provider validation;
+            it is not a claim about the provider's current API limit.
+    """
+
+    max_query_chars: int | None
 
 
 @dataclass(frozen=True)
@@ -104,6 +156,22 @@ class BackendProtocol(Protocol):
             - Exa: solo 'snippet' (devuelve highlights, no summaries)
             - Tavily: 'snippet', 'summary', 'full' (todos)
 
+        QUERY_CAPABILITIES: PRE2-A2. ``BackendQueryCapabilities``
+            con el cap operacional/conservador de Oroimen para el
+            tamano de query que el backend acepta. Declarado por
+            cada backend concreta. El valor es un cut
+            operacional defensivo pendiente de validacion con el
+            provider real; NO es una afirmacion sobre el limite
+            actual de la API del provider. Usado por el router
+            para validar la query ORIGINAL contra el backend
+            SELECCIONADO (incluyendo fallback), ANTES del
+            truncamiento generico de 2000 chars y ANTES de
+            adquirir semaforo, debitar budget, despachar
+            ``search``, o mutar el circuit breaker.
+            ``max_query_chars = None`` significa "desconocido /
+            sin rechazo local provider-specific"; NO es una
+            garantia de aceptacion ilimitada.
+
     Estado externo (NO en este Protocol, vive en BudgetTracker):
         - Budget mensual por backend (SQLite atomico).
         - Circuit breaker state (open/closed/half-open).
@@ -118,6 +186,9 @@ class BackendProtocol(Protocol):
 
     # Modos de contenido soportados nativamente (P0 Gemini 3.5)
     SUPPORTED_CONTENT_MODES: ClassVar[frozenset[str]]
+
+    # PRE2-A2: query-length capability (inmutable, class-level).
+    QUERY_CAPABILITIES: ClassVar[BackendQueryCapabilities]
 
     async def search(
         self,
