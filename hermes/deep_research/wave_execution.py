@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
@@ -44,6 +44,9 @@ class WaveExecutionResult:
     source_query_ids: Mapping[str, str]
     outcome: WaveExecutionOutcome
     unique_source_cap: int
+
+
+MAX_RESULT_ROWS = 32
 
 
 class SearchCallable(Protocol):
@@ -131,24 +134,29 @@ def _candidate_urls(result: Any) -> tuple[tuple[str, ...], str | None] | None:
         return None
     raw_rows, backend = extracted
     try:
-        rows = tuple(raw_rows)
+        iterator = iter(raw_rows)
     except Exception:
         return None
 
     refs: list[str] = []
-    for row in rows:
-        raw_url: Any
-        if isinstance(result, list):
-            if not isinstance(row, str):
+    try:
+        for index, row in enumerate(iterator):
+            if index >= MAX_RESULT_ROWS:
                 return None
-            raw_url = row
-        else:
-            if not isinstance(row, dict):
-                return None
-            raw_url = row.get("url")
-        normalized = _normalize_url(raw_url)
-        if normalized is not None:
-            refs.append(normalized)
+            raw_url: Any
+            if isinstance(result, list):
+                if not isinstance(row, str):
+                    return None
+                raw_url = row
+            else:
+                if not isinstance(row, dict):
+                    return None
+                raw_url = row.get("url")
+            normalized = _normalize_url(raw_url)
+            if normalized is not None:
+                refs.append(normalized)
+    except Exception:
+        return None
     return tuple(refs), backend
 
 
@@ -178,25 +186,56 @@ class SearchWaveExecutor:
         self._content_mode = content_mode
         self._num_results = num_results
 
-    async def execute(self, plan: SearchPlan) -> WaveExecutionResult:
+    async def execute(
+        self,
+        plan: SearchPlan,
+        *,
+        completed_observations: tuple[SearchObservation, ...] = (),
+        on_observation: Callable[[SearchObservation], None] | None = None,
+    ) -> WaveExecutionResult:
+        ordered_queries = sorted(plan.queries, key=lambda item: item.ordinal)
+        if not isinstance(completed_observations, tuple):
+            raise ValueError("completed_observations must be a tuple")
+        if len(completed_observations) > len(ordered_queries):
+            raise ValueError("completed observations exceed the plan")
+
         observations: list[SearchObservation] = []
         unique_refs: list[str] = []
         source_query_ids: dict[str, str] = {}
         failures = 0
 
-        for query in sorted(plan.queries, key=lambda item: item.ordinal):
+        for query, observation in zip(
+            ordered_queries[: len(completed_observations)],
+            completed_observations,
+            strict=True,
+        ):
+            if observation.wave_index != plan.wave_index or observation.query_id != query.query_id:
+                raise ValueError("completed observations must be an ordinal plan prefix")
+            if observation.local_usage.get("search_calls") != 1:
+                raise ValueError("completed observations must report one search call")
+            observations.append(observation)
+            if observation.structured_error is not None:
+                failures += 1
+            self._record_refs(
+                query_id=query.query_id,
+                refs=observation.result_refs,
+                unique_refs=unique_refs,
+                source_query_ids=source_query_ids,
+            )
+
+        for query in ordered_queries[len(completed_observations) :]:
             observation, refs = await self._execute_query(plan.wave_index, query)
             observations.append(observation)
             if observation.structured_error is not None:
                 failures += 1
-                continue
-            for ref in refs:
-                if ref in source_query_ids:
-                    continue
-                if len(unique_refs) >= self._max_unique_sources:
-                    break
-                unique_refs.append(ref)
-                source_query_ids[ref] = query.query_id
+            self._record_refs(
+                query_id=query.query_id,
+                refs=refs,
+                unique_refs=unique_refs,
+                source_query_ids=source_query_ids,
+            )
+            if on_observation is not None:
+                on_observation(observation)
 
         if failures == len(observations):
             outcome = WaveExecutionOutcome.ALL_FAILED
@@ -221,6 +260,23 @@ class SearchWaveExecutor:
             outcome=outcome,
             unique_source_cap=self._max_unique_sources,
         )
+
+    def _record_refs(
+        self,
+        *,
+        query_id: str,
+        refs: Iterable[Any],
+        unique_refs: list[str],
+        source_query_ids: dict[str, str],
+    ) -> None:
+        for raw_ref in refs:
+            ref = _normalize_url(raw_ref)
+            if ref is None or ref in source_query_ids:
+                continue
+            if len(unique_refs) >= self._max_unique_sources:
+                break
+            unique_refs.append(ref)
+            source_query_ids[ref] = query_id
 
     async def _execute_query(
         self,

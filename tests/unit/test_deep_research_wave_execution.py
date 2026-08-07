@@ -277,6 +277,26 @@ async def test_iterable_materialization_failure_is_malformed_and_wave_continues(
 
 
 @pytest.mark.asyncio
+async def test_oversized_iterable_is_bounded_and_malformed() -> None:
+    class OversizedRows:
+        backend_used = "malformed"
+
+        @property
+        def results(self):
+            return ({"url": f"https://oversized.test/{index}"} for index in range(10_000))
+
+    result = await SearchWaveExecutor(_FakeSearch([OversizedRows()])).execute(
+        _plan((_query(0, "oversized iterable"),))
+    )
+
+    assert json.loads(result.observations[0].structured_error or "{}") == {
+        "code": "malformed_result"
+    }
+    assert result.unique_source_refs == ()
+    assert result.outcome == WaveExecutionOutcome.ALL_FAILED
+
+
+@pytest.mark.asyncio
 async def test_malformed_results_accessor_is_structured_and_wave_continues() -> None:
     class AccessorError:
         backend_used = "malformed"

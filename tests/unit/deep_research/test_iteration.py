@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from hermes.deep_research.iteration import (
     IterationLimits,
     IterationPhase,
     ResearchController,
+    ResearchIterationState,
     StopReason,
 )
 from hermes.deep_research.iteration_store import (
@@ -214,15 +216,26 @@ async def test_controller_runs_multiple_waves_and_preserves_original_brief(
     assert BRIEF not in persisted
     assert compute_research_brief_sha256(BRIEF) in persisted
 
+    persisted_payload = json.loads(persisted)
+    persisted_payload["waves"][0]["source_query_ids"] = {}
+    (tmp_path / "research_iterations" / f"{JOB_ID}.iteration.json").write_text(
+        json.dumps(persisted_payload),
+        encoding="utf-8",
+    )
+    with pytest.raises(IterationStateCorruptError):
+        store.load(JOB_ID)
+
 
 @pytest.mark.asyncio
 async def test_recovery_reuses_plan_persisted_before_cancellation(tmp_path: Path) -> None:
-    raw_planner = _RawPlanner([_payload("DIRECT", "recoverable")])
+    raw_planner = _RawPlanner([_payload("DECOMPOSE", "recoverable")])
 
-    class _CancellingExecutor:
-        async def execute(self, plan: Any) -> Any:
-            del plan
-            raise asyncio.CancelledError
+    class _CancelOnSecondSearch(_FakeSearch):
+        async def __call__(self, **kwargs: Any) -> SearchResult:
+            if len(self.calls) == 1:
+                self.calls.append(kwargs["query"])
+                raise asyncio.CancelledError
+            return await super().__call__(**kwargs)
 
     assessor = _ScriptedAssessor(
         lambda _call, _state, _wave: GapAssessment(
@@ -233,7 +246,7 @@ async def test_recovery_reuses_plan_persisted_before_cancellation(tmp_path: Path
     store = LocalIterationStateStore(tmp_path)
     first = ResearchController(
         planner=SemanticPlanner(raw_planner, capability_snapshot=CAPABILITY),
-        executor=_CancellingExecutor(),
+        executor=SearchWaveExecutor(_CancelOnSecondSearch()),
         assessor=assessor,
         state_store=store,
         planning_limits=PLANNING_LIMITS,
@@ -243,14 +256,19 @@ async def test_recovery_reuses_plan_persisted_before_cancellation(tmp_path: Path
     )
 
     with pytest.raises(asyncio.CancelledError):
-        await first.run(JOB_ID, BRIEF, limits=_limits(max_waves=1, max_searches=1))
+        await first.run(
+            JOB_ID,
+            BRIEF,
+            limits=_limits(max_waves=1, max_searches=2, max_local_call_units=4),
+        )
 
     checkpoint = store.load(JOB_ID)
     assert checkpoint is not None
     assert checkpoint.phase is IterationPhase.PLAN_PERSISTED
     assert checkpoint.active_plan is not None
+    assert len(checkpoint.active_observations) == 1
     assert checkpoint.accounting.planner_calls == 1
-    assert checkpoint.accounting.search_calls == 0
+    assert checkpoint.accounting.search_calls == 1
 
     class _PlannerMustNotRun:
         async def plan(self, request: PlannerRequest) -> Any:
@@ -268,12 +286,17 @@ async def test_recovery_reuses_plan_persisted_before_cancellation(tmp_path: Path
         clock_ms=lambda: 0,
         created_at_factory=lambda: "2026-08-07T00:00:00Z",
     )
-    result = await recovered.run(JOB_ID, BRIEF, limits=_limits(max_waves=1, max_searches=1))
+    result = await recovered.run(
+        JOB_ID,
+        BRIEF,
+        limits=_limits(max_waves=1, max_searches=2, max_local_call_units=4),
+    )
 
     assert result.state.stop_reason is StopReason.OBJECTIVE_COVERED
     assert result.state.accounting.planner_calls == 1
-    assert result.state.accounting.search_calls == 1
+    assert result.state.accounting.search_calls == 2
     assert len(search.calls) == 1
+    assert "recoverable retrieval question 0" not in search.calls[0]
 
 
 @pytest.mark.asyncio
@@ -369,6 +392,66 @@ async def test_stop_reasons_cover_budget_no_progress_and_cooperative_cancel(
     assert local_budget_result.state.accounting.search_calls == 1
     assert local_budget_result.state.accounting.assessment_calls == 0
 
+    exact_assessor = _ScriptedAssessor(
+        lambda _call, _state, _wave: GapAssessment(
+            decision=ContinuationDecision.STOP_COVERED,
+            material_gain=True,
+        )
+    )
+    exact_result = await _controller(
+        raw_planner=_RawPlanner([_payload("DECOMPOSE", "exact budget")]),
+        assessor=exact_assessor,
+        store=LocalIterationStateStore(tmp_path / "exact-budget"),
+        search=_FakeSearch(),
+    ).run(
+        JOB_ID,
+        BRIEF,
+        limits=_limits(max_waves=1, max_searches=2, max_local_call_units=4),
+    )
+    assert exact_result.state.stop_reason is StopReason.OBJECTIVE_COVERED
+    assert exact_result.state.accounting.search_calls == 2
+
+    under_assessor = _ScriptedAssessor(
+        lambda _call, _state, _wave: pytest.fail("assessment must not run")
+    )
+    under_result = await _controller(
+        raw_planner=_RawPlanner([_payload("DECOMPOSE", "under budget")]),
+        assessor=under_assessor,
+        store=LocalIterationStateStore(tmp_path / "under-budget"),
+        search=_FakeSearch(),
+    ).run(
+        JOB_ID,
+        BRIEF,
+        limits=_limits(max_waves=1, max_searches=2, max_local_call_units=3),
+    )
+    assert under_result.state.stop_reason is StopReason.BUDGET_EXHAUSTED
+    assert under_result.state.accounting.planner_calls == 1
+    assert under_result.state.accounting.search_calls == 2
+    assert under_result.state.accounting.assessment_calls == 0
+
+    class _SlowSearch(_FakeSearch):
+        async def __call__(self, **kwargs: Any) -> SearchResult:
+            await asyncio.sleep(0.05)
+            return await super().__call__(**kwargs)
+
+    timed_executor_assessor = _ScriptedAssessor(
+        lambda _call, _state, _wave: pytest.fail("assessment must not run")
+    )
+    timed_result = await _controller(
+        raw_planner=_RawPlanner([_payload("DIRECT", "deadline")]),
+        assessor=timed_executor_assessor,
+        store=LocalIterationStateStore(tmp_path / "deadline"),
+        search=_SlowSearch(),
+    ).run(
+        JOB_ID,
+        BRIEF,
+        limits=_limits(max_waves=1, max_searches=1, max_elapsed_ms=5),
+    )
+    assert timed_result.state.stop_reason is StopReason.BUDGET_EXHAUSTED
+    assert timed_result.state.active_plan is not None
+    assert timed_result.state.accounting.planner_calls == 1
+    assert timed_result.state.accounting.search_calls == 0
+
     cancelled = _Cancellation(cancelled=True)
     cancel_assessor = _ScriptedAssessor(
         lambda _call, _state, _wave: pytest.fail("assessor must not run")
@@ -438,9 +521,62 @@ async def test_controller_rejects_non_semantic_plan_and_repeated_query(
         )
 
 
+@pytest.mark.asyncio
+async def test_signed_source_is_rejected_before_durable_checkpoint(tmp_path: Path) -> None:
+    class _SignedSearch(_FakeSearch):
+        async def __call__(self, **kwargs: Any) -> SearchResult:
+            del kwargs
+            return SearchResult(
+                results=[
+                    {"url": "https://sources.test/report?X-Amz-Signature=secret-value"}
+                ],
+                backend_used="fake",
+                query="signed",
+                content_mode="snippet",
+                original_content_mode="snippet",
+                format_fallback=False,
+                size_guard_chars=200_000,
+                truncated=False,
+            )
+
+    store = LocalIterationStateStore(tmp_path)
+    assessor = _ScriptedAssessor(
+        lambda _call, _state, _wave: pytest.fail("assessment must not run")
+    )
+    with pytest.raises(ValueError, match="safe HTTP"):
+        await _controller(
+            raw_planner=_RawPlanner([_payload("DIRECT", "signed")]),
+            assessor=assessor,
+            store=store,
+            search=_SignedSearch(),
+        ).run(JOB_ID, BRIEF, limits=_limits(max_waves=1, max_searches=1))
+
+    checkpoint = store.load(JOB_ID)
+    assert checkpoint is not None
+    assert checkpoint.active_observations == ()
+    assert "secret-value" not in (
+        tmp_path / "research_iterations" / f"{JOB_ID}.iteration.json"
+    ).read_text(encoding="utf-8")
+
+
 def test_iteration_state_store_is_atomic_and_fail_closed(tmp_path: Path) -> None:
     store = LocalIterationStateStore(tmp_path)
     path = tmp_path / "research_iterations" / f"{JOB_ID}.iteration.json"
     path.write_text("not-json", encoding="utf-8")
+    with pytest.raises(IterationStateCorruptError):
+        store.load(JOB_ID)
+
+    valid_state = ResearchIterationState.new(
+        job_id=JOB_ID,
+        research_brief_sha256=compute_research_brief_sha256(BRIEF),
+        limits=_limits(),
+        planning_limits=PLANNING_LIMITS,
+        capability_snapshot=CAPABILITY,
+        started_at_ms=0,
+    )
+    store.write(JOB_ID, valid_state)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["next_wave_index"] = 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(IterationStateCorruptError):
         store.load(JOB_ID)

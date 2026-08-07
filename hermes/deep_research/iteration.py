@@ -12,6 +12,7 @@ idempotent checkpoints, and terminal STOP reasons.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import re
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from hermes.deep_research.planner import (
     STRUCTURED_LLM_PLANNER_KIND,
@@ -58,6 +59,37 @@ MAX_SOURCE_REF_CHARS = 2_048
 MAX_RESULT_REFS_PER_OBSERVATION = 32
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_ITERATION_STATE_KEYS = frozenset(
+    {
+        "schema_version",
+        "job_id",
+        "research_brief_sha256",
+        "limits",
+        "planning_limits",
+        "capability_snapshot",
+        "phase",
+        "next_wave_index",
+        "started_at_ms",
+        "active_plan",
+        "active_observations",
+        "active_source_refs",
+        "active_source_query_ids",
+        "waves",
+        "source_refs",
+        "source_query_ids",
+        "searched_query_ids",
+        "searched_query_texts",
+        "exhausted_query_ids",
+        "exhausted_query_texts",
+        "exhausted_source_refs",
+        "open_gaps",
+        "accounting",
+        "stop_reason",
+    }
+)
+_SENSITIVE_URL_KEY_PARTS = frozenset(
+    {"token", "key", "sig", "signature", "secret", "auth", "credential"}
+)
 
 
 class IterationPhase(StrEnum):
@@ -135,11 +167,16 @@ class IterationLimits:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> IterationLimits:
+        _require_keys(
+            payload,
+            {"max_waves", "max_searches", "max_elapsed_ms", "max_local_call_units"},
+            "iteration limits",
+        )
         return cls(
-            max_waves=int(payload["max_waves"]),
-            max_searches=int(payload["max_searches"]),
-            max_elapsed_ms=int(payload["max_elapsed_ms"]),
-            max_local_call_units=int(payload["max_local_call_units"]),
+            max_waves=_strict_int(payload, "max_waves"),
+            max_searches=_strict_int(payload, "max_searches"),
+            max_elapsed_ms=_strict_int(payload, "max_elapsed_ms"),
+            max_local_call_units=_strict_int(payload, "max_local_call_units"),
         )
 
 
@@ -170,10 +207,15 @@ class ResearchAccounting:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ResearchAccounting:
+        _require_keys(
+            payload,
+            {"planner_calls", "search_calls", "assessment_calls"},
+            "research accounting",
+        )
         return cls(
-            planner_calls=int(payload.get("planner_calls", 0)),
-            search_calls=int(payload.get("search_calls", 0)),
-            assessment_calls=int(payload.get("assessment_calls", 0)),
+            planner_calls=_strict_int(payload, "planner_calls"),
+            search_calls=_strict_int(payload, "search_calls"),
+            assessment_calls=_strict_int(payload, "assessment_calls"),
         )
 
 
@@ -196,6 +238,66 @@ def _bounded_items(
         if "\n" in value or "\r" in value:
             raise ValueError(f"{name} items must be single-line")
     return values
+
+
+def _require_keys(
+    payload: Mapping[str, Any],
+    expected: set[str] | frozenset[str],
+    name: str,
+) -> None:
+    if not isinstance(payload, Mapping) or set(payload) != set(expected):
+        raise ValueError(f"{name} has an invalid field set")
+
+
+def _strict_int(payload: Mapping[str, Any], name: str) -> int:
+    value = payload.get(name)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{name} must be an int")
+    return value
+
+
+def _strict_str(payload: Mapping[str, Any], name: str) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    return value
+
+
+def _strict_mapping(payload: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    value = payload.get(name)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be an object")
+    return value
+
+
+def _strict_capability_snapshot(payload: Mapping[str, Any]) -> CapabilitySnapshot:
+    allowed = {
+        "planner_kind",
+        "planner_version",
+        "max_queries_per_wave",
+        "max_query_chars",
+        "planner_provenance",
+    }
+    if not set(payload).issubset(allowed) or not {
+        "planner_kind",
+        "planner_version",
+        "max_queries_per_wave",
+        "max_query_chars",
+    }.issubset(payload):
+        raise ValueError("capability snapshot has an invalid field set")
+    provenance_raw = payload.get("planner_provenance", {})
+    if not isinstance(provenance_raw, Mapping) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in provenance_raw.items()
+    ):
+        raise ValueError("planner provenance must be a string mapping")
+    return CapabilitySnapshot(
+        planner_kind=_strict_str(payload, "planner_kind"),
+        planner_version=_strict_str(payload, "planner_version"),
+        max_queries_per_wave=_strict_int(payload, "max_queries_per_wave"),
+        max_query_chars=_strict_int(payload, "max_query_chars"),
+        planner_provenance=dict(provenance_raw),
+    )
 
 
 @dataclass(frozen=True)
@@ -257,6 +359,22 @@ def _safe_source_ref(value: str) -> bool:
         parsed = urlsplit(value)
     except ValueError:
         return False
+    try:
+        query_keys = {
+            key.lower()
+            for key, _value in parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+                max_num_fields=64,
+            )
+        }
+    except ValueError:
+        return False
+    if any(
+        any(part in key for part in _SENSITIVE_URL_KEY_PARTS)
+        for key in query_keys
+    ):
+        return False
     return (
         parsed.scheme.lower() in {"http", "https"}
         and bool(parsed.netloc)
@@ -305,7 +423,6 @@ class WaveRecord:
             raise ValueError("wave observations must bind to the wave")
         if len(set(observation_ids)) != len(observation_ids) or set(observation_ids) != query_ids:
             raise ValueError("wave observations must cover each planned query once")
-        observed_refs_by_query = {}
         for observation in self.observations:
             if len(observation.result_refs) > MAX_RESULT_REFS_PER_OBSERVATION:
                 raise ValueError("observation result refs exceed the per-query cap")
@@ -316,16 +433,41 @@ class WaveRecord:
                 for source_ref in observation.result_refs
             ):
                 raise ValueError("observation result refs must be safe HTTP(S) URLs")
-            observed_refs_by_query[observation.query_id] = set(observation.result_refs)
         if not set(self.source_query_ids).issubset(self.unique_source_refs):
             raise ValueError("source provenance must point to wave evidence")
-        if not set(self.source_query_ids.values()).issubset(query_ids):
+        expected_refs: list[str] = []
+        expected_provenance: dict[str, str] = {}
+        for observation in self.observations:
+            for source_ref in observation.result_refs:
+                if source_ref in expected_provenance:
+                    continue
+                if len(expected_refs) >= self.unique_source_cap:
+                    break
+                expected_refs.append(source_ref)
+                expected_provenance[source_ref] = observation.query_id
+        if tuple(expected_refs) != self.unique_source_refs:
+            raise ValueError("wave sources must match first-seen observation evidence")
+        if dict(self.source_query_ids) != expected_provenance:
+            raise ValueError("wave source provenance must match first-seen evidence")
+        if set(self.source_query_ids.values()) - query_ids:
             raise ValueError("source provenance must point to wave queries")
-        if any(
-            source_ref not in observed_refs_by_query[query_id]
-            for source_ref, query_id in self.source_query_ids.items()
-        ):
-            raise ValueError("source provenance must match observation evidence")
+        failures = sum(
+            observation.structured_error is not None for observation in self.observations
+        )
+        if failures == len(self.observations):
+            expected_outcome = WaveExecutionOutcome.ALL_FAILED
+        elif not self.unique_source_refs:
+            expected_outcome = (
+                WaveExecutionOutcome.PARTIAL_NO_EVIDENCE
+                if failures
+                else WaveExecutionOutcome.ALL_EMPTY
+            )
+        elif failures:
+            expected_outcome = WaveExecutionOutcome.PARTIAL_SUCCESS
+        else:
+            expected_outcome = WaveExecutionOutcome.ALL_SUCCESS
+        if self.outcome != expected_outcome:
+            raise ValueError("wave outcome contradicts observations and evidence")
         if not isinstance(self.outcome, WaveExecutionOutcome):
             object.__setattr__(self, "outcome", WaveExecutionOutcome(self.outcome))
         object.__setattr__(
@@ -393,6 +535,9 @@ class ResearchIterationState:
     next_wave_index: int
     started_at_ms: int
     active_plan: SearchPlan | None = None
+    active_observations: tuple[SearchObservation, ...] = ()
+    active_source_refs: tuple[str, ...] = ()
+    active_source_query_ids: Mapping[str, str] = field(default_factory=dict)
     waves: tuple[WaveRecord, ...] = ()
     source_refs: tuple[str, ...] = ()
     source_query_ids: Mapping[str, str] = field(default_factory=dict)
@@ -437,9 +582,56 @@ class ResearchIterationState:
                 raise ValueError("wave plan capability snapshot drifted from iteration state")
         if len(self.waves) > self.limits.max_waves:
             raise ValueError("wave records exceed max_waves")
+        if self.next_wave_index != len(self.waves):
+            raise ValueError("next_wave_index must equal the completed wave count")
         for expected_index, wave in enumerate(self.waves):
             if wave.wave_index != expected_index:
                 raise ValueError("wave records must be contiguous from zero")
+        if self.active_plan is None:
+            if (
+                self.active_observations
+                or self.active_source_refs
+                or self.active_source_query_ids
+            ):
+                raise ValueError("partial wave evidence requires an active plan")
+        else:
+            ordered_queries = sorted(
+                self.active_plan.queries,
+                key=lambda query: query.ordinal,
+            )
+            if len(self.active_observations) > len(ordered_queries):
+                raise ValueError("partial observations exceed the active plan")
+            expected_active_ids = tuple(
+                query.query_id
+                for query in ordered_queries[: len(self.active_observations)]
+            )
+            actual_active_ids = tuple(
+                observation.query_id for observation in self.active_observations
+            )
+            if actual_active_ids != expected_active_ids:
+                raise ValueError("partial observations must be an ordinal plan prefix")
+            expected_active_refs: list[str] = []
+            expected_active_provenance: dict[str, str] = {}
+            for observation in self.active_observations:
+                if observation.wave_index != self.active_plan.wave_index:
+                    raise ValueError("partial observations must bind to the active wave")
+                for source_ref in observation.result_refs:
+                    if source_ref in expected_active_provenance:
+                        continue
+                    expected_active_refs.append(source_ref)
+                    expected_active_provenance[source_ref] = observation.query_id
+            _bounded_items(
+                "active_source_refs",
+                self.active_source_refs,
+                max_items=MAX_SOURCES_PER_JOB,
+                max_chars=MAX_SOURCE_REF_CHARS,
+            )
+            if not all(_safe_source_ref(source_ref) for source_ref in self.active_source_refs):
+                raise ValueError("active source refs must be safe HTTP(S) URLs")
+            if tuple(expected_active_refs) != self.active_source_refs:
+                raise ValueError("active sources must match partial observations")
+            if dict(self.active_source_query_ids) != expected_active_provenance:
+                raise ValueError("active source provenance must match partial observations")
         expected_query_ids = tuple(
             query.query_id for wave in self.waves for query in wave.plan.queries
         )
@@ -492,7 +684,7 @@ class ResearchIterationState:
             for source_ref, query_id in self.source_query_ids.items()
         ):
             raise ValueError("source provenance must contain non-empty strings")
-        expected_search_calls = len(expected_query_ids)
+        expected_search_calls = len(expected_query_ids) + len(self.active_observations)
         if self.accounting.search_calls != expected_search_calls:
             raise ValueError("search accounting must match completed wave queries")
         all_query_ids = set(expected_query_ids)
@@ -509,9 +701,18 @@ class ResearchIterationState:
             raise ValueError("stopped state requires a stop reason")
         if self.phase is not IterationPhase.STOPPED and self.stop_reason is not None:
             raise ValueError("non-stopped state cannot have a stop reason")
-        if self.active_plan is not None and self.phase is not IterationPhase.PLAN_PERSISTED:
-            raise ValueError("active plan requires plan_persisted phase")
+        if self.phase is IterationPhase.READY_TO_PLAN and self.active_plan is not None:
+            raise ValueError("ready_to_plan state cannot contain an active plan")
+        if self.phase is IterationPhase.ASSESSMENT_PENDING and self.active_plan is not None:
+            raise ValueError("assessment_pending state cannot contain an active plan")
+        if self.phase is IterationPhase.PLAN_PERSISTED and self.active_plan is None:
+            raise ValueError("plan_persisted state requires an active plan")
         object.__setattr__(self, "source_query_ids", MappingProxyType(dict(self.source_query_ids)))
+        object.__setattr__(
+            self,
+            "active_source_query_ids",
+            MappingProxyType(dict(self.active_source_query_ids)),
+        )
 
     @classmethod
     def new(
@@ -551,6 +752,11 @@ class ResearchIterationState:
                 if self.active_plan is None
                 else json.loads(serialize_search_plan(self.active_plan).decode("utf-8"))
             ),
+            "active_observations": [
+                observation.to_dict() for observation in self.active_observations
+            ],
+            "active_source_refs": list(self.active_source_refs),
+            "active_source_query_ids": dict(self.active_source_query_ids),
             "waves": [wave.to_dict() for wave in self.waves],
             "source_refs": list(self.source_refs),
             "source_query_ids": dict(self.source_query_ids),
@@ -566,21 +772,58 @@ class ResearchIterationState:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ResearchIterationState:
-        if int(payload["schema_version"]) != ITERATION_SCHEMA_VERSION:
+        _require_keys(payload, _ITERATION_STATE_KEYS, "iteration state")
+        if _strict_int(payload, "schema_version") != ITERATION_SCHEMA_VERSION:
             raise ValueError("unsupported iteration state schema")
         active_raw = payload.get("active_plan")
         stop_raw = payload.get("stop_reason")
+        active_observations_raw = payload.get("active_observations", [])
+        if not isinstance(active_observations_raw, list):
+            raise ValueError("active_observations must be a list")
+        waves_raw = payload.get("waves")
+        if not isinstance(waves_raw, list):
+            raise ValueError("waves must be a list")
+        active_source_query_ids_raw = _strict_mapping(
+            payload,
+            "active_source_query_ids",
+        )
+        source_query_ids_raw = _strict_mapping(payload, "source_query_ids")
+        if not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in (
+                *active_source_query_ids_raw.items(),
+                *source_query_ids_raw.items(),
+            )
+        ):
+            raise ValueError("source provenance mappings must contain strings")
+        if stop_raw is not None and not isinstance(stop_raw, str):
+            raise ValueError("stop_reason must be a string or null")
+        planning_limits_raw = _strict_mapping(payload, "planning_limits")
+        _require_keys(
+            planning_limits_raw,
+            {"max_queries_per_wave", "max_query_chars"},
+            "planning limits",
+        )
         return cls(
-            job_id=str(payload["job_id"]),
-            research_brief_sha256=str(payload["research_brief_sha256"]),
-            limits=IterationLimits.from_dict(payload["limits"]),
-            planning_limits=PlanningLimits.from_dict(payload["planning_limits"]),
-            capability_snapshot=CapabilitySnapshot.from_dict(
-                payload["capability_snapshot"]
+            job_id=_strict_str(payload, "job_id"),
+            research_brief_sha256=_strict_str(payload, "research_brief_sha256"),
+            limits=IterationLimits.from_dict(_strict_mapping(payload, "limits")),
+            planning_limits=PlanningLimits(
+                max_queries_per_wave=_strict_int(
+                    planning_limits_raw,
+                    "max_queries_per_wave",
+                ),
+                max_query_chars=_strict_int(
+                    planning_limits_raw,
+                    "max_query_chars",
+                ),
             ),
-            phase=IterationPhase(str(payload["phase"])),
-            next_wave_index=int(payload["next_wave_index"]),
-            started_at_ms=int(payload["started_at_ms"]),
+            capability_snapshot=_strict_capability_snapshot(
+                _strict_mapping(payload, "capability_snapshot")
+            ),
+            phase=IterationPhase(_strict_str(payload, "phase")),
+            next_wave_index=_strict_int(payload, "next_wave_index"),
+            started_at_ms=_strict_int(payload, "started_at_ms"),
             active_plan=(
                 None
                 if active_raw is None
@@ -588,20 +831,24 @@ class ResearchIterationState:
                     json.dumps(active_raw, sort_keys=True).encode("utf-8")
                 )
             ),
-            waves=tuple(WaveRecord.from_dict(item) for item in payload.get("waves", [])),
+            active_observations=tuple(
+                SearchObservation.from_dict(item) for item in active_observations_raw
+            ),
+            active_source_refs=_strict_string_tuple(payload, "active_source_refs"),
+            active_source_query_ids=dict(active_source_query_ids_raw),
+            waves=tuple(WaveRecord.from_dict(item) for item in waves_raw),
             source_refs=_strict_string_tuple(payload, "source_refs"),
-            source_query_ids={
-                str(key): str(value)
-                for key, value in dict(payload.get("source_query_ids", {})).items()
-            },
+            source_query_ids=dict(source_query_ids_raw),
             searched_query_ids=_strict_string_tuple(payload, "searched_query_ids"),
             searched_query_texts=_strict_string_tuple(payload, "searched_query_texts"),
             exhausted_query_ids=_strict_string_tuple(payload, "exhausted_query_ids"),
             exhausted_query_texts=_strict_string_tuple(payload, "exhausted_query_texts"),
             exhausted_source_refs=_strict_string_tuple(payload, "exhausted_source_refs"),
             open_gaps=_strict_string_tuple(payload, "open_gaps"),
-            accounting=ResearchAccounting.from_dict(payload.get("accounting", {})),
-            stop_reason=(None if stop_raw is None else StopReason(str(stop_raw))),
+            accounting=ResearchAccounting.from_dict(
+                _strict_mapping(payload, "accounting")
+            ),
+            stop_reason=(None if stop_raw is None else StopReason(stop_raw)),
         )
 
 
@@ -711,7 +958,14 @@ class ResearchController:
                     exhausted_query_ids=state.exhausted_query_ids,
                     exhausted_source_refs=state.exhausted_source_refs,
                 )
-                planned = await self._planner.plan(request)
+                try:
+                    planned = await asyncio.wait_for(
+                        self._planner.plan(request),
+                        timeout=self._remaining_seconds(state, limits),
+                    )
+                except TimeoutError:
+                    state = self._stop(state, StopReason.BUDGET_EXHAUSTED)
+                    break
                 self._validate_planner_result(
                     planned,
                     state,
@@ -742,13 +996,39 @@ class ResearchController:
                 if not self._can_execute_plan(state):
                     state = self._stop(state, StopReason.BUDGET_EXHAUSTED)
                     break
-                execution = await self._executor.execute(plan)
-                search_calls = self._count_search_calls(execution)
-                if state.accounting.total_local_call_units + search_calls > limits.max_local_call_units:
+                assert state is not None
+                state_for_execution: ResearchIterationState = state
+
+                def checkpoint_observation(observation: SearchObservation) -> None:
+                    nonlocal state_for_execution
+                    state_for_execution = self._checkpoint_observation(
+                        job_id=job_id,
+                        state=state_for_execution,
+                        observation=observation,
+                        limits=limits,
+                    )
+
+                try:
+                    execution = await asyncio.wait_for(
+                        self._executor.execute(
+                            plan,
+                            completed_observations=state_for_execution.active_observations,
+                            on_observation=checkpoint_observation,
+                        ),
+                        timeout=self._remaining_seconds(state, limits),
+                    )
+                except TimeoutError:
+                    state = state_for_execution
                     state = self._stop(state, StopReason.BUDGET_EXHAUSTED)
                     break
+                state = state_for_execution
+                search_calls = self._count_search_calls(execution)
                 wave = WaveRecord.from_result(execution)
-                state = self._record_wave(state, wave, search_calls)
+                if state.accounting.search_calls + search_calls - len(
+                    state.active_observations
+                ) > limits.max_searches:
+                    raise IterationInvariantError("search accounting exceeded its reservation")
+                state = self._record_wave(state, wave)
                 self._state_store.write(job_id, state)
                 continue
 
@@ -764,7 +1044,17 @@ class ResearchController:
                     state=state,
                     wave=wave,
                 )
-                assessment = await proposal if inspect.isawaitable(proposal) else proposal
+                if inspect.isawaitable(proposal):
+                    try:
+                        assessment = await asyncio.wait_for(
+                            proposal,
+                            timeout=self._remaining_seconds(state, limits),
+                        )
+                    except TimeoutError:
+                        state = self._stop(state, StopReason.BUDGET_EXHAUSTED)
+                        break
+                else:
+                    assessment = proposal
                 self._validate_assessment(assessment, state, wave)
                 accounting = ResearchAccounting(
                     planner_calls=state.accounting.planner_calls,
@@ -798,6 +1088,16 @@ class ResearchController:
     def _elapsed(self, state: ResearchIterationState) -> int:
         return max(0, self._clock_ms() - state.started_at_ms)
 
+    def _remaining_seconds(
+        self,
+        state: ResearchIterationState,
+        limits: IterationLimits,
+    ) -> float:
+        remaining_ms = limits.max_elapsed_ms - self._elapsed(state)
+        if remaining_ms <= 0:
+            return 0.001
+        return remaining_ms / 1000
+
     @staticmethod
     def _cancelled(cancellation: CancellationProbe | None) -> bool:
         return cancellation is not None and cancellation.is_cancelled()
@@ -810,7 +1110,6 @@ class ResearchController:
         stopped = self._replace_state(
             state,
             phase=IterationPhase.STOPPED,
-            active_plan=None,
             stop_reason=reason,
         )
         self._state_store.write(state.job_id, stopped)
@@ -826,10 +1125,67 @@ class ResearchController:
     def _can_execute_plan(self, state: ResearchIterationState) -> bool:
         assert state.active_plan is not None
         query_count = len(state.active_plan.queries)
+        remaining_queries = query_count - len(state.active_observations)
         return (
-            state.accounting.search_calls + query_count <= state.limits.max_searches
-            and state.accounting.total_local_call_units + 1 <= state.limits.max_local_call_units
+            state.accounting.search_calls + remaining_queries <= state.limits.max_searches
+            and state.accounting.total_local_call_units + remaining_queries
+            <= state.limits.max_local_call_units
         )
+
+    def _checkpoint_observation(
+        self,
+        *,
+        job_id: str,
+        state: ResearchIterationState,
+        observation: SearchObservation,
+        limits: IterationLimits,
+    ) -> ResearchIterationState:
+        if state.active_plan is None:
+            raise IterationInvariantError("partial observation requires an active plan")
+        ordered_queries = sorted(
+            state.active_plan.queries,
+            key=lambda query: query.ordinal,
+        )
+        next_ordinal = len(state.active_observations)
+        if next_ordinal >= len(ordered_queries):
+            raise IterationInvariantError("executor returned too many observations")
+        if observation.query_id != ordered_queries[next_ordinal].query_id:
+            raise IterationInvariantError("executor observation order drifted")
+        if observation.local_usage.get("search_calls") != 1:
+            raise IterationInvariantError("executor observation accounting drifted")
+        if state.accounting.total_local_call_units + 1 > limits.max_local_call_units:
+            raise IterationInvariantError("executor exceeded the reserved local-call budget")
+        active_observations = (*state.active_observations, observation)
+        active_source_refs, active_source_query_ids = self._source_evidence(
+            active_observations
+        )
+        updated = self._replace_state(
+            state,
+            active_observations=active_observations,
+            active_source_refs=active_source_refs,
+            active_source_query_ids=active_source_query_ids,
+            accounting=ResearchAccounting(
+                planner_calls=state.accounting.planner_calls,
+                search_calls=state.accounting.search_calls + 1,
+                assessment_calls=state.accounting.assessment_calls,
+            ),
+        )
+        self._state_store.write(job_id, updated)
+        return updated
+
+    @staticmethod
+    def _source_evidence(
+        observations: tuple[SearchObservation, ...],
+    ) -> tuple[tuple[str, ...], dict[str, str]]:
+        refs: list[str] = []
+        provenance: dict[str, str] = {}
+        for observation in observations:
+            for source_ref in observation.result_refs:
+                if source_ref in provenance:
+                    continue
+                refs.append(source_ref)
+                provenance[source_ref] = observation.query_id
+        return tuple(refs), provenance
 
     @staticmethod
     def _validate_planner_result(
@@ -879,7 +1235,6 @@ class ResearchController:
     def _record_wave(
         state: ResearchIterationState,
         wave: WaveRecord,
-        search_calls: int,
     ) -> ResearchIterationState:
         query_ids = tuple(query.query_id for query in wave.plan.queries)
         query_texts = tuple(normalize_query_text(query.text) for query in wave.plan.queries)
@@ -897,6 +1252,9 @@ class ResearchController:
             next_wave_index=state.next_wave_index + 1,
             started_at_ms=state.started_at_ms,
             active_plan=None,
+            active_observations=(),
+            active_source_refs=(),
+            active_source_query_ids={},
             waves=(*state.waves, wave),
             source_refs=source_refs,
             source_query_ids=source_query_ids,
@@ -908,7 +1266,9 @@ class ResearchController:
             open_gaps=state.open_gaps,
             accounting=ResearchAccounting(
                 planner_calls=state.accounting.planner_calls,
-                search_calls=state.accounting.search_calls + search_calls,
+                search_calls=state.accounting.search_calls
+                + len(query_ids)
+                - len(state.active_observations),
                 assessment_calls=state.accounting.assessment_calls,
             ),
             stop_reason=None,
@@ -926,18 +1286,20 @@ class ResearchController:
             raise IterationInvariantError("assessor exhausted an unknown query")
         if not set(assessment.exhausted_source_refs).issubset(state.source_refs):
             raise IterationInvariantError("assessor exhausted an unknown source")
-        prior_refs = {
-            source_ref
-            for prior_wave in state.waves[:-1]
-            for source_ref in prior_wave.unique_source_refs
-        }
-        new_refs = set(wave.unique_source_refs) - prior_refs
         if assessment.decision is ContinuationDecision.STOP_COVERED and assessment.remaining_gaps:
             raise IterationInvariantError("STOP_COVERED requires no remaining gaps")
         if assessment.decision is ContinuationDecision.CONTINUE and not assessment.remaining_gaps:
             raise IterationInvariantError("CONTINUE requires remaining gaps")
-        if assessment.material_gain != bool(new_refs):
-            raise IterationInvariantError("material_gain must match new evidence")
+        if (
+            assessment.decision is ContinuationDecision.STOP_COVERED
+            and not assessment.material_gain
+        ):
+            raise IterationInvariantError("STOP_COVERED requires material evidence gain")
+        if (
+            assessment.decision is ContinuationDecision.STOP_NO_MATERIAL_GAIN
+            and assessment.material_gain
+        ):
+            raise IterationInvariantError("STOP_NO_MATERIAL_GAIN cannot report material gain")
 
     @staticmethod
     def _apply_assessment(
@@ -945,12 +1307,6 @@ class ResearchController:
         assessment: GapAssessment,
         accounting: ResearchAccounting,
     ) -> ResearchIterationState:
-        prior_refs = {
-            source_ref
-            for prior_wave in state.waves[:-1]
-            for source_ref in prior_wave.unique_source_refs
-        }
-        new_refs = set(state.waves[-1].unique_source_refs) - prior_refs
         query_text_by_id = {
             query.query_id: normalize_query_text(query.text)
             for wave in state.waves
@@ -989,12 +1345,6 @@ class ResearchController:
             stop_reason=None,
         )
         if assessment.decision is ContinuationDecision.STOP_COVERED:
-            if not new_refs:
-                return ResearchController._replace_state(
-                    updated,
-                    phase=IterationPhase.STOPPED,
-                    stop_reason=StopReason.NO_MATERIAL_GAIN,
-                )
             return ResearchController._replace_state(
                 updated,
                 phase=IterationPhase.STOPPED,
@@ -1006,7 +1356,7 @@ class ResearchController:
                 phase=IterationPhase.STOPPED,
                 stop_reason=StopReason.NO_MATERIAL_GAIN,
             )
-        if not new_refs:
+        if not assessment.material_gain:
             return ResearchController._replace_state(
                 updated,
                 phase=IterationPhase.STOPPED,

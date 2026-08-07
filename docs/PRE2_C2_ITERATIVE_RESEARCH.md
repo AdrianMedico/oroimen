@@ -33,9 +33,11 @@ authorizes the proposal after local validation:
 - later planner requests carry prior source references, open gaps, and
   exhausted query/source identifiers;
 - a repeated normalized query is rejected before another search call;
-- continuation requires both remaining gaps and new evidence; a wave with
-  no new source evidence stops with `NO_MATERIAL_GAIN`;
-- `STOP_COVERED` requires no remaining gaps and new evidence.
+- continuation requires remaining gaps and an explicit material-gain
+  proposal from the assessment boundary; a new URL is only an evidence
+  frontier signal, not proof of semantic gain;
+- `STOP_COVERED` requires no remaining gaps and material gain, while an
+  explicit no-gain proposal deterministically stops with `NO_MATERIAL_GAIN`.
 
 ## Job bounds and STOP reasons
 
@@ -66,26 +68,33 @@ underlying wave executor retains its truthful `ALL_EMPTY`, `ALL_FAILED`, and
 
 1. `READY_TO_PLAN` before the planner call;
 2. `PLAN_PERSISTED` immediately after a validated plan and before search;
-3. `ASSESSMENT_PENDING` after the complete wave evidence is recorded; and
-4. terminal `STOPPED` after deterministic assessment or budget/cancellation.
+3. a bounded partial observation checkpoint after each completed query;
+4. `ASSESSMENT_PENDING` after the complete wave evidence is recorded; and
+5. terminal `STOPPED` after deterministic assessment or budget/cancellation.
 
 If execution is interrupted after `PLAN_PERSISTED`, recovery reuses that
-exact plan and does not call the planner again. If assessment is interrupted
-after `ASSESSMENT_PENDING`, recovery re-runs only the assessment boundary.
+exact plan and does not call the planner again. Completed query observations
+are resumed by ordinal, so a later-query cancellation does not repeat the
+earlier completed searches. If assessment is interrupted after
+`ASSESSMENT_PENDING`, recovery re-runs only the assessment boundary.
 Terminal states are idempotent reads and make no further planner, search, or
 assessment calls. Corrupt, mismatched, capability-drifted, or brief-drifted
 state fails closed.
 
-Each persisted source reference retains first-query provenance. Accounting is
-reconciled against the materialized waves and is explicitly local-call truth;
-it is not provider billing or spending truth.
+Each persisted source reference retains first-query provenance and is derived
+from observed evidence; provenance must be complete, and wave outcome must
+match the materialized observations. Signed/query-secret URLs are rejected at
+the durable boundary. Accounting is reconciled against materialized waves
+and partial observations and is explicitly local-call truth; it is not
+provider billing or spending truth.
 
 ## Evidence and nonclaims
 
 The deterministic tests use fakes and prove multiple waves, DIRECT versus
 DECOMPOSE persistence, multilingual-safe planner input, gap continuation,
-all STOP paths, cancellation, plan reuse, provenance, accounting, brief
-privacy, and corrupt-state rejection. They do not prove semantic planner
+all STOP paths, partial-query cancellation/recovery, provenance, accounting,
+brief privacy, bounded malformed iterables, and strict corrupt-state
+rejection. They do not prove semantic planner
 quality, search quality, live provider behavior, or multi-wave product
 runtime wiring. This slice introduces no public API expansion, no database
 schema migration, no deploy/release, no credentials, no PayGo/spending, and
