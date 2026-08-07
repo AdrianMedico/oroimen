@@ -753,6 +753,12 @@ class ResearchIterationState:
         ):
             _bounded_items(name, values)
         _bounded_items(
+            "exhausted_source_refs",
+            self.exhausted_source_refs,
+            max_items=MAX_SOURCES_PER_JOB,
+            max_chars=MAX_SOURCE_REF_CHARS,
+        )
+        _bounded_items(
             "source_refs",
             self.source_refs,
             max_items=MAX_SOURCES_PER_JOB,
@@ -1303,6 +1309,9 @@ class ResearchController:
                     )
                 except TimeoutError:
                     state = self._stop(assessment_state, StopReason.BUDGET_EXHAUSTED)
+                    break
+                if self._cancelled(cancellation):
+                    state = self._stop(assessment_state, StopReason.CANCELLED)
                     break
                 completed_assessment_state = self._replace_state(
                     assessment_state,

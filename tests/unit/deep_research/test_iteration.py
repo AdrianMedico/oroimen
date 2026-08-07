@@ -222,6 +222,7 @@ async def test_controller_runs_multiple_waves_and_preserves_original_brief(
     persisted = (tmp_path / "research_iterations" / f"{JOB_ID}.iteration.json").read_text(
         encoding="utf-8"
     )
+    path = tmp_path / "research_iterations" / f"{JOB_ID}.iteration.json"
     assert BRIEF not in persisted
     assert compute_research_brief_sha256(BRIEF) in persisted
 
@@ -231,6 +232,16 @@ async def test_controller_runs_multiple_waves_and_preserves_original_brief(
         json.dumps(persisted_payload),
         encoding="utf-8",
     )
+    with pytest.raises(IterationStateCorruptError):
+        store.load(JOB_ID)
+
+    store.write(JOB_ID, result.state)
+    persisted_payload = json.loads(path.read_text(encoding="utf-8"))
+    persisted_payload["exhausted_source_refs"] = [
+        result.state.source_refs[0],
+        result.state.source_refs[0],
+    ]
+    path.write_text(json.dumps(persisted_payload), encoding="utf-8")
     with pytest.raises(IterationStateCorruptError):
         store.load(JOB_ID)
 
@@ -277,6 +288,35 @@ async def test_cancellation_between_queries_stops_before_next_dispatch(
     assert result.state.stop_reason is StopReason.CANCELLED
     assert len(search.calls) == 1
     assert len(result.state.active_observations) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_assessment_wins_over_terminal_proposal(
+    tmp_path: Path,
+) -> None:
+    cancellation = _Cancellation()
+
+    def assess(_call: int, _state: Any, _wave: Any) -> GapAssessment:
+        cancellation.cancelled = True
+        return GapAssessment(
+            decision=ContinuationDecision.STOP_COVERED,
+            material_gain=True,
+        )
+
+    result = await _controller(
+        raw_planner=_RawPlanner([_payload("DIRECT", "cancel-assessment")]),
+        assessor=_ScriptedAssessor(assess),
+        store=LocalIterationStateStore(tmp_path),
+        search=_FakeSearch(),
+    ).run(
+        JOB_ID,
+        BRIEF,
+        limits=_limits(max_waves=1, max_searches=1, max_local_call_units=3),
+        cancellation=cancellation,
+    )
+
+    assert result.state.phase is IterationPhase.STOPPED
+    assert result.state.stop_reason is StopReason.CANCELLED
 
 
 @pytest.mark.asyncio

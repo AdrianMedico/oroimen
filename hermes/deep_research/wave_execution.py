@@ -17,6 +17,7 @@ from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlsplit
 
 from hermes.deep_research.planning import (
+    MAX_QUERY_CHARS,
     EvidenceItem,
     PlannedSearchQuery,
     SearchObservation,
@@ -134,6 +135,22 @@ def _safe_search_error(error: Any) -> bool:
             or (type(error.http_status) is int and 100 <= error.http_status <= 599)
         )
         and type(error.diagnostic_category) is SearchDiagnosticCategory
+    )
+
+
+def _valid_search_result_envelope(result: Any, expected_query: str) -> bool:
+    """Validate the exact provider result envelope before any branch uses it."""
+
+    if type(result) is not SearchResult:
+        return False
+    return (
+        type(result.backend_used) is str
+        and len(result.backend_used) <= MAX_BACKEND_CHARS
+        and type(result.query) is str
+        and len(result.query) <= MAX_QUERY_CHARS
+        and result.query == expected_query
+        and type(result.results) is list
+        and (result.error is None or _safe_search_error(result.error))
     )
 
 
@@ -398,9 +415,11 @@ class SearchWaveExecutor:
             )
 
         try:
+            if type(result) is SearchResult and not _valid_search_result_envelope(
+                result, query.text
+            ):
+                raise ValueError("malformed search result envelope")
             if type(result) is SearchResult and result.error is not None:
-                if not _safe_search_error(result.error):
-                    raise ValueError("malformed search error")
                 return (
                     self._observation(
                         wave_index=wave_index,

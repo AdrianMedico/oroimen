@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from typing import Any
 
 import pytest
@@ -127,6 +127,8 @@ class _FakeSearch:
         response = self.responses.pop(0)
         if isinstance(response, BaseException):
             raise response
+        if type(response) is SearchResult:
+            response = replace(response, query=query)
         return response
 
 
@@ -253,6 +255,25 @@ async def test_malformed_and_callable_failure_are_structured_and_continue() -> N
         "code": "search_callable_failed"
     }
     assert "secret" not in (result.observations[1].structured_error or "")
+
+
+@pytest.mark.asyncio
+async def test_malformed_search_result_envelope_is_structured() -> None:
+    class InvalidEnvelope:
+        async def __call__(self, **kwargs: Any) -> SearchResult:
+            return replace(
+                _result(["https://example.test/invalid"]),
+                query=kwargs["query"],
+                backend_used=[],
+            )
+
+    result = await SearchWaveExecutor(InvalidEnvelope()).execute(
+        _plan((_query(0, "invalid envelope"),))
+    )
+
+    assert json.loads(result.observations[0].structured_error or "{}") == {
+        "code": "malformed_result"
+    }
 
 
 @pytest.mark.asyncio
