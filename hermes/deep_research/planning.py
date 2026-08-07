@@ -292,6 +292,60 @@ class PlannedSearchQuery:
 
 
 @dataclass(frozen=True)
+class EvidenceItem:
+    """Bounded, sanitized evidence metadata retained for gap assessment."""
+
+    query_id: str
+    source_ref: str
+    title: str = ""
+    snippet: str = ""
+    digest: str = ""
+
+    def __post_init__(self) -> None:
+        for name, value, max_chars in (
+            ("query_id", self.query_id, 128),
+            ("source_ref", self.source_ref, 2_048),
+            ("title", self.title, 512),
+            ("snippet", self.snippet, 1_024),
+        ):
+            if (
+                not isinstance(value, str)
+                or len(value) > max_chars
+                or "\n" in value
+                or "\r" in value
+            ):
+                raise ValueError(f"{name} is not a bounded single-line string")
+        if not isinstance(self.digest, str) or len(self.digest) != 64 or not all(
+            char in "0123456789abcdef" for char in self.digest
+        ):
+            raise ValueError("digest must be a lowercase SHA-256 value")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "query_id": self.query_id,
+            "source_ref": self.source_ref,
+            "title": self.title,
+            "snippet": self.snippet,
+            "digest": self.digest,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> EvidenceItem:
+        _require_exact_keys(
+            payload,
+            {"query_id", "source_ref", "title", "snippet", "digest"},
+            "evidence item",
+        )
+        return cls(
+            query_id=_strict_str(payload, "query_id"),
+            source_ref=_strict_str(payload, "source_ref"),
+            title=_strict_str(payload, "title"),
+            snippet=_strict_str(payload, "snippet"),
+            digest=_strict_str(payload, "digest"),
+        )
+
+
+@dataclass(frozen=True)
 class SearchObservation:
     """Minimal observation shape for a planned query's execution.
 
@@ -313,6 +367,7 @@ class SearchObservation:
     structured_error: str | None = None
     attempt_count: int = 1
     duration_ms: int | None = None
+    evidence_items: tuple[EvidenceItem, ...] = ()
     # Bounded digests prove that evidence survived materialization without
     # persisting provider snippets/content or other untrusted payloads.
     evidence_digests: tuple[str, ...] = ()
@@ -336,6 +391,8 @@ class SearchObservation:
             raise ValueError("attempt_count must be an int")
         if self.attempt_count < 1:
             raise ValueError("attempt_count must be >= 1")
+        if not isinstance(self.local_usage, Mapping):
+            raise ValueError("local_usage must be a mapping")
         if not isinstance(self.evidence_digests, tuple):
             raise ValueError("evidence_digests must be a tuple")
         if len(self.evidence_digests) > 32:
@@ -347,6 +404,31 @@ class SearchObservation:
             for value in self.evidence_digests
         ):
             raise ValueError("evidence_digests must be lowercase SHA-256 values")
+        if not isinstance(self.evidence_items, tuple) or len(self.evidence_items) > 32:
+            raise ValueError("evidence_items must be a bounded tuple")
+        if not all(isinstance(item, EvidenceItem) for item in self.evidence_items):
+            raise ValueError("evidence_items must contain EvidenceItem values")
+        if self.evidence_items or self.evidence_digests:
+            if len(self.evidence_items) != len(self.result_refs):
+                raise ValueError("evidence_items must align with result refs")
+            if len(self.evidence_digests) != len(self.evidence_items):
+                raise ValueError("evidence_digests must align with evidence items")
+            if any(item.query_id != self.query_id for item in self.evidence_items):
+                raise ValueError("evidence item query provenance drifted")
+            if any(
+                item.source_ref != source_ref or item.digest != digest
+                for item, source_ref, digest in zip(
+                    self.evidence_items,
+                    self.result_refs,
+                    self.evidence_digests,
+                    strict=True,
+                )
+            ):
+                raise ValueError("evidence item provenance drifted")
+        if self.structured_error is not None and (
+            self.result_refs or self.evidence_items or self.evidence_digests
+        ):
+            raise ValueError("structured errors cannot carry evidence")
 
     def to_dict(self) -> dict[str, Any]:
         # ``local_usage`` may be a dict or a MappingProxyType. We
@@ -364,6 +446,7 @@ class SearchObservation:
             "structured_error": self.structured_error,
             "attempt_count": self.attempt_count,
             "duration_ms": self.duration_ms,
+            "evidence_items": [item.to_dict() for item in self.evidence_items],
             "evidence_digests": list(self.evidence_digests),
             "local_usage": usage_items,
         }
@@ -380,6 +463,7 @@ class SearchObservation:
                 "structured_error",
                 "attempt_count",
                 "duration_ms",
+                "evidence_items",
                 "evidence_digests",
                 "local_usage",
             },
@@ -387,6 +471,7 @@ class SearchObservation:
         )
         result_refs = payload["result_refs"]
         evidence_digests = payload["evidence_digests"]
+        evidence_items_raw = payload["evidence_items"]
         usage_items = payload["local_usage"]
         if not isinstance(result_refs, list) or not all(
             isinstance(value, str) for value in result_refs
@@ -396,6 +481,10 @@ class SearchObservation:
             isinstance(value, str) for value in evidence_digests
         ):
             raise ValueError("evidence_digests must be a list of strings")
+        if not isinstance(evidence_items_raw, list) or not all(
+            isinstance(value, Mapping) for value in evidence_items_raw
+        ):
+            raise ValueError("evidence_items must be a list of objects")
         if not isinstance(usage_items, list):
             raise ValueError("local_usage must be a list")
         usage: dict[str, Any] = {}
@@ -424,6 +513,9 @@ class SearchObservation:
             structured_error=structured_error,
             attempt_count=_strict_int(payload, "attempt_count"),
             duration_ms=duration_ms,
+            evidence_items=tuple(
+                EvidenceItem.from_dict(item) for item in evidence_items_raw
+            ),
             evidence_digests=tuple(evidence_digests),
             local_usage=usage,
         )
@@ -1210,6 +1302,7 @@ __all__ = [
     "MIN_QUERIES_PER_WAVE",
     "SCHEMA_VERSION",
     "CapabilitySnapshot",
+    "EvidenceItem",
     "PlannedSearchQuery",
     "PlanningLimits",
     "PlanningValidationError",

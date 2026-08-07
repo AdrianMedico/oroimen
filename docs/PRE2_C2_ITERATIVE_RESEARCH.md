@@ -82,14 +82,18 @@ truthful `CANCELLED` STOP. Planner and assessor dispatches follow the same
 rule. Terminal states are idempotent reads and make no further planner,
 search, or assessment calls. Corrupt, mismatched, capability-drifted, or
 brief-drifted state fails closed, including nested plan/observation fields and
-phase/accounting equations.
+phase/accounting equations. The assessor boundary is async and cancellable;
+search results accept only concrete list/tuple containers, so an arbitrary
+synchronous iterator cannot survive a job deadline as a background worker.
 
 Each persisted source reference retains first-query provenance and is derived
 from observed evidence; provenance must be complete, and wave outcome must
-match the materialized observations. Each bounded evidence item is represented
-by a digest tied to its source/query observation; raw provider snippets and
-content are not persisted. Signed/query-secret URLs, query strings, and URL
-fragments are rejected before checkpointing. Accounting counts planner,
+match the materialized observations. Each bounded evidence item includes a
+sanitized title/snippet plus a digest tied to its source/query observation;
+raw provider content beyond those caps is not persisted. Coverage requires
+substantive bounded evidence, not merely a new URL or opaque digest.
+Signed/query-secret URLs, query strings, and URL fragments are rejected before
+checkpointing. Accounting counts planner,
 search, and assessment dispatches before the call boundary and is explicitly
 local-call truth; it is not provider billing or spending truth.
 

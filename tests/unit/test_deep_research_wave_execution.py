@@ -320,23 +320,20 @@ async def test_malformed_results_accessor_is_structured_and_wave_continues() -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("terminal", [asyncio.CancelledError, SystemExit])
-async def test_terminal_iterable_semantics_are_not_swallowed(terminal: type[BaseException]) -> None:
+async def test_arbitrary_iterables_are_bounded_as_malformed() -> None:
     class TerminalRows:
         backend_used = "terminal"
 
         @property
         def results(self):
-            def rows():
-                raise terminal()
-                yield {"url": "https://never.test"}
+            return ({"url": "https://never.test"} for _ in range(1))
 
-            return rows()
-
-    with pytest.raises(terminal):
-        await SearchWaveExecutor(_FakeSearch([TerminalRows()])).execute(
-            _plan((_query(0, "terminal"),))
-        )
+    result = await SearchWaveExecutor(_FakeSearch([TerminalRows()])).execute(
+        _plan((_query(0, "terminal"),))
+    )
+    assert json.loads(result.observations[0].structured_error or "{}") == {
+        "code": "malformed_result"
+    }
 
 
 @pytest.mark.asyncio
@@ -348,6 +345,18 @@ async def test_cancellation_is_not_swallowed_as_search_failure() -> None:
     with pytest.raises(asyncio.CancelledError):
         await SearchWaveExecutor(CancelledSearch()).execute(
             _plan((_query(0, "cancelled"),))
+        )
+
+
+@pytest.mark.asyncio
+async def test_system_exit_is_not_swallowed_as_search_failure() -> None:
+    class ExitingSearch:
+        async def __call__(self, **_: Any) -> SearchResult:
+            raise SystemExit
+
+    with pytest.raises(SystemExit):
+        await SearchWaveExecutor(ExitingSearch()).execute(
+            _plan((_query(0, "system exit"),))
         )
 
 

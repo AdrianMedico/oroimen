@@ -13,11 +13,10 @@ idempotent checkpoints, and terminal STOP reasons.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import re
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
@@ -433,7 +432,7 @@ class WaveRecord:
                 raise ValueError("observation result refs exceed the per-query cap")
             if len(observation.evidence_digests) != len(observation.result_refs):
                 raise ValueError("observation evidence must align with source refs")
-            if observation.local_usage.get("search_calls") != 1:
+            if dict(observation.local_usage) != {"search_calls": 1}:
                 raise ValueError("observation accounting must report one search call")
             if not all(
                 isinstance(source_ref, str)
@@ -675,6 +674,11 @@ class ResearchIterationState:
             )
             if len(self.active_observations) > len(ordered_queries):
                 raise ValueError("partial observations exceed the active plan")
+            if any(
+                dict(observation.local_usage) != {"search_calls": 1}
+                for observation in self.active_observations
+            ):
+                raise ValueError("partial observation accounting is not exact")
             expected_active_ids = tuple(
                 query.query_id
                 for query in ordered_queries[: len(self.active_observations)]
@@ -819,6 +823,32 @@ class ResearchIterationState:
             raise ValueError("planner accounting is incompatible with iteration phase")
         if self.accounting.assessment_calls != expected_assessment_calls:
             raise ValueError("assessment accounting is incompatible with iteration phase")
+        if self.phase is IterationPhase.STOPPED:
+            in_flight_modes = sum(
+                (
+                    self.planning_inflight,
+                    self.assessment_inflight,
+                    self.active_inflight_query_id is not None,
+                )
+            )
+            if in_flight_modes > 1:
+                raise ValueError("stopped state cannot contain multiple in-flight calls")
+            if self.planning_inflight and self.active_plan is not None:
+                raise ValueError("planner in-flight state cannot contain an active plan")
+            if self.assessment_inflight and (
+                not self.waves
+                or self.active_plan is not None
+                or self.active_observations
+                or self.active_source_refs
+                or self.active_source_query_ids
+            ):
+                raise ValueError("assessment in-flight state cannot lack a completed wave")
+            if self.active_inflight_query_id is not None and (
+                self.active_plan is None
+                or self.planning_inflight
+                or self.assessment_inflight
+            ):
+                raise ValueError("query in-flight state must own the active plan")
         object.__setattr__(self, "source_query_ids", MappingProxyType(dict(self.source_query_ids)))
         object.__setattr__(
             self,
@@ -986,6 +1016,10 @@ class IterationStateStore(Protocol):
 
     def write(self, job_id: str, state: ResearchIterationState) -> None: ...
 
+    def claim(self, job_id: str) -> None: ...
+
+    def release(self, job_id: str) -> None: ...
+
 
 class CancellationProbe(Protocol):
     def is_cancelled(self) -> bool: ...
@@ -996,13 +1030,13 @@ class SemanticWavePlanner(Protocol):
 
 
 class GapAssessor(Protocol):
-    def assess(
+    async def assess(
         self,
         *,
         research_brief: str,
         state: ResearchIterationState,
         wave: WaveRecord,
-    ) -> GapAssessment | Awaitable[GapAssessment]: ...
+    ) -> GapAssessment: ...
 
 
 @dataclass(frozen=True)
@@ -1037,6 +1071,34 @@ class ResearchController:
         )
 
     async def run(
+        self,
+        job_id: str,
+        research_brief: str,
+        *,
+        limits: IterationLimits,
+        cancellation: CancellationProbe | None = None,
+    ) -> ResearchRunResult:
+        claim = getattr(self._state_store, "claim", None)
+        release = getattr(self._state_store, "release", None)
+        if claim is None or release is None:
+            return await self._run_claimed(
+                job_id,
+                research_brief,
+                limits=limits,
+                cancellation=cancellation,
+            )
+        claim(job_id)
+        try:
+            return await self._run_claimed(
+                job_id,
+                research_brief,
+                limits=limits,
+                cancellation=cancellation,
+            )
+        finally:
+            release(job_id)
+
+    async def _run_claimed(
         self,
         job_id: str,
         research_brief: str,
@@ -1211,21 +1273,13 @@ class ResearchController:
                 self._state_store.write(job_id, assessment_state)
                 try:
                     proposal = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            self._assessor.assess,
+                        self._assessor.assess(
                             research_brief=research_brief,
                             state=assessment_state,
                             wave=wave,
                         ),
                         timeout=self._remaining_seconds(assessment_state, limits),
                     )
-                    if inspect.isawaitable(proposal):
-                        assessment = await asyncio.wait_for(
-                            proposal,
-                            timeout=self._remaining_seconds(assessment_state, limits),
-                        )
-                    else:
-                        assessment = proposal
                 except TimeoutError:
                     state = self._stop(assessment_state, StopReason.BUDGET_EXHAUSTED)
                     break
@@ -1234,10 +1288,10 @@ class ResearchController:
                     phase=IterationPhase.READY_TO_PLAN,
                     assessment_inflight=False,
                 )
-                self._validate_assessment(assessment, completed_assessment_state, wave)
+                self._validate_assessment(proposal, completed_assessment_state, wave)
                 state = self._apply_assessment(
                     completed_assessment_state,
-                    assessment,
+                    proposal,
                     completed_assessment_state.accounting,
                 )
                 self._state_store.write(job_id, state)
@@ -1365,7 +1419,7 @@ class ResearchController:
             raise IterationInvariantError("executor returned too many observations")
         if observation.query_id != ordered_queries[next_ordinal].query_id:
             raise IterationInvariantError("executor observation order drifted")
-        if observation.local_usage.get("search_calls") != 1:
+        if dict(observation.local_usage) != {"search_calls": 1}:
             raise IterationInvariantError("executor observation accounting drifted")
         if state.active_inflight_query_id != observation.query_id:
             raise IterationInvariantError("observation has no matching dispatched query")
@@ -1519,7 +1573,11 @@ class ResearchController:
             for previous_wave in state.waves[:-1]
             for digest in previous_wave.evidence_digests
         }
-        return bool(set(wave.evidence_digests) - prior_digests)
+        return any(
+            item.digest not in prior_digests and (item.title or item.snippet)
+            for observation in wave.observations
+            for item in observation.evidence_items
+        )
 
     @staticmethod
     def _apply_assessment(

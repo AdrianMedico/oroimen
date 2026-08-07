@@ -7,7 +7,6 @@ globally deduplicated source references with first-query provenance.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import time
@@ -19,6 +18,7 @@ from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlsplit
 
 from hermes.deep_research.planning import (
+    EvidenceItem,
     PlannedSearchQuery,
     SearchObservation,
     SearchPlan,
@@ -153,19 +153,34 @@ def _evidence_digest(raw_row: Any, normalized_url: str) -> str:
     ).hexdigest()
 
 
+def _bounded_text(raw_row: Any, key: str, max_chars: int) -> str:
+    if not isinstance(raw_row, dict):
+        return ""
+    value = raw_row.get(key)
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:max_chars]
+
+
 def _candidate_urls(
     result: Any,
-) -> tuple[tuple[tuple[str, str], ...], str | None] | None:
+) -> tuple[tuple[tuple[str, str, str, str], ...], str | None] | None:
     extracted = _rows(result)
     if extracted is None:
         return None
     raw_rows, backend = extracted
+    # A concrete list/tuple is already bounded by the provider boundary. An
+    # arbitrary synchronous iterator cannot be preempted safely in-process;
+    # reject it as malformed so a job deadline cannot leave an unbounded
+    # worker behind.
+    if type(raw_rows) not in (list, tuple):
+        return None
     try:
         iterator = iter(raw_rows)
     except Exception:
         return None
 
-    refs: list[tuple[str, str]] = []
+    refs: list[tuple[str, str, str, str]] = []
     try:
         for index, row in enumerate(iterator):
             if index >= MAX_RESULT_ROWS:
@@ -181,7 +196,14 @@ def _candidate_urls(
                 raw_url = row.get("url")
             normalized = _normalize_url(raw_url)
             if normalized is not None:
-                refs.append((normalized, _evidence_digest(row, normalized)))
+                refs.append(
+                    (
+                        normalized,
+                        _evidence_digest(row, normalized),
+                        _bounded_text(row, "title", 512),
+                        _bounded_text(row, "snippet", 1_024),
+                    )
+                )
     except Exception:
         return None
     return tuple(refs), backend
@@ -344,9 +366,7 @@ class SearchWaveExecutor:
                 (),
             )
 
-        # Materialization runs off the event loop so the controller's
-        # asyncio deadline also covers hostile/slow arbitrary iterables.
-        candidates = await asyncio.to_thread(_candidate_urls, result)
+        candidates = _candidate_urls(result)
         if candidates is None:
             return (
                 self._observation(
@@ -358,14 +378,27 @@ class SearchWaveExecutor:
                 (),
             )
         candidates_with_digests, backend = candidates
-        refs = tuple(ref for ref, _digest in candidates_with_digests)
-        evidence_digests = tuple(digest for _ref, digest in candidates_with_digests)
+        refs = tuple(ref for ref, _digest, _title, _snippet in candidates_with_digests)
+        evidence_digests = tuple(
+            digest for _ref, digest, _title, _snippet in candidates_with_digests
+        )
+        evidence_items = tuple(
+            EvidenceItem(
+                query_id=query.query_id,
+                source_ref=ref,
+                title=title,
+                snippet=snippet,
+                digest=digest,
+            )
+            for ref, digest, title, snippet in candidates_with_digests
+        )
         return (
             self._observation(
                 wave_index=wave_index,
                 query_id=query.query_id,
                 backend=backend,
                 result_refs=refs,
+                evidence_items=evidence_items,
                 evidence_digests=evidence_digests,
                 duration_ms=self._duration_ms(started),
             ),
@@ -383,6 +416,7 @@ class SearchWaveExecutor:
         query_id: str,
         backend: str | None = None,
         result_refs: tuple[str, ...] = (),
+        evidence_items: tuple[EvidenceItem, ...] = (),
         evidence_digests: tuple[str, ...] = (),
         structured_error: str | None = None,
         duration_ms: int | None = None,
@@ -395,6 +429,7 @@ class SearchWaveExecutor:
             structured_error=structured_error,
             attempt_count=1,
             duration_ms=duration_ms,
+            evidence_items=evidence_items,
             evidence_digests=evidence_digests,
             local_usage={"search_calls": 1},
         )

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +20,7 @@ from hermes.deep_research.iteration import (
     StopReason,
 )
 from hermes.deep_research.iteration_store import (
+    IterationStateBusyError,
     IterationStateCorruptError,
     LocalIterationStateStore,
 )
@@ -99,7 +99,13 @@ class _FakeSearch:
             results=(
                 []
                 if self.empty
-                else [{"url": f"https://sources.test/evidence/{ordinal}"}]
+                else [
+                    {
+                        "url": f"https://sources.test/evidence/{ordinal}",
+                        "title": f"Evidence title {ordinal}",
+                        "snippet": f"Bounded evidence snippet for {query}",
+                    }
+                ]
             ),
             backend_used="fake",
             query=query,
@@ -116,7 +122,9 @@ class _ScriptedAssessor:
         self.callback = callback
         self.calls: list[Any] = []
 
-    def assess(self, *, research_brief: str, state: Any, wave: Any) -> GapAssessment:
+    async def assess(
+        self, *, research_brief: str, state: Any, wave: Any
+    ) -> GapAssessment:
         del research_brief
         self.calls.append((state, wave))
         return self.callback(len(self.calls), state, wave)
@@ -479,8 +487,8 @@ async def test_stop_reasons_cover_budget_no_progress_and_cooperative_cancel(
     assert timed_result.state.active_inflight_query_id is not None
 
     class _SlowAssessor:
-        def assess(self, **_: Any) -> GapAssessment:
-            time.sleep(0.1)
+        async def assess(self, **_: Any) -> GapAssessment:
+            await asyncio.sleep(0.1)
             return GapAssessment(
                 decision=ContinuationDecision.STOP_NO_MATERIAL_GAIN,
                 material_gain=False,
@@ -506,38 +514,6 @@ async def test_stop_reasons_cover_budget_no_progress_and_cooperative_cancel(
     assert slow_assessor_result.state.stop_reason is StopReason.BUDGET_EXHAUSTED
     assert slow_assessor_result.state.accounting.assessment_calls == 1
     assert slow_assessor_result.state.assessment_inflight is True
-
-    class _BlockingRows:
-        def __iter__(self):
-            time.sleep(0.05)
-            return iter([{"url": "https://sources.test/blocking"}])
-
-    class _BlockingIterableSearch(_FakeSearch):
-        async def __call__(self, **kwargs: Any) -> SearchResult:
-            del kwargs
-            return SearchResult(
-                results=_BlockingRows(),  # type: ignore[arg-type]
-                backend_used="fake",
-                query="blocking",
-                content_mode="snippet",
-                original_content_mode="snippet",
-                format_fallback=False,
-                size_guard_chars=200_000,
-                truncated=False,
-            )
-
-    blocking_result = await _controller(
-        raw_planner=_RawPlanner([_payload("DIRECT", "blocking iterable")]),
-        assessor=elapsed_assessor,
-        store=LocalIterationStateStore(tmp_path / "blocking-iterable"),
-        search=_BlockingIterableSearch(),
-    ).run(
-        JOB_ID,
-        BRIEF,
-        limits=_limits(max_waves=1, max_searches=1, max_elapsed_ms=5),
-    )
-    assert blocking_result.state.stop_reason is StopReason.BUDGET_EXHAUSTED
-    assert blocking_result.state.active_inflight_query_id is not None
 
     cancelled = _Cancellation(cancelled=True)
     cancel_assessor = _ScriptedAssessor(
@@ -670,3 +646,25 @@ def test_iteration_state_store_is_atomic_and_fail_closed(tmp_path: Path) -> None
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(IterationStateCorruptError):
         store.load(JOB_ID)
+
+    store.write(JOB_ID, valid_state)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["phase"] = "stopped"
+    payload["stop_reason"] = "cancelled"
+    payload["assessment_inflight"] = True
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(IterationStateCorruptError):
+        store.load(JOB_ID)
+
+
+def test_iteration_state_store_claim_prevents_concurrent_coordinators(
+    tmp_path: Path,
+) -> None:
+    first = LocalIterationStateStore(tmp_path)
+    second = LocalIterationStateStore(tmp_path)
+    first.claim(JOB_ID)
+    with pytest.raises(IterationStateBusyError):
+        second.claim(JOB_ID)
+    first.release(JOB_ID)
+    second.claim(JOB_ID)
+    second.release(JOB_ID)
