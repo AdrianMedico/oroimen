@@ -121,7 +121,9 @@ class LocalIterationStateStore:
                     handle.flush()
                 handle.seek(0)
                 if msvcrt is not None:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    msvcrt.locking(  # type: ignore[attr-defined, unused-ignore]
+                        handle.fileno(), msvcrt.LK_NBLCK, 1  # type: ignore[attr-defined, unused-ignore]
+                    )
                 elif fcntl is not None:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
@@ -139,7 +141,9 @@ class LocalIterationStateStore:
             try:
                 if msvcrt is not None:
                     handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    msvcrt.locking(  # type: ignore[attr-defined, unused-ignore]
+                        handle.fileno(), msvcrt.LK_UNLCK, 1  # type: ignore[attr-defined, unused-ignore]
+                    )
                 elif fcntl is not None:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             finally:
