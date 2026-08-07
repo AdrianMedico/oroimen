@@ -1,4 +1,4 @@
-"""Tests for the PRE2-C1A plan store (hermes.jobs.plan_store).
+"""Tests for the PRE2-C1A plan store (hermes.deep_research.plan_store).
 
 These tests cover the public surface of the local plan store:
 
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes.jobs.plan_store import (
+from hermes.deep_research.plan_store import (
     ENVELOPE_VERSION,
     PLAN_FILE_SUFFIX,
     PLANS_SUBDIR,
@@ -34,7 +34,7 @@ from hermes.jobs.plan_store import (
     PlanNotFoundError,
     PlanSchemaMismatchError,
 )
-from hermes.jobs.planning import (
+from hermes.deep_research.planning import (
     MAX_QUERIES_PER_WAVE,
     MAX_QUERY_CHARS,
     SCHEMA_VERSION,
@@ -441,7 +441,7 @@ def test_store_does_not_import_orm_or_db_modules() -> None:
     # The store is filesystem-only. Catching accidental imports
     # of the SQLAlchemy / DB / HTTP / LLM-router modules is a
     # cheap regression guard.
-    import hermes.jobs.plan_store as mod
+    import hermes.deep_research.plan_store as mod
 
     src = Path(mod.__file__).read_text(encoding="utf-8")
     forbidden = [

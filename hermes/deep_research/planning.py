@@ -69,11 +69,16 @@ MAX_QUERY_CHARS: Final[int] = 399
 #: extended to permit them.
 ALLOWED_WAVE_INDICES: Final[frozenset[int]] = frozenset({0})
 
-#: Planner kinds known to the C1A validator. C1A ships the deterministic
-#: stub only; LLM-backed planner kinds (added in C1B) will be added to
-#: this set in a future slice. The set is closed for C1A; an unknown
-#: planner kind fails validation.
-KNOWN_PLANNER_KINDS: Final[frozenset[str]] = frozenset({"c1a-deterministic-stub"})
+#: Planner kinds known to the planning validator. C1A's deterministic
+#: foundation remains available as a control; C1B adds provider-neutral
+#: direct and structured-planner seams without selecting a provider.
+KNOWN_PLANNER_KINDS: Final[frozenset[str]] = frozenset(
+    {
+        "c1a-deterministic-stub",
+        "c1b-direct",
+        "c1b-llm-structured",
+    }
+)
 
 #: Regex for a bounded planner version string. Allows ``MAJOR.MINOR.PATCH``
 #: with optional pre-release tag (lowercase alnum + dot + hyphen). Kept
@@ -329,17 +334,17 @@ class CapabilitySnapshot:
     byte-equal the snapshot the caller expects (fail-closed on
     capability drift).
 
-    The shape is intentionally narrow in C1A: only the planner kind,
-    planner version, and planning limits. Future slices may add
-    additional capability fields (backend allow-list, provider model
-    provenance, daily budget residue, etc.) by extending this
-    dataclass; the JSON keys are stable.
+    The shape is intentionally narrow: planner kind/version and planning
+    limits, plus an optional bounded provider/model/version descriptor.
+    The provenance field is omitted from C1A serialization when empty so
+    existing C1A artifacts retain their byte shape.
     """
 
     planner_kind: str
     planner_version: str
     max_queries_per_wave: int
     max_query_chars: int
+    planner_provenance: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.planner_kind, str) or not self.planner_kind:
@@ -373,14 +378,36 @@ class CapabilitySnapshot:
             or self.max_query_chars < 1
         ):
             raise ValueError("max_query_chars must be a positive int")
+        if not isinstance(self.planner_provenance, Mapping):
+            raise ValueError("planner_provenance must be a mapping")
+        allowed_keys = {"provider", "model", "version"}
+        unknown_keys = set(self.planner_provenance) - allowed_keys
+        if unknown_keys:
+            raise ValueError(
+                "planner_provenance contains unsupported keys: "
+                + ",".join(sorted(str(key) for key in unknown_keys))
+            )
+        for key, value in self.planner_provenance.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError("planner_provenance keys must be non-empty strings")
+            if not isinstance(value, str) or not value or "\n" in value or "\r" in value:
+                raise ValueError(
+                    "planner_provenance values must be non-empty single-line strings"
+                )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "planner_kind": self.planner_kind,
             "planner_version": self.planner_version,
             "max_queries_per_wave": self.max_queries_per_wave,
             "max_query_chars": self.max_query_chars,
         }
+        if self.planner_provenance:
+            payload["planner_provenance"] = {
+                key: self.planner_provenance[key]
+                for key in sorted(self.planner_provenance)
+            }
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> CapabilitySnapshot:
@@ -389,6 +416,10 @@ class CapabilitySnapshot:
             planner_version=str(payload["planner_version"]),
             max_queries_per_wave=int(payload["max_queries_per_wave"]),
             max_query_chars=int(payload["max_query_chars"]),
+            planner_provenance={
+                str(key): str(value)
+                for key, value in dict(payload.get("planner_provenance", {})).items()
+            },
         )
 
 
@@ -877,7 +908,7 @@ def serialize_search_plan(plan: SearchPlan) -> bytes:
     staying strict UTF-8.
 
     The store wraps this in a versioned envelope (see
-    ``hermes.jobs.plan_store``).
+    ``hermes.deep_research.plan_store``).
     """
     payload = {
         "schema_version": plan.schema_version,

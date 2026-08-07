@@ -42,7 +42,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Final
 
-from hermes.jobs.planning import (
+from hermes.deep_research.planning import (
     SCHEMA_VERSION,
     CapabilitySnapshot,
     SearchPlan,

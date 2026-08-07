@@ -1,4 +1,4 @@
-"""Tests for the PRE2-C1A planning domain (hermes.jobs.planning).
+"""Tests for the PRE2-C1A planning domain (hermes.deep_research.planning).
 
 These tests cover the public surface of the planning foundation:
 
@@ -19,7 +19,7 @@ from collections.abc import Mapping
 
 import pytest
 
-from hermes.jobs.planning import (
+from hermes.deep_research.planning import (
     ALLOWED_WAVE_INDICES,
     KNOWN_PLANNER_KINDS,
     MAX_QUERIES_PER_WAVE,
@@ -504,10 +504,10 @@ def test_search_plan_has_no_nested_plan_field() -> None:
 
 
 def test_planner_kind_constant_is_closed_for_c1a() -> None:
-    # C1A ships the deterministic stub only. A future slice that
-    # adds LLM-backed planner kinds must update both the constant
-    # and this test.
-    assert frozenset({"c1a-deterministic-stub"}) == KNOWN_PLANNER_KINDS
+    # C1B retains the C1A control and adds provider-neutral planner seams.
+    assert frozenset(
+        {"c1a-deterministic-stub", "c1b-direct", "c1b-llm-structured"}
+    ) == KNOWN_PLANNER_KINDS
 
 
 def test_planning_limits_rejects_out_of_band_values() -> None:
