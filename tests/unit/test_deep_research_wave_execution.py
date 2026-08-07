@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from typing import Any
 
 import pytest
@@ -127,6 +127,8 @@ class _FakeSearch:
         response = self.responses.pop(0)
         if isinstance(response, BaseException):
             raise response
+        if type(response) is SearchResult:
+            response = replace(response, query=query)
         return response
 
 
@@ -193,6 +195,9 @@ async def test_url_normalization_rejects_userinfo_and_scheme_relative_urls() -> 
                 [
                     "https://user:password@example.test/private",
                     "//example.test/scheme-relative",
+                    "https://example.test/password?password=secret",
+                    "https://example.test/session#access_token=secret",
+                    "https://example.test/jwt?jwt=secret",
                     "https://example.test/accepted",
                 ]
             )
@@ -253,6 +258,25 @@ async def test_malformed_and_callable_failure_are_structured_and_continue() -> N
 
 
 @pytest.mark.asyncio
+async def test_malformed_search_result_envelope_is_structured() -> None:
+    class InvalidEnvelope:
+        async def __call__(self, **kwargs: Any) -> SearchResult:
+            return replace(
+                _result(["https://example.test/invalid"]),
+                query=kwargs["query"],
+                backend_used=[],
+            )
+
+    result = await SearchWaveExecutor(InvalidEnvelope()).execute(
+        _plan((_query(0, "invalid envelope"),))
+    )
+
+    assert json.loads(result.observations[0].structured_error or "{}") == {
+        "code": "malformed_result"
+    }
+
+
+@pytest.mark.asyncio
 async def test_iterable_materialization_failure_is_malformed_and_wave_continues() -> None:
     class ExplodingRows:
         backend_used = "malformed"
@@ -277,6 +301,26 @@ async def test_iterable_materialization_failure_is_malformed_and_wave_continues(
 
 
 @pytest.mark.asyncio
+async def test_oversized_iterable_is_bounded_and_malformed() -> None:
+    class OversizedRows:
+        backend_used = "malformed"
+
+        @property
+        def results(self):
+            return ({"url": f"https://oversized.test/{index}"} for index in range(10_000))
+
+    result = await SearchWaveExecutor(_FakeSearch([OversizedRows()])).execute(
+        _plan((_query(0, "oversized iterable"),))
+    )
+
+    assert json.loads(result.observations[0].structured_error or "{}") == {
+        "code": "malformed_result"
+    }
+    assert result.unique_source_refs == ()
+    assert result.outcome == WaveExecutionOutcome.ALL_FAILED
+
+
+@pytest.mark.asyncio
 async def test_malformed_results_accessor_is_structured_and_wave_continues() -> None:
     class AccessorError:
         backend_used = "malformed"
@@ -297,23 +341,55 @@ async def test_malformed_results_accessor_is_structured_and_wave_continues() -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("terminal", [asyncio.CancelledError, SystemExit])
-async def test_terminal_iterable_semantics_are_not_swallowed(terminal: type[BaseException]) -> None:
+async def test_blocking_result_accessors_are_rejected_without_invocation() -> None:
+    class BlockingResult:
+        @property
+        def results(self):
+            raise AssertionError("blocking result accessor must not run")
+
+        @property
+        def backend_used(self):
+            raise AssertionError("blocking backend accessor must not run")
+
+    class BlockingRow(dict[str, str]):
+        def get(self, *_: Any, **__: Any) -> str:
+            raise AssertionError("blocking row accessor must not run")
+
+    blocking_search_result = SearchResult(
+        results=[BlockingRow(url="https://never.test")],
+        backend_used="fake",
+        query="blocking row",
+        content_mode="snippet",
+        original_content_mode="snippet",
+        format_fallback=False,
+        size_guard_chars=200000,
+        truncated=False,
+    )
+    result = await SearchWaveExecutor(
+        _FakeSearch([BlockingResult(), blocking_search_result])
+    ).execute(_plan((_query(0, "bad accessor"), _query(1, "bad row"))))
+
+    assert all(
+        json.loads(observation.structured_error or "{}") == {"code": "malformed_result"}
+        for observation in result.observations
+    )
+
+
+@pytest.mark.asyncio
+async def test_arbitrary_iterables_are_bounded_as_malformed() -> None:
     class TerminalRows:
         backend_used = "terminal"
 
         @property
         def results(self):
-            def rows():
-                raise terminal()
-                yield {"url": "https://never.test"}
+            return ({"url": "https://never.test"} for _ in range(1))
 
-            return rows()
-
-    with pytest.raises(terminal):
-        await SearchWaveExecutor(_FakeSearch([TerminalRows()])).execute(
-            _plan((_query(0, "terminal"),))
-        )
+    result = await SearchWaveExecutor(_FakeSearch([TerminalRows()])).execute(
+        _plan((_query(0, "terminal"),))
+    )
+    assert json.loads(result.observations[0].structured_error or "{}") == {
+        "code": "malformed_result"
+    }
 
 
 @pytest.mark.asyncio
@@ -325,6 +401,18 @@ async def test_cancellation_is_not_swallowed_as_search_failure() -> None:
     with pytest.raises(asyncio.CancelledError):
         await SearchWaveExecutor(CancelledSearch()).execute(
             _plan((_query(0, "cancelled"),))
+        )
+
+
+@pytest.mark.asyncio
+async def test_system_exit_is_not_swallowed_as_search_failure() -> None:
+    class ExitingSearch:
+        async def __call__(self, **_: Any) -> SearchResult:
+            raise SystemExit
+
+    with pytest.raises(SystemExit):
+        await SearchWaveExecutor(ExitingSearch()).execute(
+            _plan((_query(0, "system exit"),))
         )
 
 

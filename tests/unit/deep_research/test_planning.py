@@ -25,14 +25,17 @@ from hermes.deep_research.planning import (
     KNOWN_PLANNING_DECISIONS,
     MAX_QUERIES_PER_WAVE,
     MAX_QUERY_CHARS,
+    MAX_WAVES_PER_JOB,
     SCHEMA_VERSION,
     CapabilitySnapshot,
+    EvidenceItem,
     PlannedSearchQuery,
     PlanningLimits,
     PlanningValidationError,
     SearchObservation,
     SearchPlan,
     build_search_plan,
+    compute_evidence_digest,
     compute_query_id,
     compute_research_brief_sha256,
     deserialize_search_plan,
@@ -40,6 +43,23 @@ from hermes.deep_research.planning import (
     serialize_search_plan,
     validate_search_plan,
 )
+
+
+def test_evidence_digest_binds_persisted_fields() -> None:
+    item = EvidenceItem(
+        query_id="q-123",
+        source_ref="https://example.test/report",
+        title="Original title",
+        snippet="Original snippet",
+        digest=compute_evidence_digest(
+            "https://example.test/report", "Original title", "Original snippet"
+        ),
+    )
+    tampered = item.to_dict()
+    tampered["snippet"] = "Altered snippet"
+
+    with pytest.raises(ValueError, match="digest does not match"):
+        EvidenceItem.from_dict(tampered)
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
@@ -322,13 +342,13 @@ def test_unsupported_schema_version_is_invalid() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (13) unsupported C1A wave index invalid
+# (13) unsupported wave index invalid
 # ---------------------------------------------------------------------------
 
 
 def test_unsupported_wave_index_is_invalid() -> None:
-    q = _make_query(0, wave_index=1)
-    plan = _make_plan((q,), wave_index=1)
+    q = _make_query(0, wave_index=MAX_WAVES_PER_JOB)
+    plan = _make_plan((q,), wave_index=MAX_WAVES_PER_JOB)
     with pytest.raises(PlanningValidationError) as excinfo:
         validate_search_plan(plan, expected_research_brief_sha256="f" * 64)
     names = {name for name, _ in excinfo.value.violations}
@@ -336,10 +356,7 @@ def test_unsupported_wave_index_is_invalid() -> None:
 
 
 def test_wave_index_constants_match_c1a_contract() -> None:
-    # C1A only permits wave_index == 0. This test documents that
-    # contract; a future slice that adds wave_index > 0 must update
-    # both the constant and this test.
-    assert frozenset({0}) == ALLOWED_WAVE_INDICES
+    assert frozenset(range(MAX_WAVES_PER_JOB)) == ALLOWED_WAVE_INDICES
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +712,7 @@ def test_observation_post_init_validates_wave_index() -> None:
     obs = SearchObservation(wave_index=0, query_id="q-abc")
     assert obs.wave_index == 0
     with pytest.raises(ValueError):
-        SearchObservation(wave_index=5, query_id="q-abc")
+        SearchObservation(wave_index=MAX_WAVES_PER_JOB, query_id="q-abc")
 
 
 def test_observation_serialization_roundtrip() -> None:
@@ -703,10 +720,22 @@ def test_observation_serialization_roundtrip() -> None:
         wave_index=0,
         query_id="q-abc",
         backend="tavily",
-        result_refs=("https://a", "https://b"),
+        result_refs=("https://a",),
         structured_error=None,
         attempt_count=1,
         duration_ms=250,
+        evidence_items=(
+            EvidenceItem(
+                query_id="q-abc",
+                source_ref="https://a",
+                title="Evidence",
+                snippet="Snippet",
+                digest=compute_evidence_digest("https://a", "Evidence", "Snippet"),
+            ),
+        ),
+        evidence_digests=(
+            compute_evidence_digest("https://a", "Evidence", "Snippet"),
+        ),
         local_usage={"tokens": 100, "model": "tavily-fast"},
     )
     payload = obs.to_dict()
@@ -715,6 +744,34 @@ def test_observation_serialization_roundtrip() -> None:
     assert payload["local_usage"] == sorted(payload["local_usage"])
     reloaded = SearchObservation.from_dict(payload)
     assert reloaded == obs
+
+    with pytest.raises(ValueError, match="align with result refs"):
+        SearchObservation(wave_index=0, query_id="q-abc", result_refs=("https://a",))
+
+
+def test_persisted_nested_shapes_fail_closed_without_coercion() -> None:
+    brief_sha = compute_research_brief_sha256("strict nested plan")
+    plan = _make_plan(
+        (_make_query(0, text="strict nested query", brief_sha=brief_sha),),
+        brief_sha=brief_sha,
+    )
+    payload = json.loads(serialize_search_plan(plan).decode("utf-8"))
+
+    bad_plan = dict(payload)
+    bad_plan["wave_index"] = "0"
+    with pytest.raises(ValueError):
+        deserialize_search_plan(json.dumps(bad_plan).encode("utf-8"))
+
+    bad_query = json.loads(json.dumps(payload))
+    bad_query["queries"][0]["ordinal"] = "0"
+    with pytest.raises(ValueError):
+        deserialize_search_plan(json.dumps(bad_query).encode("utf-8"))
+
+    observation = SearchObservation(wave_index=0, query_id="q-strict")
+    bad_observation = observation.to_dict()
+    bad_observation["attempt_count"] = "1"
+    with pytest.raises(ValueError):
+        SearchObservation.from_dict(bad_observation)
 
 
 # ---------------------------------------------------------------------------

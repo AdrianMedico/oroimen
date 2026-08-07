@@ -65,10 +65,11 @@ MAX_QUERIES_PER_WAVE: Final[int] = 4
 #: cap; only the DERIVED queries are.
 MAX_QUERY_CHARS: Final[int] = 399
 
-#: Only ``wave_index == 0`` is permitted in C1A. Later slices may
-#: create waves with higher indices; the validator will then be
-#: extended to permit them.
-ALLOWED_WAVE_INDICES: Final[frozenset[int]] = frozenset({0})
+#: Bounded wave-index domain for the iterative C2 foundation. C1A/C1B use
+#: wave zero; C2 may authorize later indices through its smaller per-job
+#: ``IterationLimits.max_waves`` value.
+MAX_WAVES_PER_JOB: Final[int] = 8
+ALLOWED_WAVE_INDICES: Final[frozenset[int]] = frozenset(range(MAX_WAVES_PER_JOB))
 
 #: Planner kinds known to the planning validator. C1A's deterministic
 #: foundation remains available as a control; C1B adds provider-neutral
@@ -126,6 +127,34 @@ class PlanningValidationError(ValueError):
         self.violations: tuple[tuple[str, str], ...] = violations
         joined = "; ".join(f"{name}:{detail}" for name, detail in violations)
         super().__init__(f"SearchPlan failed {len(violations)} check(s): {joined}")
+
+
+def _require_exact_keys(
+    payload: Mapping[str, Any],
+    required: set[str],
+    name: str,
+    optional: set[str] | None = None,
+) -> None:
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{name} must be an object")
+    allowed = required | (optional or set())
+    keys = set(payload)
+    if not required.issubset(keys) or not keys.issubset(allowed):
+        raise ValueError(f"{name} has an invalid field set")
+
+
+def _strict_int(payload: Mapping[str, Any], name: str) -> int:
+    value = payload[name]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{name} must be an int")
+    return value
+
+
+def _strict_str(payload: Mapping[str, Any], name: str) -> str:
+    value = payload[name]
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +218,14 @@ class PlanningLimits:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> PlanningLimits:
+        _require_exact_keys(
+            payload,
+            {"max_queries_per_wave", "max_query_chars"},
+            "planning limits",
+        )
         return cls(
-            max_queries_per_wave=int(payload["max_queries_per_wave"]),
-            max_query_chars=int(payload["max_query_chars"]),
+            max_queries_per_wave=_strict_int(payload, "max_queries_per_wave"),
+            max_query_chars=_strict_int(payload, "max_query_chars"),
         )
 
 
@@ -238,15 +272,80 @@ class PlannedSearchQuery:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> PlannedSearchQuery:
+        _require_exact_keys(
+            payload,
+            {"query_id", "text", "purpose", "dimension_ids", "ordinal"},
+            "planned search query",
+        )
         dim_ids_raw = payload["dimension_ids"]
-        if not isinstance(dim_ids_raw, (list, tuple)):
-            raise ValueError("dimension_ids must be a list/tuple")
+        if not isinstance(dim_ids_raw, list):
+            raise ValueError("dimension_ids must be a list")
+        if not all(isinstance(value, str) for value in dim_ids_raw):
+            raise ValueError("dimension_ids must contain strings")
         return cls(
-            query_id=str(payload["query_id"]),
-            text=str(payload["text"]),
-            purpose=str(payload["purpose"]),
-            dimension_ids=tuple(str(x) for x in dim_ids_raw),
-            ordinal=int(payload["ordinal"]),
+            query_id=_strict_str(payload, "query_id"),
+            text=_strict_str(payload, "text"),
+            purpose=_strict_str(payload, "purpose"),
+            dimension_ids=tuple(dim_ids_raw),
+            ordinal=_strict_int(payload, "ordinal"),
+        )
+
+
+@dataclass(frozen=True)
+class EvidenceItem:
+    """Bounded, sanitized evidence metadata retained for gap assessment."""
+
+    query_id: str
+    source_ref: str
+    title: str = ""
+    snippet: str = ""
+    digest: str = ""
+
+    def __post_init__(self) -> None:
+        for name, value, max_chars in (
+            ("query_id", self.query_id, 128),
+            ("source_ref", self.source_ref, 2_048),
+            ("title", self.title, 512),
+            ("snippet", self.snippet, 1_024),
+        ):
+            if (
+                not isinstance(value, str)
+                or len(value) > max_chars
+                or "\n" in value
+                or "\r" in value
+            ):
+                raise ValueError(f"{name} is not a bounded single-line string")
+        if not isinstance(self.digest, str) or len(self.digest) != 64 or not all(
+            char in "0123456789abcdef" for char in self.digest
+        ):
+            raise ValueError("digest must be a lowercase SHA-256 value")
+        if self.digest != compute_evidence_digest(
+            self.source_ref, self.title, self.snippet
+        ):
+            raise ValueError("digest does not match persisted evidence")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "query_id": self.query_id,
+            "source_ref": self.source_ref,
+            "title": self.title,
+            "snippet": self.snippet,
+            "digest": self.digest,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> EvidenceItem:
+        _require_exact_keys(
+            payload,
+            {"query_id", "source_ref", "title", "snippet", "digest"},
+            "evidence item",
+        )
+        return cls(
+            query_id=_strict_str(payload, "query_id"),
+            source_ref=_strict_str(payload, "source_ref"),
+            title=_strict_str(payload, "title"),
+            snippet=_strict_str(payload, "snippet"),
+            digest=_strict_str(payload, "digest"),
         )
 
 
@@ -272,6 +371,10 @@ class SearchObservation:
     structured_error: str | None = None
     attempt_count: int = 1
     duration_ms: int | None = None
+    evidence_items: tuple[EvidenceItem, ...] = ()
+    # Bounded digests prove that evidence survived materialization without
+    # persisting provider snippets/content or other untrusted payloads.
+    evidence_digests: tuple[str, ...] = ()
     # ``local_usage`` is intentionally a small open-ended mapping
     # (provider/model tokens, byte counts, etc.). It is NOT validated
     # by the structural validator; runtime code is responsible for
@@ -292,6 +395,51 @@ class SearchObservation:
             raise ValueError("attempt_count must be an int")
         if self.attempt_count < 1:
             raise ValueError("attempt_count must be >= 1")
+        if not isinstance(self.local_usage, Mapping):
+            raise ValueError("local_usage must be a mapping")
+        if not isinstance(self.result_refs, tuple) or len(self.result_refs) > 32:
+            raise ValueError("result_refs must be a bounded tuple")
+        if not all(
+            type(source_ref) is str and 0 < len(source_ref) <= 2_048
+            for source_ref in self.result_refs
+        ):
+            raise ValueError("result_refs must be bounded strings")
+        if not isinstance(self.evidence_digests, tuple):
+            raise ValueError("evidence_digests must be a tuple")
+        if len(self.evidence_digests) > 32:
+            raise ValueError("evidence_digests exceeds the per-query cap")
+        if not all(
+            isinstance(value, str)
+            and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value)
+            for value in self.evidence_digests
+        ):
+            raise ValueError("evidence_digests must be lowercase SHA-256 values")
+        if not isinstance(self.evidence_items, tuple) or len(self.evidence_items) > 32:
+            raise ValueError("evidence_items must be a bounded tuple")
+        if not all(type(item) is EvidenceItem for item in self.evidence_items):
+            raise ValueError("evidence_items must contain EvidenceItem values")
+        if len(self.evidence_items) != len(self.result_refs):
+            raise ValueError("evidence_items must align with result refs")
+        if len(self.evidence_digests) != len(self.evidence_items):
+            raise ValueError("evidence_digests must align with evidence items")
+        if self.evidence_items or self.evidence_digests:
+            if any(item.query_id != self.query_id for item in self.evidence_items):
+                raise ValueError("evidence item query provenance drifted")
+            if any(
+                item.source_ref != source_ref or item.digest != digest
+                for item, source_ref, digest in zip(
+                    self.evidence_items,
+                    self.result_refs,
+                    self.evidence_digests,
+                    strict=True,
+                )
+            ):
+                raise ValueError("evidence item provenance drifted")
+        if self.structured_error is not None and (
+            self.result_refs or self.evidence_items or self.evidence_digests
+        ):
+            raise ValueError("structured errors cannot carry evidence")
 
     def to_dict(self) -> dict[str, Any]:
         # ``local_usage`` may be a dict or a MappingProxyType. We
@@ -309,29 +457,77 @@ class SearchObservation:
             "structured_error": self.structured_error,
             "attempt_count": self.attempt_count,
             "duration_ms": self.duration_ms,
+            "evidence_items": [item.to_dict() for item in self.evidence_items],
+            "evidence_digests": list(self.evidence_digests),
             "local_usage": usage_items,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> SearchObservation:
-        usage_items = payload.get("local_usage", [])
-        usage: dict[str, Any] = {str(k): v for k, v in usage_items}
+        _require_exact_keys(
+            payload,
+            {
+                "wave_index",
+                "query_id",
+                "backend",
+                "result_refs",
+                "structured_error",
+                "attempt_count",
+                "duration_ms",
+                "evidence_items",
+                "evidence_digests",
+                "local_usage",
+            },
+            "search observation",
+        )
+        result_refs = payload["result_refs"]
+        evidence_digests = payload["evidence_digests"]
+        evidence_items_raw = payload["evidence_items"]
+        usage_items = payload["local_usage"]
+        if not isinstance(result_refs, list) or not all(
+            isinstance(value, str) for value in result_refs
+        ):
+            raise ValueError("result_refs must be a list of strings")
+        if not isinstance(evidence_digests, list) or not all(
+            isinstance(value, str) for value in evidence_digests
+        ):
+            raise ValueError("evidence_digests must be a list of strings")
+        if not isinstance(evidence_items_raw, list) or not all(
+            isinstance(value, Mapping) for value in evidence_items_raw
+        ):
+            raise ValueError("evidence_items must be a list of objects")
+        if not isinstance(usage_items, list):
+            raise ValueError("local_usage must be a list")
+        usage: dict[str, Any] = {}
+        for item in usage_items:
+            if not isinstance(item, (list, tuple)) or len(item) != 2 or not isinstance(item[0], str):
+                raise ValueError("local_usage must contain [string, value] pairs")
+            if item[0] in usage:
+                raise ValueError("local_usage must not contain duplicate keys")
+            usage[item[0]] = item[1]
+        backend = payload["backend"]
+        structured_error = payload["structured_error"]
+        duration_ms = payload["duration_ms"]
+        if backend is not None and not isinstance(backend, str):
+            raise ValueError("backend must be a string or null")
+        if structured_error is not None and not isinstance(structured_error, str):
+            raise ValueError("structured_error must be a string or null")
+        if duration_ms is not None and (
+            not isinstance(duration_ms, int) or isinstance(duration_ms, bool)
+        ):
+            raise ValueError("duration_ms must be an int or null")
         return cls(
-            wave_index=int(payload["wave_index"]),
-            query_id=str(payload["query_id"]),
-            backend=(None if payload.get("backend") is None else str(payload["backend"])),
-            result_refs=tuple(str(x) for x in payload.get("result_refs", [])),
-            structured_error=(
-                None
-                if payload.get("structured_error") is None
-                else str(payload["structured_error"])
+            wave_index=_strict_int(payload, "wave_index"),
+            query_id=_strict_str(payload, "query_id"),
+            backend=backend,
+            result_refs=tuple(result_refs),
+            structured_error=structured_error,
+            attempt_count=_strict_int(payload, "attempt_count"),
+            duration_ms=duration_ms,
+            evidence_items=tuple(
+                EvidenceItem.from_dict(item) for item in evidence_items_raw
             ),
-            attempt_count=int(payload.get("attempt_count", 1)),
-            duration_ms=(
-                None
-                if payload.get("duration_ms") is None
-                else int(payload["duration_ms"])
-            ),
+            evidence_digests=tuple(evidence_digests),
             local_usage=usage,
         )
 
@@ -431,15 +627,27 @@ class CapabilitySnapshot:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> CapabilitySnapshot:
+        allowed = {
+            "planner_kind",
+            "planner_version",
+            "max_queries_per_wave",
+            "max_query_chars",
+            "planner_provenance",
+        }
+        required = allowed - {"planner_provenance"}
+        _require_exact_keys(payload, required, "capability snapshot", allowed - required)
+        provenance_raw = payload.get("planner_provenance", {})
+        if not isinstance(provenance_raw, Mapping) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in provenance_raw.items()
+        ):
+            raise ValueError("planner_provenance must be a string mapping")
         return cls(
-            planner_kind=str(payload["planner_kind"]),
-            planner_version=str(payload["planner_version"]),
-            max_queries_per_wave=int(payload["max_queries_per_wave"]),
-            max_query_chars=int(payload["max_query_chars"]),
-            planner_provenance={
-                str(key): str(value)
-                for key, value in dict(payload.get("planner_provenance", {})).items()
-            },
+            planner_kind=_strict_str(payload, "planner_kind"),
+            planner_version=_strict_str(payload, "planner_version"),
+            max_queries_per_wave=_strict_int(payload, "max_queries_per_wave"),
+            max_query_chars=_strict_int(payload, "max_query_chars"),
+            planner_provenance=dict(provenance_raw),
         )
 
 
@@ -452,10 +660,9 @@ class SearchPlan:
     public persisted ``research_jobs.query`` is the source of
     original intent).
 
-    ``wave_index`` is the position of the wave in the (future)
-    research loop. C1A only permits ``wave_index == 0``; later
-    slices may produce additional waves without changing the
-    meaning of the C1A contract.
+    ``wave_index`` is the position of the wave in the bounded research loop.
+    C1A/C1B use wave zero; C2 may produce later waves within the hard
+    ``MAX_WAVES_PER_JOB`` safety bound.
 
     ``queries`` is an ordered tuple of ``PlannedSearchQuery``. The
     tuple length is bounded to ``[MIN_QUERIES_PER_WAVE,
@@ -494,6 +701,16 @@ def _canonical_json(payload: Mapping[str, Any]) -> bytes:
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
+
+
+def compute_evidence_digest(source_ref: str, title: str, snippet: str) -> str:
+    """Hash exactly the bounded evidence fields retained in a checkpoint."""
+
+    return hashlib.sha256(
+        _canonical_json(
+            {"source_ref": source_ref, "title": title, "snippet": snippet}
+        )
+    ).hexdigest()
 
 
 def compute_research_brief_sha256(brief_text: str) -> str:
@@ -643,7 +860,8 @@ def validate_search_plan(
         violations.append(
             _violation(
                 "wave_index",
-                f"must be in {sorted(ALLOWED_WAVE_INDICES)} for C1A, "
+                f"must be in {sorted(ALLOWED_WAVE_INDICES)} for the bounded "
+                "wave domain, "
                 f"got {plan.wave_index}",
             )
         )
@@ -1047,28 +1265,51 @@ def deserialize_search_plan(blob: bytes) -> SearchPlan:
     if not isinstance(payload, dict):
         raise ValueError("plan JSON must be a top-level object")
 
-    queries_raw = payload.get("queries", [])
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "planner_kind",
+            "planner_version",
+            "research_brief_sha256",
+            "wave_index",
+            "queries",
+            "planning_limits",
+            "capability_snapshot",
+            "created_at",
+        },
+        "search plan",
+        {"planning_decision"},
+    )
+
+    queries_raw = payload["queries"]
     if not isinstance(queries_raw, list):
         raise ValueError("queries must be a list")
+    if not all(isinstance(item, Mapping) for item in queries_raw):
+        raise ValueError("queries must contain objects")
     queries = tuple(PlannedSearchQuery.from_dict(q) for q in queries_raw)
 
+    planning_decision = payload.get("planning_decision")
+    if planning_decision is not None and not isinstance(planning_decision, str):
+        raise ValueError("planning_decision must be a string or null")
+    planning_limits_raw = payload["planning_limits"]
+    capability_raw = payload["capability_snapshot"]
+    if not isinstance(planning_limits_raw, Mapping):
+        raise ValueError("planning_limits must be an object")
+    if not isinstance(capability_raw, Mapping):
+        raise ValueError("capability_snapshot must be an object")
+
     return SearchPlan(
-        schema_version=int(payload["schema_version"]),
-        planner_kind=str(payload["planner_kind"]),
-        planner_version=str(payload["planner_version"]),
-        research_brief_sha256=str(payload["research_brief_sha256"]),
-        wave_index=int(payload["wave_index"]),
+        schema_version=_strict_int(payload, "schema_version"),
+        planner_kind=_strict_str(payload, "planner_kind"),
+        planner_version=_strict_str(payload, "planner_version"),
+        research_brief_sha256=_strict_str(payload, "research_brief_sha256"),
+        wave_index=_strict_int(payload, "wave_index"),
         queries=queries,
-        planning_limits=PlanningLimits.from_dict(payload["planning_limits"]),
-        capability_snapshot=CapabilitySnapshot.from_dict(
-            payload["capability_snapshot"]
-        ),
-        created_at=str(payload["created_at"]),
-        planning_decision=(
-            None
-            if payload.get("planning_decision") is None
-            else str(payload["planning_decision"])
-        ),
+        planning_limits=PlanningLimits.from_dict(planning_limits_raw),
+        capability_snapshot=CapabilitySnapshot.from_dict(capability_raw),
+        created_at=_strict_str(payload, "created_at"),
+        planning_decision=planning_decision,
     )
 
 
@@ -1078,15 +1319,18 @@ __all__ = [
     "KNOWN_PLANNING_DECISIONS",
     "MAX_QUERIES_PER_WAVE",
     "MAX_QUERY_CHARS",
+    "MAX_WAVES_PER_JOB",
     "MIN_QUERIES_PER_WAVE",
     "SCHEMA_VERSION",
     "CapabilitySnapshot",
+    "EvidenceItem",
     "PlannedSearchQuery",
     "PlanningLimits",
     "PlanningValidationError",
     "SearchObservation",
     "SearchPlan",
     "build_search_plan",
+    "compute_evidence_digest",
     "compute_query_id",
     "compute_research_brief_sha256",
     "deserialize_search_plan",
