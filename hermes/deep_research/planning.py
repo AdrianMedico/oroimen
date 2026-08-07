@@ -39,6 +39,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, Final
 
 # ---------------------------------------------------------------------------
@@ -174,6 +175,11 @@ class PlanningLimits:
             )
         if self.max_query_chars < 1:
             raise ValueError("max_query_chars must be >= 1")
+        if self.max_query_chars > MAX_QUERY_CHARS:
+            raise ValueError(
+                f"max_query_chars must be <= {MAX_QUERY_CHARS} "
+                f"(got {self.max_query_chars})"
+            )
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -382,8 +388,11 @@ class CapabilitySnapshot:
             not isinstance(self.max_query_chars, int)
             or isinstance(self.max_query_chars, bool)
             or self.max_query_chars < 1
+            or self.max_query_chars > MAX_QUERY_CHARS
         ):
-            raise ValueError("max_query_chars must be a positive int")
+            raise ValueError(
+                f"max_query_chars must be in [1, {MAX_QUERY_CHARS}]"
+            )
         if not isinstance(self.planner_provenance, Mapping):
             raise ValueError("planner_provenance must be a mapping")
         allowed_keys = {"provider", "model", "version"}
@@ -400,6 +409,11 @@ class CapabilitySnapshot:
                 raise ValueError(
                     "planner_provenance values must be non-empty single-line strings"
                 )
+        object.__setattr__(
+            self,
+            "planner_provenance",
+            MappingProxyType(dict(self.planner_provenance)),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -653,6 +667,14 @@ def validate_search_plan(
             )
         )
 
+    if n > plan.planning_limits.max_queries_per_wave:
+        violations.append(
+            _violation(
+                "queries_count_planning_limit",
+                "wave query count exceeds planning_limits.max_queries_per_wave",
+            )
+        )
+
     # (8) per-query checks
     seen_normalized: dict[str, int] = {}
     seen_ordinals: set[int] = set()
@@ -699,6 +721,17 @@ def validate_search_plan(
                     "query_text_too_long",
                     f"query id {q.query_id!r} has len {len(q.text)} > "
                     f"{MAX_QUERY_CHARS}",
+                )
+            )
+
+        if (
+            isinstance(q.text, str)
+            and len(q.text) > plan.planning_limits.max_query_chars
+        ):
+            violations.append(
+                _violation(
+                    "query_text_planning_limit",
+                    f"query id {q.query_id!r} exceeds the effective query cap",
                 )
             )
 
@@ -796,8 +829,27 @@ def validate_search_plan(
                 "capability_snapshot.planner_version must equal plan.planner_version",
             )
         )
+    if plan.planner_kind == "c1b-llm-structured" and set(
+        plan.capability_snapshot.planner_provenance
+    ) != {"provider", "model", "version"}:
+        violations.append(
+            _violation(
+                "planner_provenance_missing",
+                "structured C1B plans must persist provider/model/version provenance",
+            )
+        )
 
     # (11) C1B semantic decision, when present
+    if (
+        plan.planner_kind in {"c1b-direct", "c1b-llm-structured"}
+        and plan.planning_decision is None
+    ):
+        violations.append(
+            _violation(
+                "planning_decision_missing",
+                "C1B plans must persist the semantic planner decision",
+            )
+        )
     if plan.planning_decision is not None:
         if plan.planning_decision not in KNOWN_PLANNING_DECISIONS:
             violations.append(
@@ -814,7 +866,12 @@ def validate_search_plan(
                 )
             )
         elif plan.planning_decision == "DECOMPOSE" and not (
-            2 <= len(plan.queries) <= MAX_QUERIES_PER_WAVE
+            2
+            <= len(plan.queries)
+            <= min(
+                MAX_QUERIES_PER_WAVE,
+                plan.planning_limits.max_queries_per_wave,
+            )
         ):
             violations.append(
                 _violation(

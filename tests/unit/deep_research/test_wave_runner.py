@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from hermes.deep_research.plan_store import (
     LocalPlanStore,
     PlanBriefHashMismatchError,
+    PlanCapabilitySnapshotMismatchError,
 )
 from hermes.deep_research.planner import (
     STRUCTURED_LLM_PLANNER_KIND,
@@ -32,10 +34,15 @@ JOB_ID = "0123456789ab"
 BRIEF = "Find the durable answer."
 BRIEF_HASH = compute_research_brief_sha256(BRIEF)
 SNAPSHOT = CapabilitySnapshot(
-    planner_kind="c1a-deterministic-stub",
+    planner_kind=STRUCTURED_LLM_PLANNER_KIND,
     planner_version="1.0.0",
     max_queries_per_wave=4,
     max_query_chars=399,
+    planner_provenance={
+        "provider": "test-adapter",
+        "model": "fake-structured",
+        "version": "0.1.0",
+    },
 )
 
 
@@ -66,6 +73,7 @@ def _plan() -> SearchPlan:
         ),
         capability_snapshot=SNAPSHOT,
         created_at="2026-08-07T00:00:00Z",
+        planning_decision="DIRECT",
     )
 
 
@@ -168,6 +176,36 @@ async def test_incompatible_persisted_plan_fails_before_search(tmp_path: Path) -
             plan_factory=must_not_plan,
         )
 
+    assert search.calls == []
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_nonsemantic_plan_before_search(tmp_path: Path) -> None:
+    legacy_snapshot = CapabilitySnapshot(
+        planner_kind="c1a-deterministic-stub",
+        planner_version="1.0.0",
+        max_queries_per_wave=4,
+        max_query_chars=399,
+    )
+    legacy_plan = replace(
+        _plan(),
+        planner_kind=legacy_snapshot.planner_kind,
+        capability_snapshot=legacy_snapshot,
+        planning_decision=None,
+    )
+    search = RecordingSearch()
+    runner = SearchWaveRunner(
+        plan_store=LocalPlanStore(tmp_path),
+        executor=SearchWaveExecutor(search, max_unique_sources=2),
+    )
+
+    with pytest.raises(PlanCapabilitySnapshotMismatchError):
+        await runner.run(
+            JOB_ID,
+            expected_research_brief_sha256=BRIEF_HASH,
+            expected_capability_snapshot=legacy_snapshot,
+            plan_factory=lambda: legacy_plan,
+        )
     assert search.calls == []
 
 

@@ -189,7 +189,11 @@ class StructuredPlanParser:
             raise PlannerOutputError("structured planner queries must be a list")
         if decision is PlanningDecisionKind.DIRECT and len(raw_queries) != 1:
             raise PlannerOutputError("DIRECT requires exactly one query")
-        if decision is PlanningDecisionKind.DECOMPOSE and not 2 <= len(raw_queries) <= 4:
+        if decision is PlanningDecisionKind.DECOMPOSE and not (
+            2
+            <= len(raw_queries)
+            <= request.planning_limits.max_queries_per_wave
+        ):
             raise PlannerOutputError("DECOMPOSE requires 2..4 queries")
 
         queries: list[PlannedSearchQuery] = []

@@ -18,7 +18,9 @@ from hermes.deep_research.plan_store import (
     PlanCapabilitySnapshotMismatchError,
     PlanNotFoundError,
 )
+from hermes.deep_research.planner import STRUCTURED_LLM_PLANNER_KIND
 from hermes.deep_research.planning import (
+    KNOWN_PLANNING_DECISIONS,
     CapabilitySnapshot,
     SearchPlan,
     validate_search_plan,
@@ -91,6 +93,11 @@ class SearchWaveRunner:
             self._plan_store.write(job_id, plan)
             plan_reused = False
 
+        self._require_semantic_plan(
+            job_id=job_id,
+            plan=plan,
+            expected_capability_snapshot=expected_capability_snapshot,
+        )
         execution = await self._executor.execute(plan)
         return WaveRunResult(
             plan=plan,
@@ -113,6 +120,25 @@ class SearchWaveRunner:
             expected_research_brief_sha256=expected_research_brief_sha256,
         )
         if plan.capability_snapshot.to_dict() != expected_capability_snapshot.to_dict():
+            raise PlanCapabilitySnapshotMismatchError(job_id)
+        SearchWaveRunner._require_semantic_plan(
+            job_id=job_id,
+            plan=plan,
+            expected_capability_snapshot=expected_capability_snapshot,
+        )
+
+    @staticmethod
+    def _require_semantic_plan(
+        *,
+        job_id: str,
+        plan: SearchPlan,
+        expected_capability_snapshot: CapabilitySnapshot,
+    ) -> None:
+        if (
+            expected_capability_snapshot.planner_kind != STRUCTURED_LLM_PLANNER_KIND
+            or plan.planner_kind != STRUCTURED_LLM_PLANNER_KIND
+            or plan.planning_decision not in KNOWN_PLANNING_DECISIONS
+        ):
             raise PlanCapabilitySnapshotMismatchError(job_id)
 
 

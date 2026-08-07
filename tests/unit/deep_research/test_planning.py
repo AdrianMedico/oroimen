@@ -559,6 +559,104 @@ def test_semantic_planning_decision_roundtrips_in_plan_artifact() -> None:
     assert deserialize_search_plan(serialize_search_plan(plan)).planning_decision == "DIRECT"
 
 
+def test_c1b_plan_requires_persisted_semantic_decision() -> None:
+    brief_sha = "f" * 64
+    plan = _make_plan(
+        (_make_query(0, brief_sha=brief_sha),),
+        brief_sha=brief_sha,
+        planner_kind="c1b-llm-structured",
+    )
+    with pytest.raises(PlanningValidationError) as excinfo:
+        validate_search_plan(plan, expected_research_brief_sha256=brief_sha)
+    assert "planning_decision_missing" in {
+        name for name, _ in excinfo.value.violations
+    }
+
+
+def test_structured_c1b_plan_requires_complete_provenance() -> None:
+    brief_sha = "f" * 64
+    plan = _make_plan(
+        (_make_query(0, brief_sha=brief_sha),),
+        brief_sha=brief_sha,
+        planner_kind="c1b-llm-structured",
+        planning_decision="DIRECT",
+    )
+    with pytest.raises(PlanningValidationError) as excinfo:
+        validate_search_plan(plan, expected_research_brief_sha256=brief_sha)
+    assert "planner_provenance_missing" in {
+        name for name, _ in excinfo.value.violations
+    }
+
+
+def test_effective_planning_limits_are_enforced() -> None:
+    brief_sha = "f" * 64
+    narrow_limits = PlanningLimits(max_queries_per_wave=2, max_query_chars=399)
+    narrow_snapshot = CapabilitySnapshot(
+        planner_kind=PLANNER_KIND,
+        planner_version=PLANNER_VERSION,
+        max_queries_per_wave=2,
+        max_query_chars=399,
+    )
+    too_many = SearchPlan(
+        schema_version=SCHEMA_VERSION,
+        planner_kind=PLANNER_KIND,
+        planner_version=PLANNER_VERSION,
+        research_brief_sha256=brief_sha,
+        wave_index=0,
+        queries=tuple(
+            _make_query(index, f"query {index}", brief_sha=brief_sha)
+            for index in range(3)
+        ),
+        planning_limits=narrow_limits,
+        capability_snapshot=narrow_snapshot,
+        created_at=CREATED_AT,
+    )
+    with pytest.raises(PlanningValidationError) as count_error:
+        validate_search_plan(too_many, expected_research_brief_sha256=brief_sha)
+    assert "queries_count_planning_limit" in {
+        name for name, _ in count_error.value.violations
+    }
+
+    short_limits = PlanningLimits(max_queries_per_wave=4, max_query_chars=100)
+    short_snapshot = CapabilitySnapshot(
+        planner_kind=PLANNER_KIND,
+        planner_version=PLANNER_VERSION,
+        max_queries_per_wave=4,
+        max_query_chars=100,
+    )
+    too_long = SearchPlan(
+        schema_version=SCHEMA_VERSION,
+        planner_kind=PLANNER_KIND,
+        planner_version=PLANNER_VERSION,
+        research_brief_sha256=brief_sha,
+        wave_index=0,
+        queries=(_make_query(0, "a" * 101, brief_sha=brief_sha),),
+        planning_limits=short_limits,
+        capability_snapshot=short_snapshot,
+        created_at=CREATED_AT,
+    )
+    with pytest.raises(PlanningValidationError) as length_error:
+        validate_search_plan(too_long, expected_research_brief_sha256=brief_sha)
+    assert "query_text_planning_limit" in {
+        name for name, _ in length_error.value.violations
+    }
+
+
+def test_capability_provenance_is_snapshot_immutable() -> None:
+    provenance = {"provider": "test", "model": "model", "version": "1.0.0"}
+    snapshot = CapabilitySnapshot(
+        planner_kind="c1b-llm-structured",
+        planner_version="1.0.0",
+        max_queries_per_wave=4,
+        max_query_chars=399,
+        planner_provenance=provenance,
+    )
+    provenance["provider"] = "mutated"
+    assert snapshot.planner_provenance["provider"] == "test"
+    with pytest.raises(TypeError):
+        snapshot.planner_provenance["provider"] = "mutated"  # type: ignore[index]
+
+
 def test_planning_limits_rejects_out_of_band_values() -> None:
     # max_queries_per_wave > 4 must be rejected at construction.
     with pytest.raises(ValueError):
@@ -569,6 +667,8 @@ def test_planning_limits_rejects_out_of_band_values() -> None:
     # max_query_chars < 1 must be rejected.
     with pytest.raises(ValueError):
         PlanningLimits(max_queries_per_wave=4, max_query_chars=0)
+    with pytest.raises(ValueError):
+        PlanningLimits(max_queries_per_wave=4, max_query_chars=400)
 
 
 def test_capability_snapshot_rejects_unknown_planner_kind() -> None:

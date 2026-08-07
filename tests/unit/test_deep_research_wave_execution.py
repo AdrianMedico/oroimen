@@ -277,6 +277,26 @@ async def test_iterable_materialization_failure_is_malformed_and_wave_continues(
 
 
 @pytest.mark.asyncio
+async def test_malformed_results_accessor_is_structured_and_wave_continues() -> None:
+    class AccessorError:
+        backend_used = "malformed"
+
+        @property
+        def results(self):
+            raise RuntimeError("accessor detail must not escape")
+
+    result = await SearchWaveExecutor(
+        _FakeSearch([AccessorError(), _result(["https://ok.test/accessor"])])
+    ).execute(_plan((_query(0, "bad accessor"), _query(1, "ok"))))
+
+    assert json.loads(result.observations[0].structured_error or "{}") == {
+        "code": "malformed_result"
+    }
+    assert result.unique_source_refs == ("https://ok.test/accessor",)
+    assert result.outcome == WaveExecutionOutcome.PARTIAL_SUCCESS
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("terminal", [asyncio.CancelledError, SystemExit])
 async def test_terminal_iterable_semantics_are_not_swallowed(terminal: type[BaseException]) -> None:
     class TerminalRows:
@@ -317,6 +337,7 @@ async def test_structured_error_and_observation_fields_are_truthful() -> None:
 
     assert payload == {
         "backend": "fake",
+        "breaker_relevant": False,
         "code": "RATE_LIMITED",
         "diagnostic_category": "rate_limit",
         "http_status": 429,

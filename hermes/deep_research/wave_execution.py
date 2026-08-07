@@ -72,6 +72,7 @@ def _structured_error(error: Any) -> str:
         "diagnostic_category": _enum_value(
             getattr(error, "diagnostic_category", None)
         ),
+        "breaker_relevant": bool(getattr(error, "breaker_relevant", False)),
         "http_status": getattr(error, "http_status", None),
         "retryable": bool(getattr(error, "retryable", False)),
     }
@@ -109,15 +110,19 @@ def _rows(result: Any) -> tuple[Iterable[Any], str | None] | None:
         return result.results, result.backend_used
     if isinstance(result, list):
         return result, None
-    if hasattr(result, "results"):
-        try:
-            return (
-                result.results,
-                result.backend_used if hasattr(result, "backend_used") else None,
-            )
-        except Exception:
-            return None
-    return None
+    try:
+        raw_rows = result.results
+    except AttributeError:
+        return None
+    except Exception:
+        return None
+    try:
+        backend = result.backend_used
+    except AttributeError:
+        backend = None
+    except Exception:
+        return None
+    return raw_rows, backend
 
 
 def _candidate_urls(result: Any) -> tuple[tuple[str, ...], str | None] | None:

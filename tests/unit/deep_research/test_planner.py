@@ -205,6 +205,32 @@ def test_structured_parser_requires_decision_and_cardinality() -> None:
             request,
         )
 
+    narrow_limits = PlanningLimits(max_queries_per_wave=2, max_query_chars=399)
+    narrow_snapshot = CapabilitySnapshot(
+        planner_kind=STRUCTURED_LLM_PLANNER_KIND,
+        planner_version="1.0.0",
+        max_queries_per_wave=2,
+        max_query_chars=399,
+        planner_provenance=LLM_SNAPSHOT.planner_provenance,
+    )
+    with pytest.raises(PlannerOutputError, match="DECOMPOSE"):
+        StructuredPlanParser.parse(
+            {
+                "decision": "DECOMPOSE",
+                "queries": [
+                    _query("one", "p", "d"),
+                    _query("two", "p", "e"),
+                    _query("three", "p", "f"),
+                ],
+            },
+            PlannerRequest(
+                research_brief="A narrow brief.",
+                planning_limits=narrow_limits,
+                capability_snapshot=narrow_snapshot,
+                created_at="2026-08-07T00:00:00Z",
+            ),
+        )
+
 
 def test_structured_parser_rejects_duplicate_queries_deterministically() -> None:
     request = _request("A comparison brief.")
