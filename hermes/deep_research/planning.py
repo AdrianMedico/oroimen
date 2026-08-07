@@ -397,6 +397,13 @@ class SearchObservation:
             raise ValueError("attempt_count must be >= 1")
         if not isinstance(self.local_usage, Mapping):
             raise ValueError("local_usage must be a mapping")
+        if not isinstance(self.result_refs, tuple) or len(self.result_refs) > 32:
+            raise ValueError("result_refs must be a bounded tuple")
+        if not all(
+            type(source_ref) is str and 0 < len(source_ref) <= 2_048
+            for source_ref in self.result_refs
+        ):
+            raise ValueError("result_refs must be bounded strings")
         if not isinstance(self.evidence_digests, tuple):
             raise ValueError("evidence_digests must be a tuple")
         if len(self.evidence_digests) > 32:
@@ -410,13 +417,13 @@ class SearchObservation:
             raise ValueError("evidence_digests must be lowercase SHA-256 values")
         if not isinstance(self.evidence_items, tuple) or len(self.evidence_items) > 32:
             raise ValueError("evidence_items must be a bounded tuple")
-        if not all(isinstance(item, EvidenceItem) for item in self.evidence_items):
+        if not all(type(item) is EvidenceItem for item in self.evidence_items):
             raise ValueError("evidence_items must contain EvidenceItem values")
+        if len(self.evidence_items) != len(self.result_refs):
+            raise ValueError("evidence_items must align with result refs")
+        if len(self.evidence_digests) != len(self.evidence_items):
+            raise ValueError("evidence_digests must align with evidence items")
         if self.evidence_items or self.evidence_digests:
-            if len(self.evidence_items) != len(self.result_refs):
-                raise ValueError("evidence_items must align with result refs")
-            if len(self.evidence_digests) != len(self.evidence_items):
-                raise ValueError("evidence_digests must align with evidence items")
             if any(item.query_id != self.query_id for item in self.evidence_items):
                 raise ValueError("evidence item query provenance drifted")
             if any(

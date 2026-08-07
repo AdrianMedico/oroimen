@@ -246,6 +246,40 @@ async def test_controller_runs_multiple_waves_and_preserves_original_brief(
 
 
 @pytest.mark.asyncio
+async def test_cancellation_between_queries_stops_before_next_dispatch(
+    tmp_path: Path,
+) -> None:
+    cancellation = _Cancellation()
+
+    class _CancelAfterFirstSearch(_FakeSearch):
+        async def __call__(self, **kwargs: Any) -> SearchResult:
+            result = await super().__call__(**kwargs)
+            cancellation.cancelled = True
+            return result
+
+    assessor = _ScriptedAssessor(
+        lambda _call, _state, _wave: pytest.fail("assessment must not run")
+    )
+    search = _CancelAfterFirstSearch()
+    result = await _controller(
+        raw_planner=_RawPlanner([_payload("DECOMPOSE", "cancel-between")]),
+        assessor=assessor,
+        store=LocalIterationStateStore(tmp_path),
+        search=search,
+    ).run(
+        JOB_ID,
+        BRIEF,
+        limits=_limits(max_waves=1, max_searches=2, max_local_call_units=4),
+        cancellation=cancellation,
+    )
+
+    assert result.state.phase is IterationPhase.STOPPED
+    assert result.state.stop_reason is StopReason.CANCELLED
+    assert len(search.calls) == 1
+    assert len(result.state.active_observations) == 1
+
+
+@pytest.mark.asyncio
 async def test_recovery_does_not_replay_uncertain_dispatch(tmp_path: Path) -> None:
     raw_planner = _RawPlanner([_payload("DECOMPOSE", "recoverable")])
 

@@ -23,6 +23,11 @@ from hermes.deep_research.planning import (
     SearchPlan,
     compute_evidence_digest,
 )
+from hermes.services.search.errors import (
+    SearchDiagnosticCategory,
+    SearchError,
+    SearchErrorCode,
+)
 from hermes.services.search.protocol import SearchResult
 
 
@@ -49,6 +54,9 @@ class WaveExecutionResult:
 
 
 MAX_RESULT_ROWS = 32
+MAX_SOURCE_REF_CHARS = 2_048
+MAX_BACKEND_CHARS = 128
+MAX_ERROR_TEXT_CHARS = 512
 
 
 class SearchCallable(Protocol):
@@ -62,6 +70,10 @@ class SearchCallable(Protocol):
         content: str,
         num_results: int,
     ) -> Any: ...
+
+
+class WaveExecutionCancelled(Exception):
+    """Cooperative cancellation observed between query dispatches."""
 
 
 def _enum_value(value: Any) -> Any:
@@ -89,12 +101,50 @@ def _structured_error(error: Any) -> str:
     )
 
 
+def _safe_search_error(error: Any) -> bool:
+    if type(error) is not SearchError:
+        return False
+    return (
+        type(error.code) is SearchErrorCode
+        and type(error.message) is str
+        and len(error.message) <= MAX_ERROR_TEXT_CHARS
+        and (error.backend is None or type(error.backend) is str)
+        and (error.backend is None or len(error.backend) <= MAX_BACKEND_CHARS)
+        and type(error.retryable) is bool
+        and type(error.suggestion) is str
+        and len(error.suggestion) <= MAX_ERROR_TEXT_CHARS
+        and type(error.backends_tried) is list
+        and len(error.backends_tried) <= 16
+        and all(
+            type(value) is str and len(value) <= MAX_BACKEND_CHARS
+            for value in error.backends_tried
+        )
+        and type(error.reasons) is dict
+        and len(error.reasons) <= 16
+        and all(
+            type(key) is str
+            and len(key) <= MAX_BACKEND_CHARS
+            and type(value) is str
+            and len(value) <= MAX_ERROR_TEXT_CHARS
+            for key, value in error.reasons.items()
+        )
+        and type(error.breaker_relevant) is bool
+        and (
+            error.http_status is None
+            or (type(error.http_status) is int and 100 <= error.http_status <= 599)
+        )
+        and type(error.diagnostic_category) is SearchDiagnosticCategory
+    )
+
+
 def _failure(code: str) -> str:
     return json.dumps({"code": code}, separators=(",", ":"), sort_keys=True)
 
 
 def _normalize_url(raw: Any) -> str | None:
     if type(raw) is not str:
+        return None
+    if len(raw) > MAX_SOURCE_REF_CHARS:
         return None
     value = raw.strip().rstrip("/")
     if not value:
@@ -124,6 +174,11 @@ def _rows(result: Any) -> tuple[Iterable[Any], str | None] | None:
     # Reject subclasses before touching properties or overridden methods;
     # malformed provider objects must not block the event loop.
     if type(result) is SearchResult:
+        if (
+            type(result.backend_used) is not str
+            or len(result.backend_used) > MAX_BACKEND_CHARS
+        ):
+            return None
         return result.results, result.backend_used
     if type(result) is list:
         return result, None
@@ -144,7 +199,7 @@ def _bounded_text(raw_row: Any, key: str, max_chars: int) -> str:
     value = raw_row.get(key)
     if type(value) is not str:
         return ""
-    return " ".join(value.split())[:max_chars]
+    return " ".join(value[:max_chars].split())[:max_chars]
 
 
 def _candidate_urls(
@@ -227,6 +282,7 @@ class SearchWaveExecutor:
         completed_observations: tuple[SearchObservation, ...] = (),
         on_observation: Callable[[SearchObservation], None] | None = None,
         on_dispatch: Callable[[PlannedSearchQuery], None] | None = None,
+        cancellation: Callable[[], bool] | None = None,
     ) -> WaveExecutionResult:
         ordered_queries = sorted(plan.queries, key=lambda item: item.ordinal)
         if not isinstance(completed_observations, tuple):
@@ -259,6 +315,8 @@ class SearchWaveExecutor:
             )
 
         for query in ordered_queries[len(completed_observations) :]:
+            if cancellation is not None and cancellation():
+                raise WaveExecutionCancelled
             if on_dispatch is not None:
                 on_dispatch(query)
             observation, refs = await self._execute_query(plan.wave_index, query)
@@ -339,20 +397,52 @@ class SearchWaveExecutor:
                 (),
             )
 
-        if isinstance(result, SearchResult) and result.error is not None:
+        try:
+            if type(result) is SearchResult and result.error is not None:
+                if not _safe_search_error(result.error):
+                    raise ValueError("malformed search error")
+                return (
+                    self._observation(
+                        wave_index=wave_index,
+                        query_id=query.query_id,
+                        backend=result.backend_used,
+                        structured_error=_structured_error(result.error),
+                        duration_ms=self._duration_ms(started),
+                    ),
+                    (),
+                )
+
+            candidates = _candidate_urls(result)
+            if candidates is None:
+                raise ValueError("malformed search result")
+            candidates_with_digests, backend = candidates
+            refs = tuple(ref for ref, _digest, _title, _snippet in candidates_with_digests)
+            evidence_digests = tuple(
+                digest for _ref, digest, _title, _snippet in candidates_with_digests
+            )
+            evidence_items = tuple(
+                EvidenceItem(
+                    query_id=query.query_id,
+                    source_ref=ref,
+                    title=title,
+                    snippet=snippet,
+                    digest=digest,
+                )
+                for ref, digest, title, snippet in candidates_with_digests
+            )
             return (
                 self._observation(
                     wave_index=wave_index,
                     query_id=query.query_id,
-                    backend=result.backend_used,
-                    structured_error=_structured_error(result.error),
+                    backend=backend,
+                    result_refs=refs,
+                    evidence_items=evidence_items,
+                    evidence_digests=evidence_digests,
                     duration_ms=self._duration_ms(started),
                 ),
-                (),
+                refs,
             )
-
-        candidates = _candidate_urls(result)
-        if candidates is None:
+        except Exception:
             return (
                 self._observation(
                     wave_index=wave_index,
@@ -362,33 +452,6 @@ class SearchWaveExecutor:
                 ),
                 (),
             )
-        candidates_with_digests, backend = candidates
-        refs = tuple(ref for ref, _digest, _title, _snippet in candidates_with_digests)
-        evidence_digests = tuple(
-            digest for _ref, digest, _title, _snippet in candidates_with_digests
-        )
-        evidence_items = tuple(
-            EvidenceItem(
-                query_id=query.query_id,
-                source_ref=ref,
-                title=title,
-                snippet=snippet,
-                digest=digest,
-            )
-            for ref, digest, title, snippet in candidates_with_digests
-        )
-        return (
-            self._observation(
-                wave_index=wave_index,
-                query_id=query.query_id,
-                backend=backend,
-                result_refs=refs,
-                evidence_items=evidence_items,
-                evidence_digests=evidence_digests,
-                duration_ms=self._duration_ms(started),
-            ),
-            refs,
-        )
 
     @staticmethod
     def _duration_ms(started: float) -> int:
@@ -423,6 +486,7 @@ class SearchWaveExecutor:
 __all__ = [
     "SearchCallable",
     "SearchWaveExecutor",
+    "WaveExecutionCancelled",
     "WaveExecutionOutcome",
     "WaveExecutionResult",
 ]

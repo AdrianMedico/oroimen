@@ -44,6 +44,7 @@ from hermes.deep_research.planning import (
 )
 from hermes.deep_research.wave_execution import (
     SearchWaveExecutor,
+    WaveExecutionCancelled,
     WaveExecutionOutcome,
     WaveExecutionResult,
 )
@@ -322,7 +323,12 @@ class GapAssessment:
             raise ValueError("material_gain must be a bool")
         _bounded_items("remaining_gaps", self.remaining_gaps)
         _bounded_items("exhausted_query_ids", self.exhausted_query_ids)
-        _bounded_items("exhausted_source_refs", self.exhausted_source_refs)
+        _bounded_items(
+            "exhausted_source_refs",
+            self.exhausted_source_refs,
+            max_items=MAX_SOURCES_PER_JOB,
+            max_chars=MAX_SOURCE_REF_CHARS,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1236,9 +1242,17 @@ class ResearchController:
                             completed_observations=state_for_execution.active_observations,
                             on_observation=checkpoint_observation,
                             on_dispatch=checkpoint_dispatch,
+                            cancellation=(
+                                None
+                                if cancellation is None
+                                else cancellation.is_cancelled
+                            ),
                         ),
                         timeout=self._remaining_seconds(state, limits),
                     )
+                except WaveExecutionCancelled:
+                    state = self._stop(state_for_execution, StopReason.CANCELLED)
+                    break
                 except TimeoutError:
                     state = state_for_execution
                     state = self._stop(state, StopReason.BUDGET_EXHAUSTED)

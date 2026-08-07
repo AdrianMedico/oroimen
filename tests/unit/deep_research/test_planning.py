@@ -720,10 +720,22 @@ def test_observation_serialization_roundtrip() -> None:
         wave_index=0,
         query_id="q-abc",
         backend="tavily",
-        result_refs=("https://a", "https://b"),
+        result_refs=("https://a",),
         structured_error=None,
         attempt_count=1,
         duration_ms=250,
+        evidence_items=(
+            EvidenceItem(
+                query_id="q-abc",
+                source_ref="https://a",
+                title="Evidence",
+                snippet="Snippet",
+                digest=compute_evidence_digest("https://a", "Evidence", "Snippet"),
+            ),
+        ),
+        evidence_digests=(
+            compute_evidence_digest("https://a", "Evidence", "Snippet"),
+        ),
         local_usage={"tokens": 100, "model": "tavily-fast"},
     )
     payload = obs.to_dict()
@@ -732,6 +744,9 @@ def test_observation_serialization_roundtrip() -> None:
     assert payload["local_usage"] == sorted(payload["local_usage"])
     reloaded = SearchObservation.from_dict(payload)
     assert reloaded == obs
+
+    with pytest.raises(ValueError, match="align with result refs"):
+        SearchObservation(wave_index=0, query_id="q-abc", result_refs=("https://a",))
 
 
 def test_persisted_nested_shapes_fail_closed_without_coercion() -> None:
