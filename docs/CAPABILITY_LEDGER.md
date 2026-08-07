@@ -14,12 +14,12 @@ tests exist.
    audited at `0e29dd6f38372ed24e060e1649d8f8456c49adbc`.
 2. **Runtime baseline for the PRE2 documentation update.**
    `8f08c42e316a6044390e1f6ba4915ce053d919cb`.
-3. **Documentation-only addendum.** The query-planning ADR,
-   technical design, and the amended ledger row below introduce
-   design truth only and do not change runtime behavior.
-4. **Non-recertification.** Rows not modified by this
-   documentation update are not automatically re-certified
-   against `8f08c42e`.
+3. **PRE2-C1B/C2 implementation addendum.** The query-planning
+   foundation and bounded iterative component seams are implemented in
+   the current PRE2 branch, but are not production service wiring and do
+   not change the public runtime path.
+4. **Non-recertification.** Rows not modified by the PRE2 addenda are
+   not automatically re-certified against the current branch.
 
 ## Status vocabulary
 
@@ -169,8 +169,8 @@ conflate them.
 | OCR routing and edge coordination | `hermes/memory/ocr_decision.py`; `hermes/memory/edge_coordinator.py`; `hermes/receivers/ocr_api.py`; OCR unit tests | Implemented, runtime unavailable: the public generic OCR decision and route are present and unit-tested offline, but the production startup does not wire the advanced edge-coordinator path; the edge path is deployment-dependent and not part of the public product surface | Retain public generic behavior; keep deployment assumptions out of public docs | External binaries, local vision model, and edge lifecycle | Public OCR decision tests pass; deployment-specific readiness is not claimed | P2 |
 | LLM provider cascade and streaming | `hermes/llm/router.py`; `hermes/llm/ollama.py`; `hermes/llm/chatgpt5_6.py`; provider and streaming tests | Supported: the local provider is the default and is enabled without operator opt-in; the cloud and frontier providers are separately Optional and require operator opt-in (per the row above for cloud providers) | Retain explicit selection and fallback semantics | Credentials, cost, data egress, provider availability | Offline diagnostics list provider modes without values; live probes are explicit and bounded | P1 |
 | Container egress firewall | `hermes/security/egress.py`; `tests/unit/security/test_egress.py` | Optional (disabled by default) | Retain as defense in depth, not as request-level URL authorization | DNS is resolved when rules are applied; stale DNS and request-level SSRF remain separate concerns | Diagnostics report only enabled state and policy validity, never addresses or sensitive configuration | P1 |
-| Deep Research iterative retrieval | absent | Absent: no multi-pass planning, no reflection step, no re-query with refined terms, no stopping decision | Deferred | An iterative loop would require a new boundary in the service, new preflight codes, and a benchmark to prove it improves quality; none of these is justified at the current baseline | Not supported as a product path | P2 |
-| Deep Research query decomposition / query planning | `docs/ADR_DEEP_RESEARCH_QUERY_PLANNING.md`; `docs/DEEP_RESEARCH_QUERY_PLANNING_DESIGN.md` | Design only: phase 1 still performs one search query and has no planning fan-out or query-to-source provenance | Retain as accepted design; implementation and measurement are deferred to separately scoped PRE2 implementation and measurement work | Structured search-error truth, backend query capabilities, offline planner selection, bounded accounting, recovery semantics, and provider-specific live validation | Deterministic direct and decomposed planning, global source cap, query-to-source provenance, recovery reuse, and separate live and quality evidence; no claim of implementation, runtime availability, provider proof, research-quality improvement, or product support | P2 |
+| Deep Research iterative retrieval | `hermes/deep_research/iteration.py`; `hermes/deep_research/iteration_store.py`; `tests/unit/deep_research/test_iteration.py`; `docs/PRE2_C2_ITERATIVE_RESEARCH.md` | Implemented, runtime unavailable: bounded multi-wave controller, gap assessment, job limits, cancellation STOP, atomic private checkpoints, recovery reuse, and provenance exist as offline component seams; production service wiring and public API remain unchanged | Retain as an internal PRE2-C2 foundation; do not present as a supported product path until separately authorized runtime integration and measurement | Deterministic assessor/planner proposals, evidence frontier, provider-independent local accounting, private state recovery, and future provider integration | Deterministic fakes prove multiple waves, DIRECT/DECOMPOSE persistence, STOP/recovery paths, provenance and privacy; no claim of live provider behavior, planner/search quality, runtime composition, or product support | P1 |
+| Deep Research query decomposition / query planning | `hermes/deep_research/planning.py`; `hermes/deep_research/planner.py`; `hermes/deep_research/wave_execution.py`; `hermes/deep_research/iteration.py`; `tests/unit/deep_research/test_planning.py`; `tests/unit/deep_research/test_planner.py`; `docs/ADR_DEEP_RESEARCH_QUERY_PLANNING.md`; `docs/DEEP_RESEARCH_QUERY_PLANNING_DESIGN.md`; `docs/PRE2_C2_ITERATIVE_RESEARCH.md` | Implemented, runtime unavailable: every C2 controller planning pass uses the replaceable structured semantic planner; DIRECT is a persisted planner decision, not a lexical bypass; per-wave query limits and query-to-source provenance are validated offline | Retain as an internal component foundation; implementation is not wired into the public Deep Research service and live/quality measurement remains separately authorized | Structured planner provenance, per-wave bounds, deterministic validation, local accounting, recovery/idempotency, safe source URLs, and provider-specific live validation | Focused and neighboring deterministic tests pass; no claim of production runtime availability, live provider/planner behavior, semantic quality, search quality, or product support | P1 |
 | Deep Research claim-level provenance and citation verification | absent | Absent: the service does not extract individual claims, does not verify citation support, and does not produce a claim ledger | Deferred | A claim parser + verifier would require a new phase, a new boundary, and a benchmark to prove it improves quality; none of these is justified at the current baseline | Not supported as a product path | P2 |
 | Deep Research contradiction handling | absent | Absent: the service does not explicitly detect or surface contradictions between retrieved sources | Deferred | A contradiction-handling phase would require a new boundary, new prompts, and a benchmark; none of these is justified at the current baseline | Not supported as a product path | P2 |
 | Deep Research quality benchmark | absent | Absent: no frozen benchmark, no rubric, no run manifest, no human audit procedure has been published in the current commit; the existing deterministic E2E is a smoke, not a quality measurement; the calibration plan in `docs/DR_Q1A_BASELINE_CALIBRATION_PLAN.md` is a design-only artifact, not an executed benchmark | Calibration slice planned (see `docs/DR_Q1A_BASELINE_CALIBRATION_PLAN.md`) | A real benchmark needs an owner-approved corpus, rubric, and reviewer workflow; the calibration plan exists but the benchmark has not been executed | A future measurement may show that the existing pipeline meets the bar; the existing pipeline MUST NOT be modified in response to LLM recommendations until a measurement is published | P0 |
@@ -390,7 +390,7 @@ worker or process separation, and broad autonomous research
 behavior remain deferred until the calibration result is published
 and the dominant failure (if any) is identified.
 
-## Current documentation addendum (PRE2, at 8f08c42e)
+## Previous documentation addendum (PRE2, at 8f08c42e)
 
 The PRE2 documentation update introduces the following facts,
 which are design truth only and do not change runtime behavior:
@@ -399,10 +399,22 @@ which are design truth only and do not change runtime behavior:
   accepted design-only direction (see
   `docs/ADR_DEEP_RESEARCH_QUERY_PLANNING.md` and
   `docs/DEEP_RESEARCH_QUERY_PLANNING_DESIGN.md`);
-- runtime remains one search query per phase 1 call, with no
-  planning fan-out and no query-to-source provenance;
-- implementation and measurement proceed only through separately
-  scoped PRE2 stages (PRE2-A1, PRE2-A2, PRE2-B, PRE2-C, and the
-  separately authorized live and quality work);
+- the public production runtime remained one search query per phase 1
+  call, with no planning fan-out and no query-to-source provenance;
+- implementation and measurement were then deferred through separately
+  scoped PRE2 stages;
 - no provider, quality, or product-support claim follows from
   the accepted design.
+
+## Current implementation addendum (PRE2-C2)
+
+The current PRE2 branch adds the provider-neutral C1B/C2 component seams
+listed in the two Deep Research rows above. `ResearchController` is bounded
+and recoverable, but it is not wired into the public Deep Research service.
+The deterministic evidence is unit-level fake-planner/fake-search coverage;
+it proves state transitions, checkpoint reuse, provenance, local accounting,
+privacy and STOP behavior only. It does not prove planner or search quality,
+live provider behavior, production runtime availability, public API support,
+multi-wave `ResearchController` service integration, deployability, or
+spending/billing truth. No public Research Brief API, schema migration,
+credential surface, or production composition root changed in PRE2-C2.

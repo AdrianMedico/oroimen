@@ -65,10 +65,11 @@ MAX_QUERIES_PER_WAVE: Final[int] = 4
 #: cap; only the DERIVED queries are.
 MAX_QUERY_CHARS: Final[int] = 399
 
-#: Only ``wave_index == 0`` is permitted in C1A. Later slices may
-#: create waves with higher indices; the validator will then be
-#: extended to permit them.
-ALLOWED_WAVE_INDICES: Final[frozenset[int]] = frozenset({0})
+#: Bounded wave-index domain for the iterative C2 foundation. C1A/C1B use
+#: wave zero; C2 may authorize later indices through its smaller per-job
+#: ``IterationLimits.max_waves`` value.
+MAX_WAVES_PER_JOB: Final[int] = 8
+ALLOWED_WAVE_INDICES: Final[frozenset[int]] = frozenset(range(MAX_WAVES_PER_JOB))
 
 #: Planner kinds known to the planning validator. C1A's deterministic
 #: foundation remains available as a control; C1B adds provider-neutral
@@ -452,10 +453,9 @@ class SearchPlan:
     public persisted ``research_jobs.query`` is the source of
     original intent).
 
-    ``wave_index`` is the position of the wave in the (future)
-    research loop. C1A only permits ``wave_index == 0``; later
-    slices may produce additional waves without changing the
-    meaning of the C1A contract.
+    ``wave_index`` is the position of the wave in the bounded research loop.
+    C1A/C1B use wave zero; C2 may produce later waves within the hard
+    ``MAX_WAVES_PER_JOB`` safety bound.
 
     ``queries`` is an ordered tuple of ``PlannedSearchQuery``. The
     tuple length is bounded to ``[MIN_QUERIES_PER_WAVE,
@@ -643,7 +643,8 @@ def validate_search_plan(
         violations.append(
             _violation(
                 "wave_index",
-                f"must be in {sorted(ALLOWED_WAVE_INDICES)} for C1A, "
+                f"must be in {sorted(ALLOWED_WAVE_INDICES)} for the bounded "
+                "wave domain, "
                 f"got {plan.wave_index}",
             )
         )
@@ -1078,6 +1079,7 @@ __all__ = [
     "KNOWN_PLANNING_DECISIONS",
     "MAX_QUERIES_PER_WAVE",
     "MAX_QUERY_CHARS",
+    "MAX_WAVES_PER_JOB",
     "MIN_QUERIES_PER_WAVE",
     "SCHEMA_VERSION",
     "CapabilitySnapshot",

@@ -25,6 +25,7 @@ from hermes.deep_research.planning import (
     KNOWN_PLANNING_DECISIONS,
     MAX_QUERIES_PER_WAVE,
     MAX_QUERY_CHARS,
+    MAX_WAVES_PER_JOB,
     SCHEMA_VERSION,
     CapabilitySnapshot,
     PlannedSearchQuery,
@@ -322,13 +323,13 @@ def test_unsupported_schema_version_is_invalid() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (13) unsupported C1A wave index invalid
+# (13) unsupported wave index invalid
 # ---------------------------------------------------------------------------
 
 
 def test_unsupported_wave_index_is_invalid() -> None:
-    q = _make_query(0, wave_index=1)
-    plan = _make_plan((q,), wave_index=1)
+    q = _make_query(0, wave_index=MAX_WAVES_PER_JOB)
+    plan = _make_plan((q,), wave_index=MAX_WAVES_PER_JOB)
     with pytest.raises(PlanningValidationError) as excinfo:
         validate_search_plan(plan, expected_research_brief_sha256="f" * 64)
     names = {name for name, _ in excinfo.value.violations}
@@ -336,10 +337,7 @@ def test_unsupported_wave_index_is_invalid() -> None:
 
 
 def test_wave_index_constants_match_c1a_contract() -> None:
-    # C1A only permits wave_index == 0. This test documents that
-    # contract; a future slice that adds wave_index > 0 must update
-    # both the constant and this test.
-    assert frozenset({0}) == ALLOWED_WAVE_INDICES
+    assert frozenset(range(MAX_WAVES_PER_JOB)) == ALLOWED_WAVE_INDICES
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +693,7 @@ def test_observation_post_init_validates_wave_index() -> None:
     obs = SearchObservation(wave_index=0, query_id="q-abc")
     assert obs.wave_index == 0
     with pytest.raises(ValueError):
-        SearchObservation(wave_index=5, query_id="q-abc")
+        SearchObservation(wave_index=MAX_WAVES_PER_JOB, query_id="q-abc")
 
 
 def test_observation_serialization_roundtrip() -> None:

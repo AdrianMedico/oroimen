@@ -50,6 +50,10 @@ class PlannerRequest:
     capability_snapshot: CapabilitySnapshot
     created_at: str
     wave_index: int = 0
+    prior_source_refs: tuple[str, ...] = ()
+    open_gaps: tuple[str, ...] = ()
+    exhausted_query_ids: tuple[str, ...] = ()
+    exhausted_source_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.research_brief, str) or not self.research_brief.strip():
@@ -58,6 +62,16 @@ class PlannerRequest:
             raise ValueError("created_at must be a non-empty string")
         if self.wave_index not in ALLOWED_WAVE_INDICES:
             raise ValueError(f"wave_index must be in {sorted(ALLOWED_WAVE_INDICES)}")
+        for field_name, values in (
+            ("prior_source_refs", self.prior_source_refs),
+            ("open_gaps", self.open_gaps),
+            ("exhausted_query_ids", self.exhausted_query_ids),
+            ("exhausted_source_refs", self.exhausted_source_refs),
+        ):
+            if not isinstance(values, tuple) or not all(
+                isinstance(value, str) and value for value in values
+            ):
+                raise ValueError(f"{field_name} must be a tuple of non-empty strings")
         if (
             self.planning_limits.max_queries_per_wave
             != self.capability_snapshot.max_queries_per_wave
