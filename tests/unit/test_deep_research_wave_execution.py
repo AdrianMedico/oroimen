@@ -226,6 +226,17 @@ async def test_all_empty_and_all_failed_outcomes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_plus_failed_without_evidence_is_not_partial_success() -> None:
+    result = await SearchWaveExecutor(
+        _FakeSearch([_result([]), _error_result()])
+    ).execute(_plan((_query(0, "empty"), _query(1, "failed"))))
+
+    assert result.unique_source_refs == ()
+    assert result.outcome == WaveExecutionOutcome.PARTIAL_NO_EVIDENCE
+    assert result.outcome != WaveExecutionOutcome.PARTIAL_SUCCESS
+
+
+@pytest.mark.asyncio
 async def test_malformed_and_callable_failure_are_structured_and_continue() -> None:
     fake = _FakeSearch([{"unexpected": True}, RuntimeError("secret traceback")])
     result = await SearchWaveExecutor(fake).execute(
@@ -239,6 +250,50 @@ async def test_malformed_and_callable_failure_are_structured_and_continue() -> N
         "code": "search_callable_failed"
     }
     assert "secret" not in (result.observations[1].structured_error or "")
+
+
+@pytest.mark.asyncio
+async def test_iterable_materialization_failure_is_malformed_and_wave_continues() -> None:
+    class ExplodingRows:
+        backend_used = "malformed"
+
+        @property
+        def results(self):
+            def rows():
+                raise RuntimeError("iterator detail must not escape")
+                yield {"url": "https://never.test"}
+
+            return rows()
+
+    result = await SearchWaveExecutor(
+        _FakeSearch([ExplodingRows(), _result(["https://ok.test/source"])])
+    ).execute(_plan((_query(0, "malformed iterable"), _query(1, "ok"))))
+
+    assert json.loads(result.observations[0].structured_error or "{}") == {
+        "code": "malformed_result"
+    }
+    assert result.unique_source_refs == ("https://ok.test/source",)
+    assert result.outcome == WaveExecutionOutcome.PARTIAL_SUCCESS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [asyncio.CancelledError, SystemExit])
+async def test_terminal_iterable_semantics_are_not_swallowed(terminal: type[BaseException]) -> None:
+    class TerminalRows:
+        backend_used = "terminal"
+
+        @property
+        def results(self):
+            def rows():
+                raise terminal()
+                yield {"url": "https://never.test"}
+
+            return rows()
+
+    with pytest.raises(terminal):
+        await SearchWaveExecutor(_FakeSearch([TerminalRows()])).execute(
+            _plan((_query(0, "terminal"),))
+        )
 
 
 @pytest.mark.asyncio

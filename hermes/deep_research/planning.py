@@ -80,6 +80,12 @@ KNOWN_PLANNER_KINDS: Final[frozenset[str]] = frozenset(
     }
 )
 
+#: Semantic planner decisions are persisted with C1B plans.  The planner
+#: proposes one of these values; the deterministic validator owns the bounds.
+KNOWN_PLANNING_DECISIONS: Final[frozenset[str]] = frozenset(
+    {"DIRECT", "DECOMPOSE"}
+)
+
 #: Regex for a bounded planner version string. Allows ``MAJOR.MINOR.PATCH``
 #: with optional pre-release tag (lowercase alnum + dot + hyphen). Kept
 #: strict so the validator can reject garbage without ambiguity.
@@ -451,6 +457,9 @@ class SearchPlan:
     planning_limits: PlanningLimits
     capability_snapshot: CapabilitySnapshot
     created_at: str  # ISO 8601 UTC, e.g. "2026-08-07T12:00:00Z"
+    # C1A artifacts omit this optional C1B field.  C1B persists the semantic
+    # planner's decision so recovery does not infer it from query count.
+    planning_decision: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -788,7 +797,32 @@ def validate_search_plan(
             )
         )
 
-    # (11) created_at is a non-empty string (the format is left to
+    # (11) C1B semantic decision, when present
+    if plan.planning_decision is not None:
+        if plan.planning_decision not in KNOWN_PLANNING_DECISIONS:
+            violations.append(
+                _violation(
+                    "planning_decision",
+                    "must be DIRECT or DECOMPOSE",
+                )
+            )
+        elif plan.planning_decision == "DIRECT" and len(plan.queries) != 1:
+            violations.append(
+                _violation(
+                    "planning_decision_cardinality",
+                    "DIRECT requires exactly one query",
+                )
+            )
+        elif plan.planning_decision == "DECOMPOSE" and not (
+            2 <= len(plan.queries) <= MAX_QUERIES_PER_WAVE
+        ):
+            violations.append(
+                _violation(
+                    "planning_decision_cardinality",
+                    "DECOMPOSE requires 2..4 queries",
+                )
+            )
+    # (12) created_at is a non-empty string (the format is left to
     # the caller; C1A does not need to lock the format because the
     # store does not parse the timestamp).
     if not isinstance(plan.created_at, str) or not plan.created_at:
@@ -799,7 +833,7 @@ def validate_search_plan(
             )
         )
 
-    # (12) no extra recursive / nested plan structure. The frozen
+    # (13) no extra recursive / nested plan structure. The frozen
     # dataclass forbids nested SearchPlan / wave objects by typing,
     # so this is enforced statically; we still verify by reflection
     # that no field of the plan is itself a SearchPlan / tuple of
@@ -846,6 +880,7 @@ def build_search_plan(
     created_at: str,
     schema_version: int = SCHEMA_VERSION,
     expected_research_brief_sha256: str | None = None,
+    planning_decision: str | None = None,
 ) -> SearchPlan:
     """Build and validate a SearchPlan in one call.
 
@@ -884,6 +919,7 @@ def build_search_plan(
         planning_limits=planning_limits,
         capability_snapshot=capability_snapshot,
         created_at=created_at,
+        planning_decision=planning_decision,
     )
     validate_search_plan(
         plan,
@@ -902,7 +938,8 @@ def serialize_search_plan(plan: SearchPlan) -> bytes:
 
     Field order is fixed: schema_version, planner_kind, planner_version,
     research_brief_sha256, wave_index, queries, planning_limits,
-    capability_snapshot, created_at. ``sort_keys=True`` provides a
+    capability_snapshot, created_at, and optional planning_decision.
+    ``sort_keys=True`` provides a
     second layer of stability for any nested mappings we might add in
     the future. ``ensure_ascii=False`` keeps the output compact while
     staying strict UTF-8.
@@ -921,6 +958,8 @@ def serialize_search_plan(plan: SearchPlan) -> bytes:
         "capability_snapshot": plan.capability_snapshot.to_dict(),
         "created_at": plan.created_at,
     }
+    if plan.planning_decision is not None:
+        payload["planning_decision"] = plan.planning_decision
     return json.dumps(
         payload,
         sort_keys=True,
@@ -968,12 +1007,18 @@ def deserialize_search_plan(blob: bytes) -> SearchPlan:
             payload["capability_snapshot"]
         ),
         created_at=str(payload["created_at"]),
+        planning_decision=(
+            None
+            if payload.get("planning_decision") is None
+            else str(payload["planning_decision"])
+        ),
     )
 
 
 __all__ = [
     "ALLOWED_WAVE_INDICES",
     "KNOWN_PLANNER_KINDS",
+    "KNOWN_PLANNING_DECISIONS",
     "MAX_QUERIES_PER_WAVE",
     "MAX_QUERY_CHARS",
     "MIN_QUERIES_PER_WAVE",

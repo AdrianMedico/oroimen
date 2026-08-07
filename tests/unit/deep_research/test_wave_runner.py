@@ -12,8 +12,8 @@ from hermes.deep_research.plan_store import (
 )
 from hermes.deep_research.planner import (
     STRUCTURED_LLM_PLANNER_KIND,
-    HybridPlanner,
     PlannerRequest,
+    SemanticPlanner,
 )
 from hermes.deep_research.planning import (
     CapabilitySnapshot,
@@ -172,7 +172,7 @@ async def test_incompatible_persisted_plan_fails_before_search(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_hybrid_planner_runs_through_persisted_wave_boundary(tmp_path: Path) -> None:
+async def test_semantic_planner_runs_through_persisted_wave_boundary(tmp_path: Path) -> None:
     brief = "Compare regulation A across jurisdiction and timeline."
     llm_snapshot = CapabilitySnapshot(
         planner_kind=STRUCTURED_LLM_PLANNER_KIND,
@@ -185,18 +185,6 @@ async def test_hybrid_planner_runs_through_persisted_wave_boundary(tmp_path: Pat
             "version": "0.1.0",
         },
     )
-    direct_snapshot = CapabilitySnapshot(
-        planner_kind="c1b-direct",
-        planner_version="1.0.0",
-        max_queries_per_wave=4,
-        max_query_chars=399,
-        planner_provenance={
-            "provider": "local",
-            "model": "deterministic-direct",
-            "version": "1.0.0",
-        },
-    )
-
     class FakeStructuredPlanner:
         calls = 0
 
@@ -204,6 +192,7 @@ async def test_hybrid_planner_runs_through_persisted_wave_boundary(tmp_path: Pat
             self.calls += 1
             assert request.capability_snapshot == llm_snapshot
             return {
+                "decision": "DIRECT",
                 "queries": [
                     {
                         "text": "primary regulation A source",
@@ -214,10 +203,9 @@ async def test_hybrid_planner_runs_through_persisted_wave_boundary(tmp_path: Pat
             }
 
     structured = FakeStructuredPlanner()
-    hybrid = HybridPlanner(
+    semantic = SemanticPlanner(
         structured,
-        direct_capability_snapshot=direct_snapshot,
-        structured_capability_snapshot=llm_snapshot,
+        capability_snapshot=llm_snapshot,
     )
     request = PlannerRequest(
         research_brief=brief,
@@ -233,7 +221,7 @@ async def test_hybrid_planner_runs_through_persisted_wave_boundary(tmp_path: Pat
     usage: list[dict[str, int]] = []
 
     async def factory():
-        planned = await hybrid.plan(request)
+        planned = await semantic.plan(request)
         usage.append(dict(planned.local_usage))
         return planned.plan
 

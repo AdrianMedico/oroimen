@@ -22,6 +22,7 @@ import pytest
 from hermes.deep_research.planning import (
     ALLOWED_WAVE_INDICES,
     KNOWN_PLANNER_KINDS,
+    KNOWN_PLANNING_DECISIONS,
     MAX_QUERIES_PER_WAVE,
     MAX_QUERY_CHARS,
     SCHEMA_VERSION,
@@ -108,6 +109,7 @@ def _make_plan(
     planner_kind: str = PLANNER_KIND,
     planner_version: str = PLANNER_VERSION,
     created_at: str = CREATED_AT,
+    planning_decision: str | None = None,
 ) -> SearchPlan:
     planning_limits = _planning_limits()
     capability_snapshot = CapabilitySnapshot(
@@ -126,6 +128,7 @@ def _make_plan(
         planning_limits=planning_limits,
         capability_snapshot=capability_snapshot,
         created_at=created_at,
+        planning_decision=planning_decision,
     )
 
 
@@ -508,6 +511,52 @@ def test_planner_kind_constant_is_closed_for_c1a() -> None:
     assert frozenset(
         {"c1a-deterministic-stub", "c1b-direct", "c1b-llm-structured"}
     ) == KNOWN_PLANNER_KINDS
+
+
+def test_semantic_planning_decision_is_closed_and_cardinality_bound() -> None:
+    assert frozenset({"DIRECT", "DECOMPOSE"}) == KNOWN_PLANNING_DECISIONS
+    brief_sha = "f" * 64
+    direct = _make_plan(
+        (_make_query(0, brief_sha=brief_sha),),
+        brief_sha=brief_sha,
+        planning_decision="DIRECT",
+    )
+    validate_search_plan(direct, expected_research_brief_sha256=brief_sha)
+
+    decomposed = _make_plan(
+        (
+            _make_query(0, "one", brief_sha=brief_sha),
+            _make_query(1, "two", brief_sha=brief_sha),
+        ),
+        brief_sha=brief_sha,
+        planning_decision="DECOMPOSE",
+    )
+    validate_search_plan(decomposed, expected_research_brief_sha256=brief_sha)
+
+    for decision, queries in (
+        ("DIRECT", (_make_query(0, "one", brief_sha=brief_sha), _make_query(1, "two", brief_sha=brief_sha))),
+        ("DECOMPOSE", (_make_query(0, brief_sha=brief_sha),)),
+        ("UNKNOWN", (_make_query(0, brief_sha=brief_sha),)),
+    ):
+        invalid = _make_plan(
+            queries,
+            brief_sha=brief_sha,
+            planning_decision=decision,
+        )
+        with pytest.raises(PlanningValidationError):
+            validate_search_plan(invalid, expected_research_brief_sha256=brief_sha)
+
+
+def test_semantic_planning_decision_roundtrips_in_plan_artifact() -> None:
+    brief_sha = "f" * 64
+    plan = _make_plan(
+        (_make_query(0, brief_sha=brief_sha),),
+        brief_sha=brief_sha,
+        planning_decision="DIRECT",
+    )
+    payload = json.loads(serialize_search_plan(plan))
+    assert payload["planning_decision"] == "DIRECT"
+    assert deserialize_search_plan(serialize_search_plan(plan)).planning_decision == "DIRECT"
 
 
 def test_planning_limits_rejects_out_of_band_values() -> None:

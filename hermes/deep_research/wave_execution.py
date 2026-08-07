@@ -29,6 +29,7 @@ class WaveExecutionOutcome(StrEnum):
 
     ALL_SUCCESS = "all_success"
     PARTIAL_SUCCESS = "partial_success"
+    PARTIAL_NO_EVIDENCE = "partial_no_evidence"
     ALL_EMPTY = "all_empty"
     ALL_FAILED = "all_failed"
 
@@ -126,7 +127,7 @@ def _candidate_urls(result: Any) -> tuple[tuple[str, ...], str | None] | None:
     raw_rows, backend = extracted
     try:
         rows = tuple(raw_rows)
-    except (TypeError, ValueError):
+    except Exception:
         return None
 
     refs: list[str] = []
@@ -194,6 +195,12 @@ class SearchWaveExecutor:
 
         if failures == len(observations):
             outcome = WaveExecutionOutcome.ALL_FAILED
+        elif not unique_refs:
+            outcome = (
+                WaveExecutionOutcome.PARTIAL_NO_EVIDENCE
+                if failures
+                else WaveExecutionOutcome.ALL_EMPTY
+            )
         elif failures:
             outcome = WaveExecutionOutcome.PARTIAL_SUCCESS
         elif unique_refs:
