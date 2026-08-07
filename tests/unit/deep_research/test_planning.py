@@ -715,6 +715,31 @@ def test_observation_serialization_roundtrip() -> None:
     assert reloaded == obs
 
 
+def test_persisted_nested_shapes_fail_closed_without_coercion() -> None:
+    brief_sha = compute_research_brief_sha256("strict nested plan")
+    plan = _make_plan(
+        (_make_query(0, text="strict nested query", brief_sha=brief_sha),),
+        brief_sha=brief_sha,
+    )
+    payload = json.loads(serialize_search_plan(plan).decode("utf-8"))
+
+    bad_plan = dict(payload)
+    bad_plan["wave_index"] = "0"
+    with pytest.raises(ValueError):
+        deserialize_search_plan(json.dumps(bad_plan).encode("utf-8"))
+
+    bad_query = json.loads(json.dumps(payload))
+    bad_query["queries"][0]["ordinal"] = "0"
+    with pytest.raises(ValueError):
+        deserialize_search_plan(json.dumps(bad_query).encode("utf-8"))
+
+    observation = SearchObservation(wave_index=0, query_id="q-strict")
+    bad_observation = observation.to_dict()
+    bad_observation["attempt_count"] = "1"
+    with pytest.raises(ValueError):
+        SearchObservation.from_dict(bad_observation)
+
+
 # ---------------------------------------------------------------------------
 # build_search_plan helper
 # ---------------------------------------------------------------------------

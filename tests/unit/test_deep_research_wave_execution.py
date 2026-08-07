@@ -193,6 +193,9 @@ async def test_url_normalization_rejects_userinfo_and_scheme_relative_urls() -> 
                 [
                     "https://user:password@example.test/private",
                     "//example.test/scheme-relative",
+                    "https://example.test/password?password=secret",
+                    "https://example.test/session#access_token=secret",
+                    "https://example.test/jwt?jwt=secret",
                     "https://example.test/accepted",
                 ]
             )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -225,9 +226,19 @@ async def test_controller_runs_multiple_waves_and_preserves_original_brief(
     with pytest.raises(IterationStateCorruptError):
         store.load(JOB_ID)
 
+    store.write(JOB_ID, result.state)
+    persisted_payload = json.loads(persisted)
+    persisted_payload["source_query_ids"] = {}
+    (tmp_path / "research_iterations" / f"{JOB_ID}.iteration.json").write_text(
+        json.dumps(persisted_payload),
+        encoding="utf-8",
+    )
+    with pytest.raises(IterationStateCorruptError):
+        store.load(JOB_ID)
+
 
 @pytest.mark.asyncio
-async def test_recovery_reuses_plan_persisted_before_cancellation(tmp_path: Path) -> None:
+async def test_recovery_does_not_replay_uncertain_dispatch(tmp_path: Path) -> None:
     raw_planner = _RawPlanner([_payload("DECOMPOSE", "recoverable")])
 
     class _CancelOnSecondSearch(_FakeSearch):
@@ -268,7 +279,8 @@ async def test_recovery_reuses_plan_persisted_before_cancellation(tmp_path: Path
     assert checkpoint.active_plan is not None
     assert len(checkpoint.active_observations) == 1
     assert checkpoint.accounting.planner_calls == 1
-    assert checkpoint.accounting.search_calls == 1
+    assert checkpoint.accounting.search_calls == 2
+    assert checkpoint.active_inflight_query_id == checkpoint.active_plan.queries[1].query_id
 
     class _PlannerMustNotRun:
         async def plan(self, request: PlannerRequest) -> Any:
@@ -292,11 +304,10 @@ async def test_recovery_reuses_plan_persisted_before_cancellation(tmp_path: Path
         limits=_limits(max_waves=1, max_searches=2, max_local_call_units=4),
     )
 
-    assert result.state.stop_reason is StopReason.OBJECTIVE_COVERED
+    assert result.state.stop_reason is StopReason.CANCELLED
     assert result.state.accounting.planner_calls == 1
     assert result.state.accounting.search_calls == 2
-    assert len(search.calls) == 1
-    assert "recoverable retrieval question 0" not in search.calls[0]
+    assert search.calls == []
 
 
 @pytest.mark.asyncio
@@ -355,6 +366,20 @@ async def test_stop_reasons_cover_budget_no_progress_and_cooperative_cancel(
         search=_FakeSearch(empty=True),
     ).run(JOB_ID, BRIEF, limits=_limits(max_waves=1, max_searches=1))
     assert empty_result.state.stop_reason is StopReason.NO_MATERIAL_GAIN
+
+    invalid_coverage = _ScriptedAssessor(
+        lambda _call, _state, _wave: GapAssessment(
+            decision=ContinuationDecision.STOP_COVERED,
+            material_gain=True,
+        )
+    )
+    with pytest.raises(IterationInvariantError, match="new bounded evidence"):
+        await _controller(
+            raw_planner=_RawPlanner([_payload("DIRECT", "false coverage")]),
+            assessor=invalid_coverage,
+            store=LocalIterationStateStore(tmp_path / "false-coverage"),
+            search=_FakeSearch(empty=True),
+        ).run(JOB_ID, BRIEF, limits=_limits(max_waves=1, max_searches=1))
 
     elapsed_calls = iter((0, 100))
     elapsed_assessor = _ScriptedAssessor(
@@ -450,7 +475,69 @@ async def test_stop_reasons_cover_budget_no_progress_and_cooperative_cancel(
     assert timed_result.state.stop_reason is StopReason.BUDGET_EXHAUSTED
     assert timed_result.state.active_plan is not None
     assert timed_result.state.accounting.planner_calls == 1
-    assert timed_result.state.accounting.search_calls == 0
+    assert timed_result.state.accounting.search_calls == 1
+    assert timed_result.state.active_inflight_query_id is not None
+
+    class _SlowAssessor:
+        def assess(self, **_: Any) -> GapAssessment:
+            time.sleep(0.1)
+            return GapAssessment(
+                decision=ContinuationDecision.STOP_NO_MATERIAL_GAIN,
+                material_gain=False,
+            )
+
+    slow_assessor_result = await ResearchController(
+        planner=SemanticPlanner(
+            _RawPlanner([_payload("DIRECT", "slow assessor")]),
+            capability_snapshot=CAPABILITY,
+        ),
+        executor=SearchWaveExecutor(_FakeSearch()),
+        assessor=_SlowAssessor(),
+        state_store=LocalIterationStateStore(tmp_path / "slow-assessor"),
+        planning_limits=PLANNING_LIMITS,
+        capability_snapshot=CAPABILITY,
+        clock_ms=lambda: 0,
+        created_at_factory=lambda: "2026-08-07T00:00:00Z",
+    ).run(
+        JOB_ID,
+        BRIEF,
+        limits=_limits(max_waves=1, max_searches=1, max_elapsed_ms=20),
+    )
+    assert slow_assessor_result.state.stop_reason is StopReason.BUDGET_EXHAUSTED
+    assert slow_assessor_result.state.accounting.assessment_calls == 1
+    assert slow_assessor_result.state.assessment_inflight is True
+
+    class _BlockingRows:
+        def __iter__(self):
+            time.sleep(0.05)
+            return iter([{"url": "https://sources.test/blocking"}])
+
+    class _BlockingIterableSearch(_FakeSearch):
+        async def __call__(self, **kwargs: Any) -> SearchResult:
+            del kwargs
+            return SearchResult(
+                results=_BlockingRows(),  # type: ignore[arg-type]
+                backend_used="fake",
+                query="blocking",
+                content_mode="snippet",
+                original_content_mode="snippet",
+                format_fallback=False,
+                size_guard_chars=200_000,
+                truncated=False,
+            )
+
+    blocking_result = await _controller(
+        raw_planner=_RawPlanner([_payload("DIRECT", "blocking iterable")]),
+        assessor=elapsed_assessor,
+        store=LocalIterationStateStore(tmp_path / "blocking-iterable"),
+        search=_BlockingIterableSearch(),
+    ).run(
+        JOB_ID,
+        BRIEF,
+        limits=_limits(max_waves=1, max_searches=1, max_elapsed_ms=5),
+    )
+    assert blocking_result.state.stop_reason is StopReason.BUDGET_EXHAUSTED
+    assert blocking_result.state.active_inflight_query_id is not None
 
     cancelled = _Cancellation(cancelled=True)
     cancel_assessor = _ScriptedAssessor(
@@ -522,7 +609,7 @@ async def test_controller_rejects_non_semantic_plan_and_repeated_query(
 
 
 @pytest.mark.asyncio
-async def test_signed_source_is_rejected_before_durable_checkpoint(tmp_path: Path) -> None:
+async def test_signed_source_is_sanitized_before_durable_checkpoint(tmp_path: Path) -> None:
     class _SignedSearch(_FakeSearch):
         async def __call__(self, **kwargs: Any) -> SearchResult:
             del kwargs
@@ -541,19 +628,22 @@ async def test_signed_source_is_rejected_before_durable_checkpoint(tmp_path: Pat
 
     store = LocalIterationStateStore(tmp_path)
     assessor = _ScriptedAssessor(
-        lambda _call, _state, _wave: pytest.fail("assessment must not run")
+        lambda _call, _state, _wave: GapAssessment(
+            decision=ContinuationDecision.STOP_NO_MATERIAL_GAIN,
+            material_gain=False,
+        )
     )
-    with pytest.raises(ValueError, match="safe HTTP"):
-        await _controller(
-            raw_planner=_RawPlanner([_payload("DIRECT", "signed")]),
-            assessor=assessor,
-            store=store,
-            search=_SignedSearch(),
-        ).run(JOB_ID, BRIEF, limits=_limits(max_waves=1, max_searches=1))
+    result = await _controller(
+        raw_planner=_RawPlanner([_payload("DIRECT", "signed")]),
+        assessor=assessor,
+        store=store,
+        search=_SignedSearch(),
+    ).run(JOB_ID, BRIEF, limits=_limits(max_waves=1, max_searches=1))
 
     checkpoint = store.load(JOB_ID)
     assert checkpoint is not None
-    assert checkpoint.active_observations == ()
+    assert result.state.stop_reason is StopReason.NO_MATERIAL_GAIN
+    assert checkpoint.waves[0].unique_source_refs == ()
     assert "secret-value" not in (
         tmp_path / "research_iterations" / f"{JOB_ID}.iteration.json"
     ).read_text(encoding="utf-8")

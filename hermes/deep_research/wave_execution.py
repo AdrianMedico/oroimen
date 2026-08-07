@@ -7,6 +7,8 @@ globally deduplicated source references with first-query provenance.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -14,7 +16,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from hermes.deep_research.planning import (
     PlannedSearchQuery,
@@ -105,6 +107,15 @@ def _normalize_url(raw: Any) -> str | None:
         return None
     if parsed.username is not None or parsed.password is not None:
         return None
+    # Persisted source refs are intentionally allow-listed to origin/path.
+    # Query strings and fragments may contain signed URLs or session tokens.
+    if parsed.query or parsed.fragment:
+        return None
+    try:
+        if parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=64):
+            return None
+    except ValueError:
+        return None
     return value
 
 
@@ -128,7 +139,23 @@ def _rows(result: Any) -> tuple[Iterable[Any], str | None] | None:
     return raw_rows, backend
 
 
-def _candidate_urls(result: Any) -> tuple[tuple[str, ...], str | None] | None:
+def _evidence_digest(raw_row: Any, normalized_url: str) -> str:
+    fields: dict[str, str] = {"url": normalized_url}
+    if isinstance(raw_row, dict):
+        for key in ("title", "snippet", "content", "description"):
+            value = raw_row.get(key)
+            if isinstance(value, str):
+                fields[key] = value[:2_048]
+    return hashlib.sha256(
+        json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _candidate_urls(
+    result: Any,
+) -> tuple[tuple[tuple[str, str], ...], str | None] | None:
     extracted = _rows(result)
     if extracted is None:
         return None
@@ -138,7 +165,7 @@ def _candidate_urls(result: Any) -> tuple[tuple[str, ...], str | None] | None:
     except Exception:
         return None
 
-    refs: list[str] = []
+    refs: list[tuple[str, str]] = []
     try:
         for index, row in enumerate(iterator):
             if index >= MAX_RESULT_ROWS:
@@ -154,7 +181,7 @@ def _candidate_urls(result: Any) -> tuple[tuple[str, ...], str | None] | None:
                 raw_url = row.get("url")
             normalized = _normalize_url(raw_url)
             if normalized is not None:
-                refs.append(normalized)
+                refs.append((normalized, _evidence_digest(row, normalized)))
     except Exception:
         return None
     return tuple(refs), backend
@@ -192,6 +219,7 @@ class SearchWaveExecutor:
         *,
         completed_observations: tuple[SearchObservation, ...] = (),
         on_observation: Callable[[SearchObservation], None] | None = None,
+        on_dispatch: Callable[[PlannedSearchQuery], None] | None = None,
     ) -> WaveExecutionResult:
         ordered_queries = sorted(plan.queries, key=lambda item: item.ordinal)
         if not isinstance(completed_observations, tuple):
@@ -224,6 +252,8 @@ class SearchWaveExecutor:
             )
 
         for query in ordered_queries[len(completed_observations) :]:
+            if on_dispatch is not None:
+                on_dispatch(query)
             observation, refs = await self._execute_query(plan.wave_index, query)
             observations.append(observation)
             if observation.structured_error is not None:
@@ -314,7 +344,9 @@ class SearchWaveExecutor:
                 (),
             )
 
-        candidates = _candidate_urls(result)
+        # Materialization runs off the event loop so the controller's
+        # asyncio deadline also covers hostile/slow arbitrary iterables.
+        candidates = await asyncio.to_thread(_candidate_urls, result)
         if candidates is None:
             return (
                 self._observation(
@@ -325,13 +357,16 @@ class SearchWaveExecutor:
                 ),
                 (),
             )
-        refs, backend = candidates
+        candidates_with_digests, backend = candidates
+        refs = tuple(ref for ref, _digest in candidates_with_digests)
+        evidence_digests = tuple(digest for _ref, digest in candidates_with_digests)
         return (
             self._observation(
                 wave_index=wave_index,
                 query_id=query.query_id,
                 backend=backend,
                 result_refs=refs,
+                evidence_digests=evidence_digests,
                 duration_ms=self._duration_ms(started),
             ),
             refs,
@@ -348,6 +383,7 @@ class SearchWaveExecutor:
         query_id: str,
         backend: str | None = None,
         result_refs: tuple[str, ...] = (),
+        evidence_digests: tuple[str, ...] = (),
         structured_error: str | None = None,
         duration_ms: int | None = None,
     ) -> SearchObservation:
@@ -359,6 +395,7 @@ class SearchWaveExecutor:
             structured_error=structured_error,
             attempt_count=1,
             duration_ms=duration_ms,
+            evidence_digests=evidence_digests,
             local_usage={"search_calls": 1},
         )
 

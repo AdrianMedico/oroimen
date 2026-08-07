@@ -71,6 +71,9 @@ _ITERATION_STATE_KEYS = frozenset(
         "next_wave_index",
         "started_at_ms",
         "active_plan",
+        "planning_inflight",
+        "assessment_inflight",
+        "active_inflight_query_id",
         "active_observations",
         "active_source_refs",
         "active_source_query_ids",
@@ -380,6 +383,8 @@ def _safe_source_ref(value: str) -> bool:
         and bool(parsed.netloc)
         and parsed.username is None
         and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
     )
 
 
@@ -426,6 +431,10 @@ class WaveRecord:
         for observation in self.observations:
             if len(observation.result_refs) > MAX_RESULT_REFS_PER_OBSERVATION:
                 raise ValueError("observation result refs exceed the per-query cap")
+            if len(observation.evidence_digests) != len(observation.result_refs):
+                raise ValueError("observation evidence must align with source refs")
+            if observation.local_usage.get("search_calls") != 1:
+                raise ValueError("observation accounting must report one search call")
             if not all(
                 isinstance(source_ref, str)
                 and len(source_ref) <= MAX_SOURCE_REF_CHARS
@@ -476,6 +485,16 @@ class WaveRecord:
             MappingProxyType(dict(self.source_query_ids)),
         )
 
+    @property
+    def evidence_digests(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                digest
+                for observation in self.observations
+                for digest in observation.evidence_digests
+            )
+        )
+
     @classmethod
     def from_result(cls, result: WaveExecutionResult) -> WaveRecord:
         return cls(
@@ -501,24 +520,49 @@ class WaveRecord:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> WaveRecord:
+        _require_keys(
+            payload,
+            {
+                "wave_index",
+                "plan",
+                "observations",
+                "unique_source_refs",
+                "source_query_ids",
+                "outcome",
+                "unique_source_cap",
+            },
+            "wave record",
+        )
+        observations_raw = payload["observations"]
+        source_refs_raw = payload["unique_source_refs"]
+        if not isinstance(observations_raw, list) or not all(
+            isinstance(item, Mapping) for item in observations_raw
+        ):
+            raise ValueError("wave observations must be a list of objects")
+        if not isinstance(source_refs_raw, list) or not all(
+            isinstance(value, str) for value in source_refs_raw
+        ):
+            raise ValueError("wave source refs must be a list of strings")
+        source_query_ids_raw = _strict_mapping(payload, "source_query_ids")
+        if not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in source_query_ids_raw.items()
+        ):
+            raise ValueError("wave source provenance must contain strings")
+        outcome_raw = _strict_str(payload, "outcome")
         return cls(
-            wave_index=int(payload["wave_index"]),
+            wave_index=_strict_int(payload, "wave_index"),
             plan=deserialize_search_plan(
                 json.dumps(payload["plan"], sort_keys=True).encode("utf-8")
             ),
             observations=tuple(
                 SearchObservation.from_dict(item)
-                for item in payload.get("observations", [])
+                for item in observations_raw
             ),
-            unique_source_refs=tuple(
-                str(value) for value in payload.get("unique_source_refs", [])
-            ),
-            source_query_ids={
-                str(key): str(value)
-                for key, value in dict(payload.get("source_query_ids", {})).items()
-            },
-            outcome=WaveExecutionOutcome(str(payload["outcome"])),
-            unique_source_cap=int(payload["unique_source_cap"]),
+            unique_source_refs=tuple(source_refs_raw),
+            source_query_ids=dict(source_query_ids_raw),
+            outcome=WaveExecutionOutcome(outcome_raw),
+            unique_source_cap=_strict_int(payload, "unique_source_cap"),
         )
 
 
@@ -535,6 +579,9 @@ class ResearchIterationState:
     next_wave_index: int
     started_at_ms: int
     active_plan: SearchPlan | None = None
+    planning_inflight: bool = False
+    assessment_inflight: bool = False
+    active_inflight_query_id: str | None = None
     active_observations: tuple[SearchObservation, ...] = ()
     active_source_refs: tuple[str, ...] = ()
     active_source_query_ids: Mapping[str, str] = field(default_factory=dict)
@@ -566,6 +613,31 @@ class ResearchIterationState:
         except ValueError as exc:
             raise ValueError("invalid iteration phase") from exc
         object.__setattr__(self, "phase", phase)
+        for name in ("planning_inflight", "assessment_inflight"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a bool")
+        if self.active_inflight_query_id is not None and (
+            not isinstance(self.active_inflight_query_id, str)
+            or not self.active_inflight_query_id
+        ):
+            raise ValueError("active_inflight_query_id must be a string or null")
+        if self.planning_inflight and self.assessment_inflight:
+            raise ValueError("only one local call may be in flight")
+        if self.planning_inflight and phase not in {
+            IterationPhase.READY_TO_PLAN,
+            IterationPhase.STOPPED,
+        }:
+            raise ValueError("planning_inflight requires ready_to_plan")
+        if self.assessment_inflight and phase not in {
+            IterationPhase.ASSESSMENT_PENDING,
+            IterationPhase.STOPPED,
+        }:
+            raise ValueError("assessment_inflight requires assessment_pending")
+        if self.active_inflight_query_id is not None and phase not in {
+            IterationPhase.PLAN_PERSISTED,
+            IterationPhase.STOPPED,
+        }:
+            raise ValueError("active_inflight_query_id requires plan_persisted")
         if self.active_plan is not None and self.active_plan.wave_index != self.next_wave_index:
             raise ValueError("active plan must target next_wave_index")
         plans = [wave.plan for wave in self.waves]
@@ -594,6 +666,8 @@ class ResearchIterationState:
                 or self.active_source_query_ids
             ):
                 raise ValueError("partial wave evidence requires an active plan")
+            if self.active_inflight_query_id is not None:
+                raise ValueError("in-flight query requires an active plan")
         else:
             ordered_queries = sorted(
                 self.active_plan.queries,
@@ -632,6 +706,13 @@ class ResearchIterationState:
                 raise ValueError("active sources must match partial observations")
             if dict(self.active_source_query_ids) != expected_active_provenance:
                 raise ValueError("active source provenance must match partial observations")
+            next_query_id = (
+                ordered_queries[len(self.active_observations)].query_id
+                if len(self.active_observations) < len(ordered_queries)
+                else None
+            )
+            if self.active_inflight_query_id not in {None, next_query_id}:
+                raise ValueError("in-flight query must be the next ordinal query")
         expected_query_ids = tuple(
             query.query_id for wave in self.waves for query in wave.plan.queries
         )
@@ -675,8 +756,12 @@ class ResearchIterationState:
             raise ValueError("exhausted query texts must have been searched")
         if not set(self.exhausted_source_refs).issubset(self.source_refs):
             raise ValueError("exhausted sources must be present in evidence")
-        if not set(self.source_query_ids).issubset(self.source_refs):
-            raise ValueError("source provenance keys must be evidence refs")
+        expected_source_query_ids: dict[str, str] = {}
+        for wave in self.waves:
+            for source_ref, query_id in wave.source_query_ids.items():
+                expected_source_query_ids.setdefault(source_ref, query_id)
+        if dict(self.source_query_ids) != expected_source_query_ids:
+            raise ValueError("source provenance must match every completed wave")
         if not all(
             isinstance(source_ref, str)
             and isinstance(query_id, str)
@@ -684,9 +769,13 @@ class ResearchIterationState:
             for source_ref, query_id in self.source_query_ids.items()
         ):
             raise ValueError("source provenance must contain non-empty strings")
-        expected_search_calls = len(expected_query_ids) + len(self.active_observations)
+        expected_search_calls = (
+            len(expected_query_ids)
+            + len(self.active_observations)
+            + (1 if self.active_inflight_query_id is not None else 0)
+        )
         if self.accounting.search_calls != expected_search_calls:
-            raise ValueError("search accounting must match completed wave queries")
+            raise ValueError("search accounting must match dispatched query calls")
         all_query_ids = set(expected_query_ids)
         if not set(self.source_query_ids.values()).issubset(all_query_ids):
             raise ValueError("source provenance must match completed wave queries")
@@ -707,6 +796,29 @@ class ResearchIterationState:
             raise ValueError("assessment_pending state cannot contain an active plan")
         if self.phase is IterationPhase.PLAN_PERSISTED and self.active_plan is None:
             raise ValueError("plan_persisted state requires an active plan")
+        completed_waves = len(self.waves)
+        if self.phase is IterationPhase.READY_TO_PLAN:
+            expected_planner_calls = completed_waves + (1 if self.planning_inflight else 0)
+            expected_assessment_calls = completed_waves
+        elif self.phase is IterationPhase.PLAN_PERSISTED:
+            expected_planner_calls = completed_waves + 1
+            expected_assessment_calls = completed_waves
+        elif self.phase is IterationPhase.ASSESSMENT_PENDING:
+            expected_planner_calls = completed_waves
+            expected_assessment_calls = completed_waves - 1 + (
+                1 if self.assessment_inflight else 0
+            )
+        else:
+            expected_planner_calls = completed_waves + (
+                1 if self.planning_inflight or self.active_plan is not None else 0
+            )
+            expected_assessment_calls = completed_waves
+            if not self.assessment_inflight and not self.active_plan:
+                expected_assessment_calls -= 1 if self.accounting.assessment_calls == completed_waves - 1 else 0
+        if self.accounting.planner_calls != expected_planner_calls:
+            raise ValueError("planner accounting is incompatible with iteration phase")
+        if self.accounting.assessment_calls != expected_assessment_calls:
+            raise ValueError("assessment accounting is incompatible with iteration phase")
         object.__setattr__(self, "source_query_ids", MappingProxyType(dict(self.source_query_ids)))
         object.__setattr__(
             self,
@@ -752,6 +864,9 @@ class ResearchIterationState:
                 if self.active_plan is None
                 else json.loads(serialize_search_plan(self.active_plan).decode("utf-8"))
             ),
+            "planning_inflight": self.planning_inflight,
+            "assessment_inflight": self.assessment_inflight,
+            "active_inflight_query_id": self.active_inflight_query_id,
             "active_observations": [
                 observation.to_dict() for observation in self.active_observations
             ],
@@ -777,6 +892,15 @@ class ResearchIterationState:
             raise ValueError("unsupported iteration state schema")
         active_raw = payload.get("active_plan")
         stop_raw = payload.get("stop_reason")
+        active_inflight_raw = payload.get("active_inflight_query_id")
+        if active_inflight_raw is not None and not isinstance(active_inflight_raw, str):
+            raise ValueError("active_inflight_query_id must be a string or null")
+        planning_inflight_raw = payload.get("planning_inflight")
+        assessment_inflight_raw = payload.get("assessment_inflight")
+        if not isinstance(planning_inflight_raw, bool) or not isinstance(
+            assessment_inflight_raw, bool
+        ):
+            raise ValueError("in-flight flags must be bools")
         active_observations_raw = payload.get("active_observations", [])
         if not isinstance(active_observations_raw, list):
             raise ValueError("active_observations must be a list")
@@ -831,6 +955,9 @@ class ResearchIterationState:
                     json.dumps(active_raw, sort_keys=True).encode("utf-8")
                 )
             ),
+            planning_inflight=planning_inflight_raw,
+            assessment_inflight=assessment_inflight_raw,
+            active_inflight_query_id=active_inflight_raw,
             active_observations=tuple(
                 SearchObservation.from_dict(item) for item in active_observations_raw
             ),
@@ -935,6 +1062,17 @@ class ResearchController:
         if state.phase is IterationPhase.STOPPED:
             return ResearchRunResult(state=state)
 
+        # No provider idempotency key exists at this internal seam.  An
+        # interrupted dispatched call is therefore never replayed silently;
+        # recovery records a truthful cancellation STOP instead.
+        if (
+            state.planning_inflight
+            or state.assessment_inflight
+            or state.active_inflight_query_id is not None
+        ):
+            state = self._stop(state, StopReason.CANCELLED)
+            return ResearchRunResult(state=state)
+
         while state.phase is not IterationPhase.STOPPED:
             if self._cancelled(cancellation):
                 state = self._stop(state, StopReason.CANCELLED)
@@ -958,30 +1096,35 @@ class ResearchController:
                     exhausted_query_ids=state.exhausted_query_ids,
                     exhausted_source_refs=state.exhausted_source_refs,
                 )
+                planner_state = self._replace_state(
+                    state,
+                    planning_inflight=True,
+                    accounting=ResearchAccounting(
+                        planner_calls=state.accounting.planner_calls + 1,
+                        search_calls=state.accounting.search_calls,
+                        assessment_calls=state.accounting.assessment_calls,
+                    ),
+                )
+                self._state_store.write(job_id, planner_state)
                 try:
                     planned = await asyncio.wait_for(
                         self._planner.plan(request),
-                        timeout=self._remaining_seconds(state, limits),
+                        timeout=self._remaining_seconds(planner_state, limits),
                     )
                 except TimeoutError:
-                    state = self._stop(state, StopReason.BUDGET_EXHAUSTED)
+                    state = self._stop(planner_state, StopReason.BUDGET_EXHAUSTED)
                     break
                 self._validate_planner_result(
                     planned,
-                    state,
+                    planner_state,
                     brief_hash,
                     self._capability_snapshot,
                 )
-                accounting = ResearchAccounting(
-                    planner_calls=state.accounting.planner_calls + 1,
-                    search_calls=state.accounting.search_calls,
-                    assessment_calls=state.accounting.assessment_calls,
-                )
                 state = self._replace_state(
-                    state,
+                    planner_state,
                     phase=IterationPhase.PLAN_PERSISTED,
                     active_plan=planned.plan,
-                    accounting=accounting,
+                    planning_inflight=False,
                 )
                 self._state_store.write(job_id, state)
                 continue
@@ -1008,12 +1151,22 @@ class ResearchController:
                         limits=limits,
                     )
 
+                def checkpoint_dispatch(query: Any) -> None:
+                    nonlocal state_for_execution
+                    state_for_execution = self._checkpoint_dispatch(
+                        job_id=job_id,
+                        state=state_for_execution,
+                        query=query,
+                        limits=limits,
+                    )
+
                 try:
                     execution = await asyncio.wait_for(
                         self._executor.execute(
                             plan,
                             completed_observations=state_for_execution.active_observations,
                             on_observation=checkpoint_observation,
+                            on_dispatch=checkpoint_dispatch,
                         ),
                         timeout=self._remaining_seconds(state, limits),
                     )
@@ -1023,6 +1176,13 @@ class ResearchController:
                     break
                 state = state_for_execution
                 search_calls = self._count_search_calls(execution)
+                if (
+                    state.active_inflight_query_id is not None
+                    or len(state.active_observations) != len(plan.queries)
+                ):
+                    raise IterationInvariantError(
+                        "executor completed without durable observation checkpoints"
+                    )
                 wave = WaveRecord.from_result(execution)
                 if state.accounting.search_calls + search_calls - len(
                     state.active_observations
@@ -1039,29 +1199,47 @@ class ResearchController:
                     state = self._stop(state, StopReason.BUDGET_EXHAUSTED)
                     break
                 wave = state.waves[-1]
-                proposal = self._assessor.assess(
-                    research_brief=research_brief,
-                    state=state,
-                    wave=wave,
+                assessment_state = self._replace_state(
+                    state,
+                    assessment_inflight=True,
+                    accounting=ResearchAccounting(
+                        planner_calls=state.accounting.planner_calls,
+                        search_calls=state.accounting.search_calls,
+                        assessment_calls=state.accounting.assessment_calls + 1,
+                    ),
                 )
-                if inspect.isawaitable(proposal):
-                    try:
+                self._state_store.write(job_id, assessment_state)
+                try:
+                    proposal = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._assessor.assess,
+                            research_brief=research_brief,
+                            state=assessment_state,
+                            wave=wave,
+                        ),
+                        timeout=self._remaining_seconds(assessment_state, limits),
+                    )
+                    if inspect.isawaitable(proposal):
                         assessment = await asyncio.wait_for(
                             proposal,
-                            timeout=self._remaining_seconds(state, limits),
+                            timeout=self._remaining_seconds(assessment_state, limits),
                         )
-                    except TimeoutError:
-                        state = self._stop(state, StopReason.BUDGET_EXHAUSTED)
-                        break
-                else:
-                    assessment = proposal
-                self._validate_assessment(assessment, state, wave)
-                accounting = ResearchAccounting(
-                    planner_calls=state.accounting.planner_calls,
-                    search_calls=state.accounting.search_calls,
-                    assessment_calls=state.accounting.assessment_calls + 1,
+                    else:
+                        assessment = proposal
+                except TimeoutError:
+                    state = self._stop(assessment_state, StopReason.BUDGET_EXHAUSTED)
+                    break
+                completed_assessment_state = self._replace_state(
+                    assessment_state,
+                    phase=IterationPhase.READY_TO_PLAN,
+                    assessment_inflight=False,
                 )
-                state = self._apply_assessment(state, assessment, accounting)
+                self._validate_assessment(assessment, completed_assessment_state, wave)
+                state = self._apply_assessment(
+                    completed_assessment_state,
+                    assessment,
+                    completed_assessment_state.accounting,
+                )
                 self._state_store.write(job_id, state)
                 continue
 
@@ -1126,11 +1304,47 @@ class ResearchController:
         assert state.active_plan is not None
         query_count = len(state.active_plan.queries)
         remaining_queries = query_count - len(state.active_observations)
+        already_reserved = 1 if state.active_inflight_query_id is not None else 0
         return (
-            state.accounting.search_calls + remaining_queries <= state.limits.max_searches
-            and state.accounting.total_local_call_units + remaining_queries
+            state.accounting.search_calls + remaining_queries - already_reserved
+            <= state.limits.max_searches
+            and state.accounting.total_local_call_units + remaining_queries - already_reserved
             <= state.limits.max_local_call_units
         )
+
+    def _checkpoint_dispatch(
+        self,
+        *,
+        job_id: str,
+        state: ResearchIterationState,
+        query: Any,
+        limits: IterationLimits,
+    ) -> ResearchIterationState:
+        if state.active_plan is None:
+            raise IterationInvariantError("query dispatch requires an active plan")
+        if state.active_inflight_query_id is not None:
+            raise IterationInvariantError("a query is already in flight")
+        ordered_queries = sorted(state.active_plan.queries, key=lambda item: item.ordinal)
+        next_ordinal = len(state.active_observations)
+        if next_ordinal >= len(ordered_queries):
+            raise IterationInvariantError("executor dispatched too many queries")
+        if query.query_id != ordered_queries[next_ordinal].query_id:
+            raise IterationInvariantError("executor dispatch order drifted")
+        if state.accounting.search_calls + 1 > limits.max_searches:
+            raise IterationInvariantError("executor exceeded the search-call budget")
+        if state.accounting.total_local_call_units + 1 > limits.max_local_call_units:
+            raise IterationInvariantError("executor exceeded the local-call budget")
+        updated = self._replace_state(
+            state,
+            active_inflight_query_id=query.query_id,
+            accounting=ResearchAccounting(
+                planner_calls=state.accounting.planner_calls,
+                search_calls=state.accounting.search_calls + 1,
+                assessment_calls=state.accounting.assessment_calls,
+            ),
+        )
+        self._state_store.write(job_id, updated)
+        return updated
 
     def _checkpoint_observation(
         self,
@@ -1153,8 +1367,8 @@ class ResearchController:
             raise IterationInvariantError("executor observation order drifted")
         if observation.local_usage.get("search_calls") != 1:
             raise IterationInvariantError("executor observation accounting drifted")
-        if state.accounting.total_local_call_units + 1 > limits.max_local_call_units:
-            raise IterationInvariantError("executor exceeded the reserved local-call budget")
+        if state.active_inflight_query_id != observation.query_id:
+            raise IterationInvariantError("observation has no matching dispatched query")
         active_observations = (*state.active_observations, observation)
         active_source_refs, active_source_query_ids = self._source_evidence(
             active_observations
@@ -1164,11 +1378,7 @@ class ResearchController:
             active_observations=active_observations,
             active_source_refs=active_source_refs,
             active_source_query_ids=active_source_query_ids,
-            accounting=ResearchAccounting(
-                planner_calls=state.accounting.planner_calls,
-                search_calls=state.accounting.search_calls + 1,
-                assessment_calls=state.accounting.assessment_calls,
-            ),
+            active_inflight_query_id=None,
         )
         self._state_store.write(job_id, updated)
         return updated
@@ -1266,9 +1476,7 @@ class ResearchController:
             open_gaps=state.open_gaps,
             accounting=ResearchAccounting(
                 planner_calls=state.accounting.planner_calls,
-                search_calls=state.accounting.search_calls
-                + len(query_ids)
-                - len(state.active_observations),
+                search_calls=state.accounting.search_calls,
                 assessment_calls=state.accounting.assessment_calls,
             ),
             stop_reason=None,
@@ -1290,16 +1498,28 @@ class ResearchController:
             raise IterationInvariantError("STOP_COVERED requires no remaining gaps")
         if assessment.decision is ContinuationDecision.CONTINUE and not assessment.remaining_gaps:
             raise IterationInvariantError("CONTINUE requires remaining gaps")
+        has_new_evidence = ResearchController._has_new_evidence(state, wave)
         if (
             assessment.decision is ContinuationDecision.STOP_COVERED
-            and not assessment.material_gain
+            and (not assessment.material_gain or not has_new_evidence)
         ):
-            raise IterationInvariantError("STOP_COVERED requires material evidence gain")
+            raise IterationInvariantError(
+                "STOP_COVERED requires material gain and new bounded evidence"
+            )
         if (
             assessment.decision is ContinuationDecision.STOP_NO_MATERIAL_GAIN
             and assessment.material_gain
         ):
             raise IterationInvariantError("STOP_NO_MATERIAL_GAIN cannot report material gain")
+
+    @staticmethod
+    def _has_new_evidence(state: ResearchIterationState, wave: WaveRecord) -> bool:
+        prior_digests = {
+            digest
+            for previous_wave in state.waves[:-1]
+            for digest in previous_wave.evidence_digests
+        }
+        return bool(set(wave.evidence_digests) - prior_digests)
 
     @staticmethod
     def _apply_assessment(
@@ -1356,7 +1576,9 @@ class ResearchController:
                 phase=IterationPhase.STOPPED,
                 stop_reason=StopReason.NO_MATERIAL_GAIN,
             )
-        if not assessment.material_gain:
+        if not assessment.material_gain or not ResearchController._has_new_evidence(
+            state, state.waves[-1]
+        ):
             return ResearchController._replace_state(
                 updated,
                 phase=IterationPhase.STOPPED,

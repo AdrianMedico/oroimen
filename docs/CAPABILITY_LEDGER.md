@@ -412,9 +412,11 @@ The current PRE2 branch adds the provider-neutral C1B/C2 component seams
 listed in the two Deep Research rows above. `ResearchController` is bounded
 and recoverable, but it is not wired into the public Deep Research service.
 The deterministic evidence is unit-level fake-planner/fake-search coverage;
-it proves state transitions, checkpoint reuse, provenance, local accounting,
-privacy and STOP behavior only. It does not prove planner or search quality,
-live provider behavior, production runtime availability, public API support,
-multi-wave `ResearchController` service integration, deployability, or
-spending/billing truth. No public Research Brief API, schema migration,
-credential surface, or production composition root changed in PRE2-C2.
+it proves state transitions, strict nested-state recovery, pre-dispatch local
+accounting, explicit no-replay handling for uncertain calls, evidence-digest
+frontiers, provenance, privacy, bounded malformed-iterable handling, and STOP
+behavior only. It does not prove planner or search quality, live provider
+behavior, production runtime availability, public API support, multi-wave
+`ResearchController` service integration, deployability, or spending/billing
+truth. No public Research Brief API, schema migration, credential surface, or
+production composition root changed in PRE2-C2.

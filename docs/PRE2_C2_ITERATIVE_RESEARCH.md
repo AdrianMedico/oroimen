@@ -66,27 +66,32 @@ underlying wave executor retains its truthful `ALL_EMPTY`, `ALL_FAILED`, and
 `LocalIterationStateStore` writes versioned JSON atomically inside a confined
 `research_iterations/` directory. Checkpoints are written at these seams:
 
-1. `READY_TO_PLAN` before the planner call;
+1. `READY_TO_PLAN` before the planner call, with the planner dispatch counted;
 2. `PLAN_PERSISTED` immediately after a validated plan and before search;
-3. a bounded partial observation checkpoint after each completed query;
+3. a durable in-flight query checkpoint before each search dispatch, followed by
+   a bounded partial observation checkpoint after each completed query;
 4. `ASSESSMENT_PENDING` after the complete wave evidence is recorded; and
 5. terminal `STOPPED` after deterministic assessment or budget/cancellation.
 
 If execution is interrupted after `PLAN_PERSISTED`, recovery reuses that
 exact plan and does not call the planner again. Completed query observations
-are resumed by ordinal, so a later-query cancellation does not repeat the
-earlier completed searches. If assessment is interrupted after
-`ASSESSMENT_PENDING`, recovery re-runs only the assessment boundary.
-Terminal states are idempotent reads and make no further planner, search, or
-assessment calls. Corrupt, mismatched, capability-drifted, or brief-drifted
-state fails closed.
+are checkpointed by ordinal. A call that was already dispatched but did not
+produce an observation is never replayed silently because this provider-neutral
+seam has no idempotency key; recovery converts that uncertain boundary into a
+truthful `CANCELLED` STOP. Planner and assessor dispatches follow the same
+rule. Terminal states are idempotent reads and make no further planner,
+search, or assessment calls. Corrupt, mismatched, capability-drifted, or
+brief-drifted state fails closed, including nested plan/observation fields and
+phase/accounting equations.
 
 Each persisted source reference retains first-query provenance and is derived
 from observed evidence; provenance must be complete, and wave outcome must
-match the materialized observations. Signed/query-secret URLs are rejected at
-the durable boundary. Accounting is reconciled against materialized waves
-and partial observations and is explicitly local-call truth; it is not
-provider billing or spending truth.
+match the materialized observations. Each bounded evidence item is represented
+by a digest tied to its source/query observation; raw provider snippets and
+content are not persisted. Signed/query-secret URLs, query strings, and URL
+fragments are rejected before checkpointing. Accounting counts planner,
+search, and assessment dispatches before the call boundary and is explicitly
+local-call truth; it is not provider billing or spending truth.
 
 ## Evidence and nonclaims
 
