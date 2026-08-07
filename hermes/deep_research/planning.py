@@ -319,6 +319,10 @@ class EvidenceItem:
             char in "0123456789abcdef" for char in self.digest
         ):
             raise ValueError("digest must be a lowercase SHA-256 value")
+        if self.digest != compute_evidence_digest(
+            self.source_ref, self.title, self.snippet
+        ):
+            raise ValueError("digest does not match persisted evidence")
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -690,6 +694,16 @@ def _canonical_json(payload: Mapping[str, Any]) -> bytes:
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
+
+
+def compute_evidence_digest(source_ref: str, title: str, snippet: str) -> str:
+    """Hash exactly the bounded evidence fields retained in a checkpoint."""
+
+    return hashlib.sha256(
+        _canonical_json(
+            {"source_ref": source_ref, "title": title, "snippet": snippet}
+        )
+    ).hexdigest()
 
 
 def compute_research_brief_sha256(brief_text: str) -> str:
@@ -1309,6 +1323,7 @@ __all__ = [
     "SearchObservation",
     "SearchPlan",
     "build_search_plan",
+    "compute_evidence_digest",
     "compute_query_id",
     "compute_research_brief_sha256",
     "deserialize_search_plan",

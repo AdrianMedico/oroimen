@@ -824,6 +824,22 @@ class ResearchIterationState:
         if self.accounting.assessment_calls != expected_assessment_calls:
             raise ValueError("assessment accounting is incompatible with iteration phase")
         if self.phase is IterationPhase.STOPPED:
+            if self.stop_reason in {
+                StopReason.OBJECTIVE_COVERED,
+                StopReason.NO_MATERIAL_GAIN,
+            } and (
+                not self.waves
+                or self.active_plan is not None
+                or self.active_observations
+                or self.active_source_refs
+                or self.active_source_query_ids
+                or self.planning_inflight
+                or self.assessment_inflight
+                or self.active_inflight_query_id is not None
+                or self.accounting.planner_calls != completed_waves
+                or self.accounting.assessment_calls != completed_waves
+            ):
+                raise ValueError("completed assessment STOP requires no in-flight work")
             in_flight_modes = sum(
                 (
                     self.planning_inflight,
@@ -1078,16 +1094,7 @@ class ResearchController:
         limits: IterationLimits,
         cancellation: CancellationProbe | None = None,
     ) -> ResearchRunResult:
-        claim = getattr(self._state_store, "claim", None)
-        release = getattr(self._state_store, "release", None)
-        if claim is None or release is None:
-            return await self._run_claimed(
-                job_id,
-                research_brief,
-                limits=limits,
-                cancellation=cancellation,
-            )
-        claim(job_id)
+        self._state_store.claim(job_id)
         try:
             return await self._run_claimed(
                 job_id,
@@ -1096,7 +1103,7 @@ class ResearchController:
                 cancellation=cancellation,
             )
         finally:
-            release(job_id)
+            self._state_store.release(job_id)
 
     async def _run_claimed(
         self,

@@ -7,7 +7,6 @@ globally deduplicated source references with first-query provenance.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -22,6 +21,7 @@ from hermes.deep_research.planning import (
     PlannedSearchQuery,
     SearchObservation,
     SearchPlan,
+    compute_evidence_digest,
 )
 from hermes.services.search.protocol import SearchResult
 
@@ -94,7 +94,7 @@ def _failure(code: str) -> str:
 
 
 def _normalize_url(raw: Any) -> str | None:
-    if not isinstance(raw, str):
+    if type(raw) is not str:
         return None
     value = raw.strip().rstrip("/")
     if not value:
@@ -120,44 +120,29 @@ def _normalize_url(raw: Any) -> str | None:
 
 
 def _rows(result: Any) -> tuple[Iterable[Any], str | None] | None:
-    if isinstance(result, SearchResult):
+    # Only exact built-in/domain values cross this synchronous materializer.
+    # Reject subclasses before touching properties or overridden methods;
+    # malformed provider objects must not block the event loop.
+    if type(result) is SearchResult:
         return result.results, result.backend_used
-    if isinstance(result, list):
+    if type(result) is list:
         return result, None
-    try:
-        raw_rows = result.results
-    except AttributeError:
-        return None
-    except Exception:
-        return None
-    try:
-        backend = result.backend_used
-    except AttributeError:
-        backend = None
-    except Exception:
-        return None
-    return raw_rows, backend
+    return None
 
 
 def _evidence_digest(raw_row: Any, normalized_url: str) -> str:
-    fields: dict[str, str] = {"url": normalized_url}
-    if isinstance(raw_row, dict):
-        for key in ("title", "snippet", "content", "description"):
-            value = raw_row.get(key)
-            if isinstance(value, str):
-                fields[key] = value[:2_048]
-    return hashlib.sha256(
-        json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
-    ).hexdigest()
+    return compute_evidence_digest(
+        normalized_url,
+        _bounded_text(raw_row, "title", 512),
+        _bounded_text(raw_row, "snippet", 1_024),
+    )
 
 
 def _bounded_text(raw_row: Any, key: str, max_chars: int) -> str:
-    if not isinstance(raw_row, dict):
+    if type(raw_row) is not dict:
         return ""
     value = raw_row.get(key)
-    if not isinstance(value, str):
+    if type(value) is not str:
         return ""
     return " ".join(value.split())[:max_chars]
 
@@ -186,12 +171,12 @@ def _candidate_urls(
             if index >= MAX_RESULT_ROWS:
                 return None
             raw_url: Any
-            if isinstance(result, list):
-                if not isinstance(row, str):
+            if type(result) is list:
+                if type(row) is not str:
                     return None
                 raw_url = row
             else:
-                if not isinstance(row, dict):
+                if type(row) is not dict:
                     return None
                 raw_url = row.get("url")
             normalized = _normalize_url(raw_url)

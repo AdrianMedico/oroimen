@@ -320,6 +320,41 @@ async def test_malformed_results_accessor_is_structured_and_wave_continues() -> 
 
 
 @pytest.mark.asyncio
+async def test_blocking_result_accessors_are_rejected_without_invocation() -> None:
+    class BlockingResult:
+        @property
+        def results(self):
+            raise AssertionError("blocking result accessor must not run")
+
+        @property
+        def backend_used(self):
+            raise AssertionError("blocking backend accessor must not run")
+
+    class BlockingRow(dict[str, str]):
+        def get(self, *_: Any, **__: Any) -> str:
+            raise AssertionError("blocking row accessor must not run")
+
+    blocking_search_result = SearchResult(
+        results=[BlockingRow(url="https://never.test")],
+        backend_used="fake",
+        query="blocking row",
+        content_mode="snippet",
+        original_content_mode="snippet",
+        format_fallback=False,
+        size_guard_chars=200000,
+        truncated=False,
+    )
+    result = await SearchWaveExecutor(
+        _FakeSearch([BlockingResult(), blocking_search_result])
+    ).execute(_plan((_query(0, "bad accessor"), _query(1, "bad row"))))
+
+    assert all(
+        json.loads(observation.structured_error or "{}") == {"code": "malformed_result"}
+        for observation in result.observations
+    )
+
+
+@pytest.mark.asyncio
 async def test_arbitrary_iterables_are_bounded_as_malformed() -> None:
     class TerminalRows:
         backend_used = "terminal"

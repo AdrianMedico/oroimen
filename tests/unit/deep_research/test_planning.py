@@ -28,12 +28,14 @@ from hermes.deep_research.planning import (
     MAX_WAVES_PER_JOB,
     SCHEMA_VERSION,
     CapabilitySnapshot,
+    EvidenceItem,
     PlannedSearchQuery,
     PlanningLimits,
     PlanningValidationError,
     SearchObservation,
     SearchPlan,
     build_search_plan,
+    compute_evidence_digest,
     compute_query_id,
     compute_research_brief_sha256,
     deserialize_search_plan,
@@ -41,6 +43,23 @@ from hermes.deep_research.planning import (
     serialize_search_plan,
     validate_search_plan,
 )
+
+
+def test_evidence_digest_binds_persisted_fields() -> None:
+    item = EvidenceItem(
+        query_id="q-123",
+        source_ref="https://example.test/report",
+        title="Original title",
+        snippet="Original snippet",
+        digest=compute_evidence_digest(
+            "https://example.test/report", "Original title", "Original snippet"
+        ),
+    )
+    tampered = item.to_dict()
+    tampered["snippet"] = "Altered snippet"
+
+    with pytest.raises(ValueError, match="digest does not match"):
+        EvidenceItem.from_dict(tampered)
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers

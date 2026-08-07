@@ -656,6 +656,14 @@ def test_iteration_state_store_is_atomic_and_fail_closed(tmp_path: Path) -> None
     with pytest.raises(IterationStateCorruptError):
         store.load(JOB_ID)
 
+    store.write(JOB_ID, valid_state)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["phase"] = "stopped"
+    payload["stop_reason"] = "objective_covered"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(IterationStateCorruptError):
+        store.load(JOB_ID)
+
 
 def test_iteration_state_store_claim_prevents_concurrent_coordinators(
     tmp_path: Path,
