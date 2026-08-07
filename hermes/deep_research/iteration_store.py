@@ -20,7 +20,7 @@ try:
 except ImportError:  # pragma: no cover - exercised on Windows CI
     fcntl = None  # type: ignore[assignment]
 
-from hermes.deep_research.iteration import ResearchIterationState
+from hermes.deep_research.iteration_state import ResearchIterationState
 
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 ITERATIONS_SUBDIR = "research_iterations"
